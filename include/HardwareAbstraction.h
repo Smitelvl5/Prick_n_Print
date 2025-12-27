@@ -6,7 +6,7 @@
 #include "config.h"
 #include "Logger.h"
 
-// Hardware Abstraction Layer for Printer Pot
+// Hardware Abstraction Layer for Print_n_Prick
 class HardwareAbstraction {
 private:
     static const char* TAG;

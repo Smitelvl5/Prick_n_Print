@@ -4,7 +4,7 @@
 #define FIRMWARE_VERSION "2.0.0"
 #define BUILD_DATE __DATE__
 #define BUILD_TIME __TIME__
-#define PROJECT_NAME "Printer Pot"
+#define PROJECT_NAME "Print_n_Prick"
 #define HARDWARE_VERSION "1.0"
 
 // Feature flags

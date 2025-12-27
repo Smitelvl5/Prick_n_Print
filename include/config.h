@@ -29,7 +29,7 @@
 // ============================================================================
 
 // WiFi Settings
-#define AP_SSID "Printer_Pot"
+#define AP_SSID "Print_n_Prick"
 #define AP_PASSWORD "08202022"
 
 // Firebase Settings

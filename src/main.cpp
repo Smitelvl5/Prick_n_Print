@@ -1,5 +1,5 @@
 /*
- * ESP32 Printer Pot v2.0 - Romantic Message Dispenser
+ * ESP32 Print_n_Prick v2.0 - Romantic Message Dispenser
  * Industry-Standard Modular Architecture
  * 
  * Features:
@@ -104,7 +104,7 @@ void setup() {
     // Set up logging
     Logger::setLevel(LOG_LEVEL_INFO);
     Logger::info("Main", "========================================");
-    Logger::info("Main", "ESP32 Printer Pot v" + String(FIRMWARE_VERSION));
+    Logger::info("Main", "ESP32 Print_n_Prick v" + String(FIRMWARE_VERSION));
     Logger::info("Main", "Build: " + String(BUILD_DATE) + " " + String(BUILD_TIME));
     Logger::info("Main", "========================================");
     
@@ -145,9 +145,9 @@ void setup() {
     // Initialize OTA service
     otaService = new OTAUpdateService();
     #ifdef OTA_PASSWORD
-    otaService->initialize("PrinterPot", OTA_PASSWORD);
+    otaService->initialize("Print_n_Prick", OTA_PASSWORD);
     #else
-    otaService->initialize("PrinterPot");
+    otaService->initialize("Print_n_Prick");
     #endif
     Logger::info("Main", "OTA update service initialized");
     
@@ -1020,7 +1020,9 @@ void handleLogin() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - Printer Pot</title>
+    <meta name="description" content="Print_n_Prick - Login to access your romantic message dispenser">
+    <meta name="apple-mobile-web-app-title" content="Print_n_Prick">
+    <title>Login - Print_n_Prick</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1075,7 +1077,7 @@ void handleLogin() {
 </head>
 <body>
     <div class="login-container">
-        <h1>🌵💌 Printer Pot</h1>
+        <h1>🌵💌 Print_n_Prick</h1>
         <form method="POST" action="/login" enctype="application/x-www-form-urlencoded">
             <input type="password" name="password" placeholder="Enter password..." required autofocus autocomplete="current-password">
             <button type="submit">Login</button>
@@ -1112,7 +1114,9 @@ void handleRoot() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <title>Printer Pot v2.0</title>
+    <meta name="apple-mobile-web-app-title" content="Print_n_Prick">
+    <meta name="description" content="Print_n_Prick - Control your romantic message dispenser with reminders, grocery lists, and system status">
+    <title>Print_n_Prick v2.0</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         body {
@@ -1293,7 +1297,7 @@ void handleRoot() {
 </head>
 <body>
     <div class="container">
-        <h1>🌵💌 Printer Pot</h1>
+        <h1>🌵💌 Print_n_Prick</h1>
         <div style="text-align: center; margin-bottom: 15px;">
             <a href="#" onclick="window.location.href=addAuthToken('/test'); return false;" style="color: #4a7c2a; text-decoration: none; font-weight: 600; font-size: 14px;">🔧 Hardware Test</a>
         </div>
@@ -1997,7 +2001,9 @@ void handleTestPage() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hardware Test - Printer Pot</title>
+    <meta name="description" content="Print_n_Prick - Hardware test interface for LED, pump, printer, and sensors">
+    <meta name="apple-mobile-web-app-title" content="Print_n_Prick">
+    <title>Hardware Test - Print_n_Prick</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {

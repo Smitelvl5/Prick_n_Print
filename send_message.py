@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Send Message to Printer Pot
+Send Message to Print_n_Prick
 Send a romantic message that will print with weather and sanitizer info
 """
 
@@ -15,7 +15,7 @@ COMMANDS_PATH = "/commands.json"
 
 def send_message(message):
     """
-    Send a message to the Printer Pot via Firebase
+    Send a message to the Print_n_Prick via Firebase
     
     Args:
         message (str): The message to print
@@ -59,7 +59,7 @@ def send_message(message):
 
 def main():
     """Main function"""
-    print("💌 Printer Pot - Send Message")
+    print("💌 Print_n_Prick - Send Message")
     print("=" * 40)
     
     # Get message from command line or prompt

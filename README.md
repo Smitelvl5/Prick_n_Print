@@ -1,4 +1,4 @@
-# 💌 Printer Pot - Romantic Message Dispenser
+# 💌 Print_n_Prick - Romantic Message Dispenser
 
 A unique combination of a thermal printer and hand sanitizer dispenser that sends sweet messages to your girlfriend via the internet. Send messages through Firebase, and they'll print out on thermal receipts along with daily weather, moisture sensor, and sanitizer level information.
 
@@ -7,7 +7,7 @@ A unique combination of a thermal printer and hand sanitizer dispenser that send
 The ESP32 has a built-in HTTP server that provides a web interface accessible from any device on your local network.
 
 ### **Access the Web Interface:**
-1. **Connect to WiFi** - ESP32 creates access point `Printer_Pot` (password: `08202022`)
+1. **Connect to WiFi** - ESP32 creates access point `Print_n_Prick` (password: `08202022`)
 2. **Find the IP address** - Check serial monitor for: `🌐 HTTP Server started on http://192.168.4.1`
 3. **Open in browser** - Go to `http://192.168.4.1` (or the IP shown in serial monitor)
 4. **Login** - Password: `0820`
@@ -43,7 +43,7 @@ The ESP32 has a built-in HTTP server that provides a web interface accessible fr
 
 ## 📱 Sending Messages Remotely
 
-Send romantic messages to the Printer Pot from anywhere in the world!
+Send romantic messages to the Print_n_Prick from anywhere in the world!
 
 ### 📱 Method 1: iOS Shortcuts (Recommended for iPhone Users)
 
@@ -109,7 +109,7 @@ Send messages directly from your iPhone using the built-in Shortcuts app - no Py
 1. Tap your shortcut (or widget)
 2. Type your romantic message
 3. Tap **Done**
-4. Your message will print on her Printer Pot! 💌
+4. Your message will print on her Print_n_Prick! 💌
 
 #### Pro Tips:
 - **Add to Widgets:** Long-press home screen → **"+"** → **Shortcuts** → Add widget
@@ -203,7 +203,7 @@ pio run --target upload
 ```
 
 ### 2. Access Web Interface
-- Connect to WiFi network `Printer_Pot` (password: `08202022`)
+- Connect to WiFi network `Print_n_Prick` (password: `08202022`)
 - Open browser and go to `http://192.168.4.1`
 - Enter password: `0820`
 - Use the web interface to:
