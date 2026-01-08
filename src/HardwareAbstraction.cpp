@@ -5,7 +5,8 @@ const char* HardwareAbstraction::TAG = "HAL";
 
 HardwareAbstraction::HardwareAbstraction() 
     : printerSerial(nullptr), ledState(false), pumpState(false),
-      moisturePercent(0.0), irDetected(false), sanitizerLevel(0.0),
+      moisturePercent(0.0), irDetected(false), lightPercent(0.0),
+      ledBrightness(0), sanitizerLevel(0.0),
       totalDispenses(0), lastDispenseTime(0), dispenseStartTime(0),
       dispensing(false) {
 }
@@ -37,6 +38,8 @@ bool HardwareAbstraction::initialize() {
     // Read initial sensor values
     readMoistureSensor();
     readIRSensor();
+    readLightSensor();
+    updateLEDBrightness();  // Set initial LED brightness based on light level
     
     Logger::info(TAG, "Hardware initialization complete");
     printDiagnostics();
@@ -52,14 +55,21 @@ bool HardwareAbstraction::initializePins() {
     pinMode(SANITIZER_PUMP_PIN, OUTPUT);
     pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
     
+    // Configure LED PWM (for 12V LED via MOSFET)
+    ledcSetup(LED_PWM_CHANNEL, LED_PWM_FREQUENCY, LED_PWM_RESOLUTION);
+    ledcAttachPin(LED_PWM_PIN, LED_PWM_CHANNEL);
+    ledcWrite(LED_PWM_CHANNEL, 0);  // Start with LED off
+    
     // Set initial states
     digitalWrite(LED_PIN, LOW);
     digitalWrite(SANITIZER_PUMP_PIN, LOW);
     
     ledState = false;
     pumpState = false;
+    ledBrightness = 0;
     
     Logger::debug(TAG, "GPIO pins configured successfully");
+    Logger::debug(TAG, "LED PWM initialized on pin " + String(LED_PWM_PIN) + " (channel " + String(LED_PWM_CHANNEL) + ")");
     return true;
 }
 
@@ -170,6 +180,42 @@ bool HardwareAbstraction::readIRSensor() {
     return irDetected;
 }
 
+float HardwareAbstraction::readLightSensor() {
+    int rawValue = analogRead(LIGHT_SENSOR_PIN);
+    // LM393 typically outputs higher values in darkness, lower in bright light
+    // Convert to percentage: 0% = dark, 100% = bright
+    lightPercent = ((float)rawValue * 100.0 / 4095.0);
+    
+    if (lightPercent < 0) lightPercent = 0;
+    if (lightPercent > 100) lightPercent = 100;
+    
+    Logger::verbose(TAG, "Light sensor: " + String(lightPercent, 1) + "% (raw: " + String(rawValue) + ")");
+    return lightPercent;
+}
+
+void HardwareAbstraction::updateLEDBrightness() {
+    // Read light sensor first
+    readLightSensor();
+    
+    // Inverse relationship: dark = bright LED, bright = dim LED
+    // lightPercent: 0% = dark, 100% = bright
+    // LED brightness: 0 = off, 255 = full brightness
+    float inverseLight = 100.0 - lightPercent;
+    uint8_t brightness = (uint8_t)((inverseLight / 100.0) * 255.0);
+    
+    setLEDBrightness(brightness);
+}
+
+void HardwareAbstraction::setLEDBrightness(uint8_t brightness) {
+    // Clamp brightness to 0-255
+    if (brightness > 255) brightness = 255;
+    
+    ledBrightness = brightness;
+    ledcWrite(LED_PWM_CHANNEL, brightness);
+    
+    Logger::verbose(TAG, "LED brightness set to: " + String(brightness) + "/255 (" + String((brightness * 100) / 255) + "%)");
+}
+
 void HardwareAbstraction::setSanitizerLevel(float level) {
     if (level < 0) level = 0;
     if (level > 100) level = 100;
@@ -219,10 +265,12 @@ void HardwareAbstraction::printDiagnostics() const {
     Logger::info(TAG, "HARDWARE DIAGNOSTICS");
     Logger::info(TAG, "========================================");
     Logger::info(TAG, "LED State: " + String(ledState ? "ON" : "OFF"));
+    Logger::info(TAG, "LED Brightness: " + String(ledBrightness) + "/255 (" + String((ledBrightness * 100) / 255) + "%)");
     Logger::info(TAG, "Pump State: " + String(pumpState ? "ON" : "OFF"));
     Logger::info(TAG, "Dispensing: " + String(dispensing ? "YES" : "NO"));
     Logger::info(TAG, "IR Sensor: " + String(irDetected ? "DETECTED" : "CLEAR"));
     Logger::info(TAG, "Moisture: " + String(moisturePercent, 1) + "%");
+    Logger::info(TAG, "Light Level: " + String(lightPercent, 1) + "%");
     Logger::info(TAG, "Sanitizer Level: " + String(sanitizerLevel, 1) + "%");
     Logger::info(TAG, "Total Dispenses: " + String(totalDispenses));
     Logger::info(TAG, "Printer: " + String(printerAvailable() ? "READY" : "NOT AVAILABLE"));
@@ -232,10 +280,12 @@ void HardwareAbstraction::printDiagnostics() const {
 String HardwareAbstraction::getStatusJSON() const {
     DynamicJsonDocument doc(512);
     doc["led"] = ledState;
+    doc["ledBrightness"] = ledBrightness;
     doc["pump"] = pumpState;
     doc["dispensing"] = dispensing;
     doc["irSensor"] = irDetected;
     doc["moisture"] = String(moisturePercent, 1);
+    doc["light"] = String(lightPercent, 1);
     doc["sanitizer"] = String(sanitizerLevel, 1);
     doc["dispenses"] = totalDispenses;
     doc["printer"] = printerAvailable();

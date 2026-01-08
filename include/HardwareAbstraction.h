@@ -19,6 +19,8 @@ private:
     // Sensor readings
     float moisturePercent;
     bool irDetected;
+    float lightPercent;
+    uint8_t ledBrightness;
     
     // Sanitizer tracking
     float sanitizerLevel;
@@ -52,8 +54,15 @@ public:
     // Sensor Reading
     float readMoistureSensor();
     bool readIRSensor();
+    float readLightSensor();
     float getMoisturePercent() const { return moisturePercent; }
     bool isIRDetected() const { return irDetected; }
+    float getLightPercent() const { return lightPercent; }
+    
+    // LED Brightness Control (inverse of light level)
+    void updateLEDBrightness();
+    void setLEDBrightness(uint8_t brightness);  // 0-255
+    uint8_t getLEDBrightness() const { return ledBrightness; }
     
     // Sanitizer Management
     float getSanitizerLevel() const { return sanitizerLevel; }

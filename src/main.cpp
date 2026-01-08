@@ -240,6 +240,7 @@ void loop() {
         // Read sensors
         hardware->readMoistureSensor();
         hardware->readIRSensor();
+        hardware->readLightSensor();
         
         // Queue status update (non-blocking)
         DynamicJsonDocument statusDoc(512);
@@ -257,6 +258,8 @@ void loop() {
         statusDoc["dispensing"] = hardware->isDispensing();
         statusDoc["sanitizerLevel"] = hardware->getSanitizerLevel();
         statusDoc["moistureSensor"] = hardware->getMoisturePercent();
+        statusDoc["lightSensor"] = hardware->getLightPercent();
+        statusDoc["ledBrightness"] = hardware->getLEDBrightness();
         statusDoc["weather"] = currentWeather;
         statusDoc["ip"] = deviceIP;
         statusDoc["status"] = "OK";
@@ -273,6 +276,7 @@ void loop() {
     if (millis() - lastSensorCheck > SENSOR_CHECK_INTERVAL) {
         hardware->readMoistureSensor();
         hardware->readIRSensor();
+        hardware->updateLEDBrightness();  // Reads light sensor and updates LED brightness inversely
         lastSensorCheck = millis();
     }
     
@@ -2368,15 +2372,21 @@ void handleTestSensors() {
     // Read sensors
     float moisture = hardware->readMoistureSensor();
     bool irDetected = hardware->readIRSensor();
+    float light = hardware->readLightSensor();
+    hardware->updateLEDBrightness();  // Update LED based on light level
     
     // Read raw IR sensor pin value for debugging
     int rawIRValue = digitalRead(IR_SENSOR_PIN);
+    int rawLightValue = analogRead(LIGHT_SENSOR_PIN);
     
-    DynamicJsonDocument response(256);
+    DynamicJsonDocument response(512);
     response["success"] = true;
     response["moisture"] = String(moisture, 1);
     response["irDetected"] = irDetected;
     response["irRaw"] = rawIRValue;  // Add raw pin value for debugging
+    response["light"] = String(light, 1);
+    response["lightRaw"] = rawLightValue;
+    response["ledBrightness"] = hardware->getLEDBrightness();
     response["message"] = "Sensors read successfully";
     
     String responseStr;

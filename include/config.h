@@ -6,11 +6,13 @@
 // ============================================================================
 
 #define LED_PIN 2              // Built-in blue LED
-#define SANITIZER_PUMP_PIN 4   // IRF520 MOSFET Gate (pump control via MOSFET)
+#define SANITIZER_PUMP_PIN 4   // IRF520 MOSFET Driver Module Gate (pump control via MOSFET module)
 #define THERMAL_TX_PIN 17      // TX2 - Thermal printer TX (ESP32 TX → Printer RX)
 #define THERMAL_RX_PIN 16      // RX2 - Thermal printer RX (ESP32 RX → Printer TX)
 #define IR_SENSOR_PIN 32       // Infrared sensor (motion detection)
 #define MOISTURE_SENSOR_PIN 34 // Moisture sensor (analog input, input-only pin)
+#define LIGHT_SENSOR_PIN 35    // LM393 Light Sensor Module (analog input, input-only pin)
+#define LED_PWM_PIN 5          // 12V LED PWM control via MOSFET (PWM output)
 
 // ============================================================================
 // THERMAL PRINTER CONFIGURATION
@@ -23,6 +25,14 @@
 // ============================================================================
 
 #define SENSOR_CHECK_INTERVAL 10000     // Check sensors every 10 seconds
+
+// ============================================================================
+// LED PWM CONFIGURATION
+// ============================================================================
+
+#define LED_PWM_CHANNEL 0               // LEDC channel for LED PWM (0-15)
+#define LED_PWM_FREQUENCY 5000          // PWM frequency in Hz (5kHz)
+#define LED_PWM_RESOLUTION 8            // PWM resolution in bits (8-bit = 0-255)
 
 // ============================================================================
 // CONFIGURATION

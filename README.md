@@ -1,53 +1,55 @@
-# 💌 Print_n_Prick - Romantic Message Dispenser
+# Print_n_Prick - IoT Message Dispenser System
 
-A unique combination of a thermal printer and hand sanitizer dispenser that sends sweet messages to your girlfriend via the internet. Send messages through Firebase, and they'll print out on thermal receipts along with daily weather, moisture sensor, and sanitizer level information.
+An integrated IoT system combining a thermal printer and hand sanitizer dispenser with remote messaging capabilities. The system enables remote message delivery through Firebase, printing messages on thermal receipts along with environmental data including weather conditions, moisture sensor readings, and sanitizer level information.
 
-## 🌐 Built-in Web Server (ESP32)
+## Web Server Interface
 
-The ESP32 has a built-in HTTP server that provides a web interface accessible from any device on your local network.
+The ESP32 includes an integrated HTTP server providing a web-based management interface accessible from any device on the local network.
 
-### **Access the Web Interface:**
-1. **Connect to WiFi** - ESP32 creates access point `Print_n_Prick` (password: `08202022`)
-2. **Find the IP address** - Check serial monitor for: `🌐 HTTP Server started on http://192.168.4.1`
-3. **Open in browser** - Go to `http://192.168.4.1` (or the IP shown in serial monitor)
-4. **Login** - Password: `0820`
-5. **Works on iPhone/Android** - Mobile-optimized interface
+### Accessing the Web Interface
 
-### **Web Interface Features:**
+1. **Connect to WiFi** - Connect to the 🔵 **ESP32** access point `Print_n_Prick` (password: `08202022`)
+2. **Obtain IP Address** - Check serial monitor output for: `HTTP Server started on http://192.168.4.1`
+3. **Open Browser** - Navigate to `http://192.168.4.1` (or the IP address displayed in serial monitor)
+4. **Authentication** - Enter password: `0820`
+5. **Mobile Support** - Interface is optimized for mobile devices (iOS and Android)
 
-#### **System Status Dashboard:**
-- 💧 **Moisture Sensor** - Real-time moisture percentage
-- 🧴 **Sanitizer Level** - Current sanitizer percentage
-- 🔄 **Reset Sanitizer Button** - Reset to 100% when refilled
+### Web Interface Features
 
-#### **Reminders Tab:**
-- 📅 **Schedule Reminders** - Set messages to print automatically at specific times
-- 💌 **Add Reminders** - Enter message and date/time (quick options: 1 min, 30 mins, 1 hour, 12 hours, 1 day, 1 week)
-- 📋 **View Scheduled Reminders** - See all pending and printed reminders
-- ✏️ **Edit Reminders** - Modify existing reminders
-- 🗑️ **Delete Reminders** - Remove reminders before they print
+#### System Status Dashboard
+- **🟣 Moisture Sensor** - Real-time moisture percentage display
+- **Sanitizer Level** - Current sanitizer level percentage
+- **Reset Sanitizer** - Reset sanitizer level to 100% after refilling
 
-#### **Groceries Tab:**
-- 🛒 **Grocery List** - Add items to remember
-- ➕ **Add Items** - Type and add grocery items
-- 🖨️ **Print List** - Print formatted grocery list to thermal printer
-- 🗑️ **Clear List** - Clear entire grocery list
+#### Reminders Management
+- **Schedule Reminders** - Configure messages to print automatically at specified times
+- **Add Reminders** - Create reminders with custom messages and date/time (preset options: 1 min, 30 mins, 1 hour, 12 hours, 1 day, 1 week)
+- **View Reminders** - Display all pending and completed reminders
+- **Edit Reminders** - Modify existing reminder configurations
+- **Delete Reminders** - Remove reminders before execution
 
-### **Mobile Optimized:**
-- 📱 **iPhone/Android Compatible** - Touch-friendly interface
-- 🔄 **Auto-refresh** - Updates every 30 seconds
-- 💾 **Persistent Storage** - All data saved to Firebase
-- 🌐 **Works Offline** - Interface cached, works even if Firebase is down
+#### Grocery List Management
+- **Grocery List** - Maintain a list of grocery items
+- **Add Items** - Add items to the grocery list
+- **Print List** - Print formatted grocery list to 🟢 **thermal printer**
+- **Clear List** - Remove all items from the grocery list
+
+### Mobile Optimization
+- **Cross-Platform Support** - Compatible with iOS and Android devices
+- **Touch Interface** - Optimized for touch input
+- **Auto-Refresh** - Automatic status updates every 30 seconds
+- **Persistent Storage** - All data synchronized with Firebase
+- **Offline Capability** - Interface remains functional when Firebase connectivity is unavailable
 
 ---
 
-## 📱 Sending Messages Remotely
+## Remote Message Delivery
 
-Send romantic messages to the Print_n_Prick from anywhere in the world!
+The system supports remote message delivery from any location with internet connectivity.
 
-### 📱 Method 1: iOS Shortcuts (Recommended for iPhone Users)
+### Method 1: iOS Shortcuts (iOS Devices)
 
-Send messages directly from your iPhone using the built-in Shortcuts app - no Python needed!
+Send messages directly from iOS devices using the built-in Shortcuts application without requiring additional software.
 
 #### Step-by-Step Setup:
 
@@ -105,48 +107,48 @@ Send messages directly from your iPhone using the built-in Shortcuts app - no Py
 - Choose an icon (Heart or Envelope)
 - Add to Home Screen for one-tap access
 
-**5. How to Use:**
-1. Tap your shortcut (or widget)
-2. Type your romantic message
+**5. Usage:**
+1. Execute the shortcut from the home screen or widget
+2. Enter the message text
 3. Tap **Done**
-4. Your message will print on her Print_n_Prick! 💌
+4. The message will be queued for printing on the device
 
-#### Pro Tips:
-- **Add to Widgets:** Long-press home screen → **"+"** → **Shortcuts** → Add widget
-- **Add to Apple Watch:** Shortcut appears automatically on Apple Watch
-- **Use Siri:** Say *"Hey Siri, Send Love Note"* for hands-free messages
+#### Additional Configuration Options
+- **Home Screen Widget:** Long-press home screen → **"+"** → **Shortcuts** → Add widget
+- **Apple Watch Integration:** Shortcut automatically appears on Apple Watch
+- **Siri Integration:** Use voice command *"Hey Siri, [Shortcut Name]"* for hands-free operation
 
 ---
 
-### 🐍 Method 2: Python Script (For Computer Users)
+### Method 2: Python Script (Desktop/Server)
 
-#### Setup:
+#### Setup
 ```bash
-python send_message.py "Your romantic message here"
+python send_message.py "Your message here"
 ```
 
-#### Features:
-- 💌 Send messages that print with weather, moisture sensor, and sanitizer level
-- ⚡ Quick and easy - just type your message
-- 🌤️ Includes weather in Fahrenheit
-- 💧 Includes moisture sensor percentage
-- 🧴 Includes sanitizer level
+#### Features
+- Send messages with integrated weather data, moisture sensor readings, and sanitizer level
+- Command-line interface for quick message delivery
+- Weather data displayed in Fahrenheit
+- Includes moisture sensor percentage
+- Includes sanitizer level information
 
-#### Usage:
+#### Usage
 ```bash
-# Interactive mode (prompts for message)
+# Interactive mode (prompts for message input)
 python send_message.py
 
-# Command line mode (message as argument)
-python send_message.py "I love you! 💕"
+# Command line mode (message provided as argument)
+python send_message.py "Your message text"
 ```
 
 ---
 
-## 📋 What Gets Printed:
+## Print Output Formats
 
-### **Your Message Receipt Format:**
-When you send a message via iOS Shortcut or Python script, the thermal printer will output:
+### Message Receipt Format
+When a message is sent via iOS Shortcut or Python script, the 🟢 **thermal printer** outputs:
 
 ```
 ================================
@@ -164,8 +166,8 @@ Moisture: 45.2%  Sanitizer: 78.5%
 ================================
 ```
 
-### **Reminder Receipt Format:**
-When a reminder prints automatically, it includes:
+### Reminder Receipt Format
+When a scheduled reminder executes, the output includes:
 ```
 ================================
 REMINDER
@@ -177,7 +179,7 @@ Set on: Dec 25, 2024 10:00 AM
 ================================
 ```
 
-### **Grocery List Format:**
+### Grocery List Format
 When printing the grocery list:
 ```
 ================================
@@ -195,33 +197,33 @@ Date: Dec 25, 2024 02:30 PM
 
 ---
 
-## 🚀 Quick Start
+## Quick Start Guide
 
-### 1. Upload ESP32 Code
+### 1. Upload Firmware
 ```bash
 pio run --target upload
 ```
 
 ### 2. Access Web Interface
 - Connect to WiFi network `Print_n_Prick` (password: `08202022`)
-- Open browser and go to `http://192.168.4.1`
-- Enter password: `0820`
-- Use the web interface to:
-  - View system status (moisture sensor, sanitizer level)
-  - Set reminders for automatic printing
-  - Manage grocery list
-  - Reset sanitizer when refilled
+- Navigate to `http://192.168.4.1` in a web browser
+- Enter authentication password: `0820`
+- Web interface provides access to:
+  - System status monitoring (moisture sensor, sanitizer level)
+  - Reminder scheduling and management
+  - Grocery list management
+  - Sanitizer level reset functionality
 
-### 3. Send Messages (Your Messages)
+### 3. Send Messages
 ```bash
-python send_message.py "Good morning beautiful! 💕"
+python send_message.py "Your message text"
 ```
 
-Or use iOS Shortcuts for one-tap sending from your iPhone!
+Alternatively, use iOS Shortcuts for one-tap message delivery from iOS devices.
 
 ---
 
-## 📡 API Documentation
+## API Documentation
 
 ### Base URL
 `http://[ESP32-IP]:8080`
@@ -231,8 +233,8 @@ Or use iOS Shortcuts for one-tap sending from your iPhone!
 - Optional API key authentication (if enabled)
 
 ### Rate Limiting
-- Default: 60 requests per minute per IP
-- Response on limit: HTTP 429 Too Many Requests
+- **Default Limit:** 60 requests per minute per IP address
+- **Rate Limit Response:** HTTP 429 Too Many Requests
 
 ### API Endpoints
 
@@ -340,7 +342,7 @@ System health check endpoint.
 
 ---
 
-## 🔧 Firebase Commands
+## Firebase Command Interface
 
 Commands can be sent through Firebase Realtime Database at `/commands/{commandId}`.
 
@@ -393,7 +395,7 @@ Commands can be sent through Firebase Realtime Database at `/commands/{commandId
 
 ---
 
-## 📊 Firebase Configuration
+## Firebase Configuration
 
 ### Database URL
 `https://printerpot-d96f8-default-rtdb.firebaseio.com`
@@ -410,7 +412,7 @@ Update Firebase Console → Realtime Database → Rules:
 }
 ```
 
-**⚠️ Security Note:** These rules allow public access. Fine for personal use, but consider authentication for production.
+**Security Note:** These rules permit public access. Suitable for personal use; implement authentication for production deployments.
 
 ### Firebase Quotas (Free Tier)
 - **Data Storage:** 1 GB ✅
@@ -433,89 +435,283 @@ printerpot-d96f8-default-rtdb/
 
 ---
 
-## 💌 How It Works
+## System Operation
 
-### **Message Sending Flow (Your Messages):**
-1. **You send a message** via iOS Shortcut or `send_message.py` or Firebase `print` command
-2. **ESP32 checks Firebase** every 30 seconds
-3. **ESP32 finds your message** and prints it on the thermal printer
-4. **Receipt includes:**
-   - Your custom message
-   - Today's weather (Fahrenheit, 12-hour format)
+### Message Delivery Workflow
+1. **Message Submission** - Message sent via iOS Shortcut, Python script, or Firebase `print` command
+2. **Firebase Polling** - 🔵 **ESP32** polls Firebase every 30 seconds for new commands
+3. **Message Processing** - 🔵 **ESP32** detects new message and queues for printing
+4. **Receipt Generation** - 🟢 **Thermal printer** outputs receipt containing:
+   - Custom message text
+   - Current weather conditions (Fahrenheit, 12-hour format)
    - Moisture sensor percentage
-   - Hand sanitizer level percentage
-   - Date and time (12-hour format with AM/PM)
+   - Sanitizer level percentage
+   - Date and time stamp (12-hour format with AM/PM)
 
-### **Reminder System (Her Reminders):**
-1. **She accesses web interface** at `http://192.168.4.1`
-2. **Adds a reminder** with message and date/time
-3. **Reminder stored in Firebase** - persists across reboots
-4. **ESP32 checks reminders** every minute
-5. **When time arrives** - prints automatically
-6. **Receipt includes:**
-   - When the reminder was set (creation time)
-   - Her message (normal size, centered)
-   - No weather or sensor info (just the message)
+### Reminder System
+1. **Reminder Creation** - User accesses web interface at `http://192.168.4.1`
+2. **Reminder Configuration** - User specifies message content and scheduled time
+3. **Data Persistence** - Reminder stored in Firebase, persists across system reboots
+4. **Reminder Monitoring** - 🔵 **ESP32** checks scheduled reminders every minute
+5. **Automatic Execution** - When scheduled time is reached, reminder prints automatically
+6. **Receipt Content**:
+   - Reminder creation timestamp
+   - Reminder message text (standard size, centered)
+   - No additional environmental data
 
-### **Grocery List System:**
-1. **She accesses Groceries tab** in web interface
-2. **Adds items** to the grocery list
-3. **List stored in Firebase** - persists across reboots
-4. **Print button** - prints formatted list to thermal printer
-5. **Clear button** - clears entire list when done shopping
+### Grocery List Management
+1. **List Access** - User navigates to Groceries tab in web interface
+2. **Item Management** - User adds items to grocery list
+3. **Data Persistence** - List stored in Firebase, persists across system reboots
+4. **Print Functionality** - Print button generates formatted list on thermal printer
+5. **List Clearing** - Clear button removes all items from list
 
-### **Hand Sanitizer Features:**
-- **IR Sensor**: Detects when hands are placed under the dispenser
-- **Automatic Dispensing**: Can dispense sanitizer when motion is detected
-- **Cooldown Period**: 3-second cooldown between dispenses prevents continuous dumping
-- **Maximum Duration**: 2-second maximum dispense duration for safety
-- **Level Tracking**: Monitors sanitizer percentage
+### Hand Sanitizer Dispensing System
+- **🟣 IR Sensor** Detection - 🟣 **Infrared sensor** detects hand placement under dispenser
+- **Automatic Dispensing** - System can automatically dispense sanitizer upon motion detection
+- **Cooldown Protection** - 3-second cooldown period between dispenses prevents continuous operation
+- **Safety Limit** - Maximum dispense duration of 2 seconds for safety
+- **Level Monitoring** - System tracks and reports sanitizer level percentage
 
 ---
 
-## 🔧 System Requirements
+## System Requirements
 
-- **ESP32** with WiFi connectivity
-- **Thermal printer** (optional)
-- **Hand sanitizer pump** and infrared sensor
+- **🔵 ESP32** microcontroller with WiFi connectivity
+- **🟢 Thermal printer** (optional component)
+- **🟠 Hand sanitizer pump** and 🟣 **infrared sensor**
 - **Python 3.7+** for control scripts (optional)
-- **Firebase** account (free tier works)
+- **Firebase** account (free tier sufficient)
 
 ---
 
-## 🛠️ Hardware Components
+## Hardware Components
 
-### **Main Controller:**
+> **Device Color Legend:**
+> - 🔵 **ESP32** - Blue
+> - 🟢 **Thermal Printer** - Green  
+> - 🟠 **Pump** - Orange
+> - 🟡 **LED** - Yellow
+> - 🟣 **Sensors** - Purple
+> - ⚫ **MOSFET** - Gray
+> - 🔷 **LM2596** - Teal
+
+### Main Controller
 - **ESP-WROOM-32 Development Expansion Board** with screw terminals
-- **ESP32 ESP-WROOM-32 Module** (3.3V) - plugs into expansion board
+- **🔵 ESP32 ESP-WROOM-32 Module** (5V) - plugs into expansion board
 
-### **Printing System:**
-- **Embedded Thermal Printer QR204 Receipt Ticket Printers** (5V-9V)
+### Printing System
+- **🟢 Embedded Thermal Printer QR204** Receipt Ticket Printers (9V)
 
-### **Sensors:**
-- **Infrared (IR) Motion Sensor Module** (5V) - for detecting hands
-- **Moisture Sensor** (Analog) - connected to GPIO 34
+### Sensors
+- **🟣 Infrared (IR) Motion Sensor Module** (5V) - hand detection
+- **🟣 Moisture Sensor** (Analog) - connected to GPIO 34
+- **🟣 LM393 Light Sensor Module** (Analog) - connected to GPIO 35
 
-### **Dispensing System:**
-- **CJWP08 Micro M20 Diaphragm Water Pump** (3.3V) - used for hand sanitizer dispensing
-- **IRF520 MOSFET Module** - for pump control (handles higher current loads)
+### Dispensing System
+- **🟠 CJWP08 Micro M20 Diaphragm Water Pump** (3.3V) - hand sanitizer dispensing
+- **⚫ IRF520 MOSFET Driver Module** - pump control (handles higher current loads)
 
-### **Power Management:**
-- **LM2596 Multi Channel Switching Power Supply Module** (3.3V/5V/12V/ADJ Adjustable)
-- **5V USB-C Wall Power Supply** (input power source)
+### Lighting System
+- **🟡 12V 5W LED** - ambient lighting
+- **⚫ MOSFET Driver Module** - LED PWM control
+
+### Power Management
+- **🔷 LM2596 Multi Channel Switching Power Supply Module** (3.3V/5V/9V/12V/ADJ Adjustable)
+- **20W USB-C Wall Power Supply** (input power source)
 - **Type-C USB Jack 3.1 Type-C 2Pin Female** (power input connector)
 
-### **Pin Connections:**
-- **GPIO 2**: Built-in LED (status indicator)
-- **GPIO 4**: IRF520 MOSFET Gate (pump control signal)
-- **GPIO 17**: Thermal printer TX
-- **GPIO 16**: Thermal printer RX
-- **GPIO 32**: IR sensor (digital input with pull-up, 5V)
-- **GPIO 34**: Moisture sensor (analog input, input-only pin)
+### Pin Connections
+- **GPIO 2**: Built-in 🟡 **LED** (status indicator)
+- **GPIO 4**: ⚫ **IRF520 MOSFET Driver Module** Gate (pump control signal)
+- **GPIO 5**: 🟡 **LED** PWM control (12V 🟡 **LED** via ⚫ **MOSFET**, PWM output)
+- **GPIO 16**: 🟢 **Thermal printer** RX
+- **GPIO 17**: 🟢 **Thermal printer** TX
+- **GPIO 32**: 🟣 **IR sensor** (digital input with pull-up, 5V)
+- **GPIO 34**: 🟣 **Moisture sensor** (analog input, input-only pin)
+- **GPIO 35**: 🟣 **LM393 Light Sensor Module** (analog input, input-only pin)
 
 ---
 
-## 🏗️ System Architecture
+## Power Calculations
+
+### Power Requirements by Rail
+
+> **Note:** Each rail has 2 connection spots. Low-current sensors can share a connection.
+
+#### 3.3V Rail (2 connections)
+- **Connection 1:** 🟠 **Pump (CJWP08)**: ~300-500mA when running
+- **Connection 2:** 🟣 **Moisture Sensor** + 🟣 **Light Sensor (LM393)**: ~5-10mA + ~5-10mA = ~10-20mA (shared connection)
+- **Total**: ~310-520mA (worst case ~0.52A)
+- **Power**: 0.52A × 3.3V = **1.7W**
+
+#### 5V Rail (2 connections)
+- **Connection 1:** 🔵 **ESP32**: ~200-500mA (spikes during WiFi transmission)
+- **Connection 2:** 🟣 **IR Sensor Module**: ~10-20mA
+- **Total**: ~210-520mA (worst case ~0.52A)
+- **Power**: 0.52A × 5V = **2.6W**
+
+#### 9V Rail (Custom) (2 connections)
+- **Connection 1:** 🟢 **Thermal Printer (QR204)**: ~50-100mA idle, ~500-1000mA when printing
+- **Connection 2:** *Available*
+- **Total**: ~50-100mA idle, ~500-1000mA when printing
+- **Power**: 1A × 9V = **9W** (peak during printing)
+
+#### 12V Rail (2 connections)
+- **Connection 1:** 🟡 **12V 5W LED**: ~417mA (5W ÷ 12V = 0.417A)
+- **Connection 2:** *Available*
+- **Total**: ~417mA
+- **Power**: 0.417A × 12V = **5W**
+
+### Total Power Consumption
+- **Combined Output Power:** ~18.3W (peak: printer printing + LED on + pump running)
+- **With 80% Efficiency:** ~22.9W input required
+- **Recommended USB-C Supply:** 20W minimum (consider 30W for better headroom)
+
+### Power Supply Specifications
+- **Input:** 5V USB-C (20W = 5V @ 4A, or 30W = 5V @ 6A recommended)
+- **🔷 LM2596 Module:** Typically rated for 2-3A per channel
+- **Available Input Current (20W):** 4A
+- **Required Input Current:** ~4.58A (22.9W ÷ 5V)
+- **Headroom (20W):** Negative margin - **30W supply recommended**
+
+### Notes
+- **Each rail has 2 connection spots** - components must be distributed accordingly
+- Low-current sensors (🟣 Moisture Sensor, 🟣 Light Sensor) share one connection on the 3.3V rail
+- The 9V rail connection 1 is dedicated to the 🟢 **thermal printer** (connection 2 available)
+- The 12V rail connection 1 is dedicated to the 🟡 **LED** (connection 2 available)
+- Peak power consumption occurs when 🟢 **printer** is printing, 🟡 **LED** is active, and 🟠 **pump** is running simultaneously
+- **20W USB-C charger may be insufficient under peak load** - 30W recommended for reliable operation
+- 🔵 **ESP32** operates from 5V rail (expansion board handles voltage regulation internally)
+
+---
+
+## Future Expansion: Touch Screen
+
+### Touch Screen Compatibility Analysis
+
+**Yes, there is room for a touch screen!** Here's the detailed breakdown:
+
+#### GPIO Pins Available for Touch Screen
+
+**SPI-Based Touch Screen (Recommended):**
+- **Display Interface:** GPIO 12 (MISO), GPIO 13 (MOSI), GPIO 14 (SCK), GPIO 15 (CS)
+- **Display Control:** GPIO 18 (DC), GPIO 19 (RST) - or use other available pins
+- **Touch Controller:** GPIO 25, 26, 27 (for touch interrupt/CS)
+- **Total Pins Needed:** ~7-9 pins (display + touch controller)
+
+**I2C-Based Touch Screen (Alternative):**
+- **Display Interface:** GPIO 21 (SDA), GPIO 22 (SCL)
+- **Touch Controller:** Same I2C bus or separate GPIO for interrupt
+- **Total Pins Needed:** ~3-4 pins (simpler but less common)
+
+#### Power Requirements
+
+**Touch Screen Power Options:**
+
+1. **3.3V Rail - Connection 2 (Shared with Sensors)**
+   - **Current Available:** ~10-20mA used by sensors, ~500mA remaining capacity
+   - **Touch Screen Power:** 4.0" ST7796S needs ~90mA
+   - **Compatibility:** ✅ **Yes** - Can share connection with sensors (total ~100-110mA)
+   - **Recommendation:** Use 3.3V touch screen, share connection with existing sensors
+   - **Power Headroom:** ~400mA remaining (plenty of margin)
+
+2. **5V Rail - Connection 2 (Shared with IR Sensor)**
+   - **Current Available:** ~10-20mA used by IR sensor, ~500mA remaining capacity
+   - **Touch Screen Power:** 4.0" ST7796S needs ~90mA (if using 5V version)
+   - **Compatibility:** ✅ **Yes** - Can share connection with IR sensor (total ~100-110mA)
+   - **Recommendation:** Use 5V touch screen, share connection with IR sensor
+   - **Power Headroom:** ~400mA remaining (plenty of margin)
+
+3. **9V Rail - Connection 2 (Dedicated)**
+   - **Current Available:** Up to ~1A (9W) when printer is idle
+   - **Compatibility:** ⚠️ **Possible** - Only if touch screen accepts 9V (uncommon, would need regulator)
+
+4. **12V Rail - Connection 2 (Dedicated)**
+   - **Current Available:** Up to ~1.5A (18W)
+   - **Compatibility:** ⚠️ **Possible** - Only if touch screen accepts 12V (uncommon, would need regulator)
+
+#### Recommended Touch Screen Options
+
+**Recommended Model:**
+
+1. **4.0" SPI TFT Touch Screen (ST7796S/ILI9486) - MSP4021**
+   - **Screen Size:** 4.0 inch
+   - **Resolution:** 480×320 pixels (HD)
+   - **Display Colors:** RGB 65K color
+   - **Driver IC:** ST7796S/ILI9486
+   - **Interface:** 4-wire SPI
+   - **Power:** 3.3V~5V (VCC), 3.3V logic (TTL)
+   - **Power Consumption:** ~90mA
+   - **GPIO Pins Needed:** ~7-9 pins (SPI + control + touch)
+   - **Compatibility:** ✅ **Excellent** - Perfect fit for this system
+   - **Features:**
+     - Optional touch function (resistive/capacitive)
+     - SD card slot for expansion
+     - Military grade process standard
+     - Operating temperature: -20℃~70℃
+   - **Power Connection:** Can share 3.3V or 5V rail connection 2
+   - **Note:** Model MSP4020 available without touch screen
+
+**Alternative Options:**
+
+2. **2.4" TFT Touch Screen (ILI9341 + XPT2046)**
+   - **Interface:** SPI
+   - **Power:** 3.3V or 5V, ~80-150mA
+   - **GPIO Pins:** 7-9 pins
+   - **Compatibility:** ✅ **Excellent** - Smaller size option
+
+3. **3.2" TFT Touch Screen (ILI9341 + XPT2046)**
+   - **Interface:** SPI
+   - **Power:** 3.3V or 5V, ~100-200mA
+   - **GPIO Pins:** 7-9 pins
+   - **Compatibility:** ✅ **Good** - Medium size option
+
+#### Power Supply Considerations
+
+- **With Current 20W Supply:**
+  - Adding 4.0" touch screen: +0.3W (3.3V @ 90mA) or +0.45W (5V @ 90mA)
+  - **Total:** ~18.6-18.75W output (~23.25-23.4W input)
+  - ⚠️ **May exceed 20W supply capacity** - 30W recommended
+
+- **With 30W Supply:**
+  - ✅ **Plenty of headroom** for 4.0" touch screen addition
+  - Recommended before adding touch screen
+  - Additional ~6-7W available for other components
+
+#### Pin Assignment Example (SPI Touch Screen)
+
+```
+Display SPI:
+- GPIO 12: MISO
+- GPIO 13: MOSI
+- GPIO 14: SCK
+- GPIO 15: CS (Display)
+
+Display Control:
+- GPIO 18: DC (Data/Command)
+- GPIO 19: RST (Reset)
+
+Touch Controller:
+- GPIO 25: Touch CS
+- GPIO 26: Touch IRQ (optional)
+- GPIO 27: Touch MOSI/MISO (if separate SPI)
+```
+
+#### Summary
+
+✅ **4.0" Touch Screen (ST7796S/ILI9486) is Fully Compatible:**
+- ✅ Sufficient GPIO pins available (7-9 pins for 4-wire SPI interface)
+- ✅ Power consumption (~90mA) fits perfectly on 3.3V or 5V rail (can share connections)
+- ✅ 4-wire SPI interface matches available GPIO pins (GPIO 12/13/14/15)
+- ✅ 3.3V~5V power range compatible with existing power rails
+- ✅ 480×320 resolution provides excellent display quality
+- ⚠️ **Recommendation:** Upgrade to 30W power supply for optimal reliability
+- ✅ **Best Option:** 4.0" ST7796S touch screen (MSP4021) on 3.3V or 5V rail connection 2
+
+---
+
+## System Architecture
 
 The system follows a modular, service-oriented architecture:
 
@@ -549,15 +745,15 @@ The system follows a modular, service-oriented architecture:
 ```
 
 ### Request Queue System
-The system uses an **asynchronous request queue** to eliminate HTTP blocking:
-- ⚡ **Instant Web Responses** - No waiting for Firebase
-- 🚀 **Non-Blocking** - Web server always responsive  
-- 🛡️ **Rate Limit Safe** - Controlled Firebase access (2 second intervals)
-- 📊 **Automatic Retry** - Handles failures gracefully
+The system implements an asynchronous request queue to eliminate HTTP blocking:
+- **Instant Web Responses** - No waiting for Firebase operations
+- **Non-Blocking Operation** - Web server remains responsive during background operations
+- **Rate Limit Protection** - Controlled Firebase access with 2-second intervals
+- **Automatic Retry** - Graceful failure handling with automatic retry mechanism
 
 ---
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 ### iOS Shortcut Issues:
 
@@ -612,34 +808,18 @@ The system uses an **asynchronous request queue** to eliminate HTTP blocking:
 
 ---
 
-## 💡 Tips:
+## Usage Tips
 
-- **Send messages anytime** - Works from anywhere in the world as long as ESP32 is online
-- **Include emojis** - They'll be converted to text equivalents (❤️ becomes <3)
-- **Long messages** - No character limit, but keep it reasonable for thermal paper
-- **Timing** - Messages print within 30 seconds of sending (ESP32 polling interval)
-- **Privacy** - Messages are deleted from Firebase after processing
+- **Remote Access** - System operates from any location with internet connectivity, as long as ESP32 maintains network connection
+- **Emoji Support** - Emojis are converted to text equivalents (e.g., ❤️ becomes <3)
+- **Message Length** - No hard character limit, but consider thermal paper width for optimal formatting
+- **Delivery Timing** - Messages print within 30 seconds of sending (ESP32 polling interval)
+- **Data Privacy** - Messages are automatically deleted from Firebase after processing
 
----
+## Support and Debugging
 
-## 🎁 Perfect For:
-
-- 💕 Surprising your girlfriend with sweet messages
-- 📅 Sending reminders throughout the day
-- 💌 Expressing love when you're apart
-- 🎉 Celebrating special moments
-- 🌟 Just because!
-
----
-
-## 📞 Support
-
-- 🔍 **Serial Monitor** - Check ESP32 status and debug messages
-- 📊 **Firebase Console** - Monitor database usage and data
-- 🌐 **Web Interface** - Access at `http://192.168.4.1` for all features
-- 🐛 **Check Logs** - Serial monitor shows detailed operation logs
-- 💡 **send_message.py** - Quick way to send test messages
-
----
-
-**Send Love! 💌✨**
+- **Serial Monitor** - Monitor ESP32 status and debug messages via serial output
+- **Firebase Console** - Monitor database usage and data through Firebase web console
+- **Web Interface** - Access full system management at `http://192.168.4.1`
+- **System Logs** - Serial monitor provides detailed operation logs for troubleshooting
+- **Test Script** - Use `send_message.py` for quick message delivery testing
