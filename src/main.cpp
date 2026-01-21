@@ -89,8 +89,13 @@ void handleQueueStatus();
 void handleTestPage();
 void handleTestLED();
 void handleTestPump();
+void handleTestLED12V();
+void handleGetAutomation();
+void handleSetAutomation();
 void handleTestPrinter();
 void handleTestSensors();
+void handleTestDisplay();
+void handleTestTouch();
 
 // Time configuration
 const char* ntpServer = NTP_SERVER;
@@ -98,26 +103,65 @@ const long gmtOffset_sec = GMT_OFFSET_SEC;
 const int daylightOffset_sec = DAYLIGHT_OFFSET_SEC;
 
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
+    // CRITICAL: Set unused strapping pins to correct state IMMEDIATELY - before Serial.begin
+    // ESP32 DevKit V1 has 5 strapping pins: GPIO 0, 2, 5, 12, 15
+    // We've moved our pins away from strapping pins, but ensure unused ones are correct
     
-    // Set up logging
-    Logger::setLevel(LOG_LEVEL_INFO);
+    // GPIO 0: Must be HIGH for normal boot mode (LOW = flash/programming mode)
+    pinMode(0, OUTPUT);
+    digitalWrite(0, HIGH);  // GPIO 0 must be HIGH during boot
+    
+    // GPIO 2: Must be LOW during boot (no longer used - set to safe state)
+    pinMode(2, INPUT_PULLDOWN);  // Set as input with pull-down to ensure LOW
+    
+    // GPIO 5: Must be HIGH during boot (no longer used - set to safe state)
+    pinMode(5, INPUT_PULLUP);  // Set as input with pull-up to ensure HIGH
+    
+    // GPIO 12: Must be LOW during boot (no longer used - set to safe state)
+    pinMode(12, INPUT_PULLDOWN);  // Set as input with pull-down to ensure LOW
+    
+    // GPIO 15: Must be HIGH during boot (no longer used - set to safe state)
+    pinMode(15, INPUT_PULLUP);  // Set as input with pull-up to ensure HIGH
+    
+    delay(200);  // Ensure all strapping pins are stable before continuing
+    
+    // CRITICAL: Set UART pins (GPIO 16, 17) to safe states before Serial.begin
+    // Thermal printer RX/TX can interfere with boot if not properly initialized
+    pinMode(THERMAL_RX_PIN, INPUT_PULLUP);  // GPIO 16 - Set as input with pull-up
+    pinMode(THERMAL_TX_PIN, INPUT_PULLUP);  // GPIO 17 - Set as input with pull-up
+    delay(100);  // Ensure pins are stable
+    
+    Serial.begin(115200);
+    // Extended delay for external power stabilization (not USB-C)
+    // Allows power supply to stabilize before initializing hardware
+    delay(3000);  // Increased delay for external power
+    
+    // Set up logging - Reduced to WARN to save flash memory (INFO logs use more string storage)
+    Logger::setLevel(LOG_LEVEL_WARN);
     Logger::info("Main", "========================================");
     Logger::info("Main", "ESP32 Print_n_Prick v" + String(FIRMWARE_VERSION));
     Logger::info("Main", "Build: " + String(BUILD_DATE) + " " + String(BUILD_TIME));
     Logger::info("Main", "========================================");
+    Logger::info("Main", "Strapping pins set to safe state (all pins moved to non-strapping GPIOs)");
+    
+    // Additional delay before hardware initialization for external power
+    delay(500);
     
     // Initialize hardware abstraction layer
     hardware = new HardwareAbstraction();
     if (!hardware->initialize()) {
         Logger::error("Main", "Hardware initialization failed!");
-        while(1) { delay(1000); }
+        // Don't halt - continue without some hardware features
+        Logger::warn("Main", "Continuing with limited hardware functionality");
     }
     
     // Initialize printer service
     printerService = new PrinterService(hardware);
     Logger::info("Main", "Printer service initialized");
+    
+    // Additional delay before WiFi setup for external power stability
+    // WiFi radio needs stable power before initialization
+    delay(500);
     
     // Setup WiFi
     setupWiFi();
@@ -184,8 +228,33 @@ void loop() {
     // Check for dispense timeout (safety feature)
     hardware->checkDispenseTimeout();
     
-    // Update LED status
-    hardware->setLED(WiFi.status() == WL_CONNECTED);
+    // Update LED status based on WiFi connection
+    static unsigned long lastLEDUpdate = 0;
+    static int lastWiFiStatus = -1;
+    if (millis() - lastLEDUpdate > 2000) {  // Check WiFi status every 2 seconds
+        int wifiStatus = WiFi.status();
+        bool wifiConnected = (wifiStatus == WL_CONNECTED);
+        
+        // Log WiFi status changes for debugging
+        if (wifiStatus != lastWiFiStatus) {
+            String statusStr = "";
+            switch(wifiStatus) {
+                case WL_IDLE_STATUS: statusStr = "IDLE"; break;
+                case WL_NO_SSID_AVAIL: statusStr = "NO_SSID_AVAIL"; break;
+                case WL_SCAN_COMPLETED: statusStr = "SCAN_COMPLETED"; break;
+                case WL_CONNECTED: statusStr = "CONNECTED"; break;
+                case WL_CONNECT_FAILED: statusStr = "CONNECT_FAILED"; break;
+                case WL_CONNECTION_LOST: statusStr = "CONNECTION_LOST"; break;
+                case WL_DISCONNECTED: statusStr = "DISCONNECTED"; break;
+                default: statusStr = "UNKNOWN(" + String(wifiStatus) + ")"; break;
+            }
+            Logger::info("Main", "WiFi Status: " + statusStr + " | LED: " + String(wifiConnected ? "ON" : "OFF"));
+            lastWiFiStatus = wifiStatus;
+        }
+        
+        hardware->setLED(wifiConnected);
+        lastLEDUpdate = millis();
+    }
     
     // Check reminders every minute
     static unsigned long lastReminderCheck = 0;
@@ -286,17 +355,61 @@ void loop() {
 void setupWiFi() {
     Logger::info("WiFi", "Setting up WiFi...");
     
+    // Ensure LED is off initially (will turn on when connected)
+    hardware->setLED(false);
+    Logger::info("WiFi", "Initial LED state: OFF");
+    
+    // Check initial WiFi status
+    int initialStatus = WiFi.status();
+    Logger::info("WiFi", "Initial WiFi status: " + String(initialStatus));
+    
     WiFiManager wm;
     WiFi.mode(WIFI_STA);
+    Logger::info("WiFi", "WiFi mode set to STA (Station)");
+    
+    // Extended timeout for external power - WiFi may need more time to initialize
+    wm.setConfigPortalTimeout(180);  // 3 minutes
+    Logger::info("WiFi", "Starting autoConnect (timeout: 180s)...");
     
     bool res = wm.autoConnect(AP_SSID, AP_PASSWORD);
     
+    // Check WiFi status after connection attempt
+    int finalStatus = WiFi.status();
+    Logger::info("WiFi", "autoConnect result: " + String(res ? "SUCCESS" : "FAILED"));
+    Logger::info("WiFi", "Final WiFi status code: " + String(finalStatus));
+    
     if (!res) {
-        Logger::error("WiFi", "Failed to connect");
+        Logger::error("WiFi", "❌ Failed to connect to WiFi");
+        String statusStr = "";
+        switch(finalStatus) {
+            case WL_IDLE_STATUS: statusStr = "IDLE"; break;
+            case WL_NO_SSID_AVAIL: statusStr = "NO_SSID_AVAIL"; break;
+            case WL_SCAN_COMPLETED: statusStr = "SCAN_COMPLETED"; break;
+            case WL_CONNECTED: statusStr = "CONNECTED"; break;
+            case WL_CONNECT_FAILED: statusStr = "CONNECT_FAILED"; break;
+            case WL_CONNECTION_LOST: statusStr = "CONNECTION_LOST"; break;
+            case WL_DISCONNECTED: statusStr = "DISCONNECTED"; break;
+            default: statusStr = "UNKNOWN(" + String(finalStatus) + ")"; break;
+        }
+        Logger::error("WiFi", "WiFi status: " + statusStr);
+        // Keep LED off if WiFi failed
+        hardware->setLED(false);
+        Logger::info("WiFi", "LED remains OFF (WiFi not connected)");
     } else {
         deviceIP = WiFi.localIP().toString();
-        Logger::info("WiFi", "Connected successfully!");
+        Logger::info("WiFi", "✅ Connected successfully!");
         Logger::info("WiFi", "IP Address: " + deviceIP);
+        Logger::info("WiFi", "RSSI: " + String(WiFi.RSSI()) + " dBm");
+        Logger::info("WiFi", "SSID: " + String(WiFi.SSID()));
+        Logger::info("WiFi", "MAC Address: " + String(WiFi.macAddress()));
+        
+        // Turn on LED to indicate WiFi connection
+        hardware->setLED(true);
+        Logger::info("WiFi", "✅ LED set to ON (WiFi connected)");
+        
+        // Verify LED state
+        bool ledState = hardware->getLEDState();
+        Logger::info("WiFi", "LED state verification: " + String(ledState ? "ON" : "OFF"));
     }
 }
 
@@ -580,8 +693,13 @@ void setupWebServer() {
     server.on("/test", HTTP_GET, handleTestPage);
     server.on("/api/test/led", HTTP_POST, handleTestLED);
     server.on("/api/test/pump", HTTP_POST, handleTestPump);
+    server.on("/api/test/led12v", HTTP_POST, handleTestLED12V);
+    server.on("/api/test/automation", HTTP_GET, handleGetAutomation);
+    server.on("/api/test/automation", HTTP_POST, handleSetAutomation);
     server.on("/api/test/printer", HTTP_POST, handleTestPrinter);
     server.on("/api/test/sensors", HTTP_GET, handleTestSensors);
+    server.on("/api/test/display", HTTP_POST, handleTestDisplay);
+    server.on("/api/test/touch", HTTP_GET, handleTestTouch);
     
     // Reminder endpoints
     server.on("/api/reminders", HTTP_GET, handleGetReminders);
@@ -2104,17 +2222,23 @@ void handleTestPage() {
         <h1>🔧 Hardware Test</h1>
         
         <div class="test-section">
-            <h2>💡 LED Test (GPIO 2)</h2>
-            <button onclick="testLED(true)">Turn LED ON</button>
-            <button onclick="testLED(false)" class="danger">Turn LED OFF</button>
-            <div id="led-status"></div>
+            <h2>💧 Pump Test (GPIO 26)</h2>
+            <p style="color: #666; margin-bottom: 10px;">⚠️ Pump has safety timeout (2 seconds max)</p>
+            <button onclick="testPump(true)">Turn Pump ON</button>
+            <button onclick="testPump(false)" class="danger">Turn Pump OFF</button>
+            <div id="pump-status"></div>
         </div>
         
         <div class="test-section">
-            <h2>💧 Pump Test (GPIO 4)</h2>
-            <p style="color: #666; margin-bottom: 10px;">⚠️ Pump will run for 1 second maximum</p>
-            <button onclick="testPump()">Start Pump (1 sec)</button>
-            <div id="pump-status"></div>
+            <h2>💡 12V LED Test (GPIO 27 - PWM)</h2>
+            <p style="color: #666; margin-bottom: 10px;">Controls 12V LED via MOSFET with PWM brightness</p>
+            <button onclick="testLED12V(true)">Turn 12V LED ON</button>
+            <button onclick="testLED12V(false)" class="danger">Turn 12V LED OFF</button>
+            <div style="margin-top: 10px;">
+                <label style="display: block; margin-bottom: 5px;">Brightness: <span id="brightness-value">128</span>/255</label>
+                <input type="range" id="brightness-slider" min="0" max="255" value="128" oninput="updateBrightness(this.value)" style="width: 100%;">
+            </div>
+            <div id="led12v-status"></div>
         </div>
         
         <div class="test-section">
@@ -2125,9 +2249,60 @@ void handleTestPage() {
         
         <div class="test-section">
             <h2>📡 Sensor Tests</h2>
-            <button onclick="testSensors()">Read All Sensors</button>
+            <div style="margin-bottom: 10px;">
+                <label style="display: flex; align-items: center; margin-bottom: 10px;">
+                    <input type="checkbox" id="live-monitoring-toggle" onchange="toggleLiveMonitoring(this.checked)" style="margin-right: 10px; width: 20px; height: 20px;">
+                    <span style="font-size: 16px;">Live Monitoring (continuous updates)</span>
+                </label>
+            </div>
+            <button onclick="testSensors()">Read All Sensors (One Shot)</button>
             <div id="sensor-status"></div>
             <div id="sensor-values"></div>
+        </div>
+        
+        <div class="test-section">
+            <h2>🖥️ Display Tests</h2>
+            <p style="color: #666; margin-bottom: 10px;">Test display functionality and debugging</p>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                <button onclick="testDisplay('clear')">Clear Screen</button>
+                <button onclick="testDisplay('text')">Text Test</button>
+                <button onclick="testDisplay('colors')">Color Test</button>
+                <button onclick="testDisplay('pattern')">Pattern Test</button>
+            </div>
+            <div style="margin-top: 10px;">
+                <input type="text" id="debug-text-input" placeholder="Debug text..." style="width: 70%; padding: 8px; border: 2px solid #4a7c2a; border-radius: 4px; margin-right: 5px;">
+                <button onclick="testDisplayDebug()" style="width: 28%;">Show Debug</button>
+            </div>
+            <div id="display-status"></div>
+        </div>
+        
+        <div class="test-section">
+            <h2>👆 Touch Screen Test</h2>
+            <p style="color: #666; margin-bottom: 10px;">Test touch screen functionality (GPIO 25, 26)</p>
+            <button onclick="testTouch()">Check Touch</button>
+            <div style="margin-top: 10px;">
+                <label style="display: flex; align-items: center; margin-bottom: 10px;">
+                    <input type="checkbox" id="live-touch-toggle" onchange="toggleLiveTouch(this.checked)" style="margin-right: 10px; width: 20px; height: 20px;">
+                    <span style="font-size: 16px;">Live Touch Monitoring</span>
+                </label>
+            </div>
+            <div id="touch-status"></div>
+            <div id="touch-values"></div>
+        </div>
+        
+        <div class="test-section">
+            <h2>⚙️ Automation Controls</h2>
+            <p style="color: #666; margin-bottom: 10px;">Disable automations that interfere with manual testing</p>
+            <div style="margin-bottom: 15px;">
+                <label style="display: flex; align-items: center; margin-bottom: 10px;">
+                    <input type="checkbox" id="auto-brightness-toggle" checked onchange="toggleAutoBrightness(this.checked)" style="margin-right: 10px; width: 20px; height: 20px;">
+                    <span style="font-size: 16px;">Auto-Brightness (LED adjusts based on light sensor)</span>
+                </label>
+                <div id="auto-brightness-status" style="margin-top: 5px; font-size: 14px; color: #666;"></div>
+            </div>
+            <div style="background: #f0f0f0; padding: 10px; border-radius: 8px; font-size: 14px; color: #666;">
+                <strong>Note:</strong> When disabled, the 12V LED will stay at the brightness you set and won't automatically adjust based on ambient light.
+            </div>
         </div>
         
         <a href="#" onclick="window.location.href=addAuthToken('/'); return false;" class="back-link">← Back to Main</a>
@@ -2157,11 +2332,15 @@ void handleTestPage() {
             return url;
         }
         
-        function testLED(state) {
-            const statusDiv = document.getElementById('led-status');
-            statusDiv.innerHTML = '<div class="status info">Testing LED...</div>';
+        function updateBrightness(value) {
+            document.getElementById('brightness-value').textContent = value;
+        }
+        
+        function testPump(state) {
+            const statusDiv = document.getElementById('pump-status');
+            statusDiv.innerHTML = '<div class="status info">Testing pump...</div>';
             
-            fetch(addAuthToken('/api/test/led'), {
+            fetch(addAuthToken('/api/test/pump'), {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({state: state})
@@ -2169,7 +2348,7 @@ void handleTestPage() {
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    statusDiv.innerHTML = '<div class="status success">✅ LED ' + (state ? 'ON' : 'OFF') + ' - Test successful!</div>';
+                    statusDiv.innerHTML = '<div class="status success">✅ Pump ' + (state ? 'ON' : 'OFF') + ' - Test successful!</div>';
                 } else {
                     statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
                 }
@@ -2179,18 +2358,21 @@ void handleTestPage() {
             });
         }
         
-        function testPump() {
-            const statusDiv = document.getElementById('pump-status');
-            statusDiv.innerHTML = '<div class="status info">Starting pump test...</div>';
+        function testLED12V(state) {
+            const statusDiv = document.getElementById('led12v-status');
+            const brightness = parseInt(document.getElementById('brightness-slider').value);
+            statusDiv.innerHTML = '<div class="status info">Testing 12V LED...</div>';
             
-            fetch(addAuthToken('/api/test/pump'), {
+            fetch(addAuthToken('/api/test/led12v'), {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'}
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({state: state, brightness: brightness})
             })
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    statusDiv.innerHTML = '<div class="status success">✅ Pump started for ' + (data.duration || 1) + ' second(s)</div>';
+                    statusDiv.innerHTML = '<div class="status success">✅ 12V LED ' + (state ? 'ON' : 'OFF') + 
+                        (state ? ' (Brightness: ' + brightness + '/255)' : '') + ' - Test successful!</div>';
                 } else {
                     statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
                 }
@@ -2249,6 +2431,52 @@ void handleTestPage() {
         }
         
         
+        function toggleAutoBrightness(enabled) {
+            const statusDiv = document.getElementById('auto-brightness-status');
+            statusDiv.innerHTML = '<div class="status info">Updating automation setting...</div>';
+            
+            fetch(addAuthToken('/api/test/automation'), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({autoBrightness: enabled})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.innerHTML = '<div class="status success">✅ Auto-brightness ' + (enabled ? 'enabled' : 'disabled') + '</div>';
+                } else {
+                    statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
+                    // Revert checkbox
+                    document.getElementById('auto-brightness-toggle').checked = !enabled;
+                }
+            })
+            .catch(err => {
+                statusDiv.innerHTML = '<div class="status error">❌ Error: ' + err.message + '</div>';
+                // Revert checkbox
+                document.getElementById('auto-brightness-toggle').checked = !enabled;
+            });
+        }
+        
+        // Load current automation state on page load
+        function loadAutomationState() {
+            fetch(addAuthToken('/api/test/automation'))
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('auto-brightness-toggle').checked = data.autoBrightness || false;
+                }
+            })
+            .catch(err => {
+                console.error('Failed to load automation state:', err);
+            });
+        }
+        
+        // Load state when page loads
+        loadAutomationState();
+        
+        let liveMonitoringInterval = null;
+        let liveTouchInterval = null;
+        
         function testSensors() {
             const statusDiv = document.getElementById('sensor-status');
             const valuesDiv = document.getElementById('sensor-values');
@@ -2259,12 +2487,7 @@ void handleTestPage() {
             .then(data => {
                 if (data.success) {
                     statusDiv.innerHTML = '<div class="status success">✅ Sensors read successfully!</div>';
-                    valuesDiv.innerHTML = 
-                        '<div style="margin-top: 15px;">' +
-                        '<div><strong>Moisture Sensor (GPIO 34):</strong> <span class="sensor-value">' + data.moisture + '%</span></div>' +
-                        '<div style="margin-top: 10px;"><strong>IR Sensor (GPIO 32):</strong> <span class="sensor-value">' + (data.irDetected ? 'DETECTED' : 'CLEAR') + '</span></div>' +
-                        '<div style="margin-top: 5px; font-size: 14px; color: #666;">Raw Pin Value: ' + (data.irRaw !== undefined ? data.irRaw : 'N/A') + ' (0=LOW, 1=HIGH)</div>' +
-                        '</div>';
+                    updateSensorDisplay(data, valuesDiv);
                 } else {
                     statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
                 }
@@ -2272,6 +2495,146 @@ void handleTestPage() {
             .catch(err => {
                 statusDiv.innerHTML = '<div class="status error">❌ Error: ' + err.message + '</div>';
             });
+        }
+        
+        function updateSensorDisplay(data, valuesDiv) {
+            valuesDiv.innerHTML = 
+                '<div style="margin-top: 15px;">' +
+                '<div><strong>Moisture Sensor (GPIO 34):</strong> <span class="sensor-value">' + data.moisture + '%</span></div>' +
+                '<div style="margin-top: 10px;"><strong>IR Sensor (GPIO 32):</strong> <span class="sensor-value">' + (data.irDetected ? 'DETECTED' : 'CLEAR') + '</span></div>' +
+                '<div style="margin-top: 5px; font-size: 14px; color: #666;">Raw Pin Value: ' + (data.irRaw !== undefined ? data.irRaw : 'N/A') + ' (0=LOW, 1=HIGH)</div>' +
+                '<div style="margin-top: 10px;"><strong>Light Sensor (GPIO 35):</strong> <span class="sensor-value">' + (data.light || 'N/A') + '%</span></div>' +
+                '<div style="margin-top: 5px; font-size: 14px; color: #666;">Raw Value: ' + (data.lightRaw !== undefined ? data.lightRaw : 'N/A') + '</div>' +
+                '<div style="margin-top: 10px;"><strong>LED Brightness:</strong> <span class="sensor-value">' + (data.ledBrightness !== undefined ? data.ledBrightness : 'N/A') + '/255</span></div>' +
+                '</div>';
+        }
+        
+        function toggleLiveMonitoring(enabled) {
+            if (enabled) {
+                const valuesDiv = document.getElementById('sensor-values');
+                valuesDiv.innerHTML = '<div class="status info">Starting live monitoring...</div>';
+                liveMonitoringInterval = setInterval(() => {
+                    fetch(addAuthToken('/api/test/sensors'))
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateSensorDisplay(data, valuesDiv);
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Live monitoring error:', err);
+                    });
+                }, 500);  // Update every 500ms
+            } else {
+                if (liveMonitoringInterval) {
+                    clearInterval(liveMonitoringInterval);
+                    liveMonitoringInterval = null;
+                }
+            }
+        }
+        
+        function testDisplay(testType) {
+            const statusDiv = document.getElementById('display-status');
+            statusDiv.innerHTML = '<div class="status info">Testing display...</div>';
+            
+            fetch(addAuthToken('/api/test/display'), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({testType: testType})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.innerHTML = '<div class="status success">✅ ' + data.message + '</div>';
+                } else {
+                    statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
+                }
+            })
+            .catch(err => {
+                statusDiv.innerHTML = '<div class="status error">❌ Error: ' + err.message + '</div>';
+            });
+        }
+        
+        function testDisplayDebug() {
+            const text = document.getElementById('debug-text-input').value || 'Debug Test';
+            const statusDiv = document.getElementById('display-status');
+            statusDiv.innerHTML = '<div class="status info">Displaying debug text...</div>';
+            
+            fetch(addAuthToken('/api/test/display'), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    testType: 'debug',
+                    text: text,
+                    color: 0xFFFF,  // White
+                    size: 2
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.innerHTML = '<div class="status success">✅ ' + data.message + '</div>';
+                } else {
+                    statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
+                }
+            })
+            .catch(err => {
+                statusDiv.innerHTML = '<div class="status error">❌ Error: ' + err.message + '</div>';
+            });
+        }
+        
+        function testTouch() {
+            const statusDiv = document.getElementById('touch-status');
+            const valuesDiv = document.getElementById('touch-values');
+            statusDiv.innerHTML = '<div class="status info">Reading touch...</div>';
+            
+            fetch(addAuthToken('/api/test/touch'))
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.innerHTML = '<div class="status success">✅ Touch read successfully!</div>';
+                    updateTouchDisplay(data, valuesDiv);
+                } else {
+                    statusDiv.innerHTML = '<div class="status error">❌ Error: ' + (data.message || 'Failed') + '</div>';
+                }
+            })
+            .catch(err => {
+                statusDiv.innerHTML = '<div class="status error">❌ Error: ' + err.message + '</div>';
+            });
+        }
+        
+        function updateTouchDisplay(data, valuesDiv) {
+            valuesDiv.innerHTML = 
+                '<div style="margin-top: 15px;">' +
+                '<div><strong>Touch Pressed:</strong> <span class="sensor-value">' + (data.pressed ? 'YES' : 'NO') + '</span></div>' +
+                '<div style="margin-top: 10px;"><strong>IRQ Pin State:</strong> <span class="sensor-value">' + data.irqState + '</span></div>' +
+                '<div style="margin-top: 5px; font-size: 14px; color: #666;">GPIO 26 (0=LOW=touch, 1=HIGH=no touch)</div>' +
+                (data.hasTouch ? '<div style="margin-top: 10px;"><strong>Touch Coordinates:</strong> <span class="sensor-value">X: ' + data.x + ', Y: ' + data.y + '</span></div>' : '') +
+                '</div>';
+        }
+        
+        function toggleLiveTouch(enabled) {
+            if (enabled) {
+                const valuesDiv = document.getElementById('touch-values');
+                valuesDiv.innerHTML = '<div class="status info">Starting live touch monitoring...</div>';
+                liveTouchInterval = setInterval(() => {
+                    fetch(addAuthToken('/api/test/touch'))
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateTouchDisplay(data, valuesDiv);
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Live touch monitoring error:', err);
+                    });
+                }, 200);  // Update every 200ms for touch
+            } else {
+                if (liveTouchInterval) {
+                    clearInterval(liveTouchInterval);
+                    liveTouchInterval = null;
+                }
+            }
         }
     </script>
 </body>
@@ -2299,11 +2662,58 @@ void handleTestLED() {
     bool state = doc["state"].as<bool>();
     hardware->setLED(state);
     
-    Logger::info("WebServer", "🧪 LED test: " + String(state ? "ON" : "OFF"));
+    Logger::info("WebServer", "🧪 Embedded LED test (GPIO 2): " + String(state ? "ON" : "OFF"));
     
     DynamicJsonDocument response(128);
     response["success"] = true;
-    response["message"] = "LED set to " + String(state ? "ON" : "OFF");
+    response["message"] = "Embedded LED set to " + String(state ? "ON" : "OFF");
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+}
+
+void handleTestLED12V() {
+    if (!isAuthenticated()) {
+        server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(256);
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (error || !doc.containsKey("state")) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+        return;
+    }
+    
+    bool state = doc["state"].as<bool>();
+    uint8_t brightness = 128;  // Default brightness
+    
+    if (doc.containsKey("brightness")) {
+        brightness = doc["brightness"].as<uint8_t>();
+    }
+    
+    if (state) {
+        // Re-enable auto-brightness when turning ON (user can manually control)
+        hardware->setAutoBrightness(false);  // Disable auto so manual control works
+        hardware->setLEDBrightness(brightness);
+        Logger::info("WebServer", "🧪 12V LED test: ON (Brightness: " + String(brightness) + "/255, auto-brightness disabled)");
+    } else {
+        // Disable auto-brightness when turning OFF to prevent it from turning back on
+        hardware->setAutoBrightness(false);
+        hardware->setLEDBrightness(0);
+        Logger::info("WebServer", "🧪 12V LED test: OFF (auto-brightness disabled to prevent auto-turn-on)");
+    }
+    
+    DynamicJsonDocument response(256);
+    response["success"] = true;
+    response["message"] = "12V LED set to " + String(state ? "ON" : "OFF");
+    response["autoBrightness"] = false;  // Always disabled when manually controlled
+    if (state) {
+        response["brightness"] = brightness;
+    }
     
     String responseStr;
     serializeJson(response, responseStr);
@@ -2316,26 +2726,100 @@ void handleTestPump() {
         return;
     }
     
-    Logger::info("WebServer", "🧪 Pump test: Starting pump for 1 second");
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(128);
+    DeserializationError error = deserializeJson(doc, body);
     
-    bool started = hardware->startPump();
-    if (!started) {
-        DynamicJsonDocument response(128);
-        response["success"] = false;
-        response["message"] = "Pump could not start (may be in cooldown)";
-        String responseStr;
-        serializeJson(response, responseStr);
-        server.send(200, "application/json", responseStr);
+    if (error || !doc.containsKey("state")) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
         return;
     }
     
-    delay(1000);  // Run for 1 second
-    hardware->stopPump();
+    bool state = doc["state"].as<bool>();
     
-    DynamicJsonDocument response(128);
+    Logger::info("WebServer", "🧪 Pump test request: " + String(state ? "ON" : "OFF"));
+    
+    if (state) {
+        // Turn pump ON
+        bool started = hardware->startPump();
+        if (!started) {
+            // Check if it's a cooldown issue
+            String reason = "Pump could not start";
+            if (hardware->isDispensing()) {
+                reason = "Pump already running";
+            } else {
+                reason = "Pump could not start (may be in cooldown or already running)";
+            }
+            
+            DynamicJsonDocument response(256);
+            response["success"] = false;
+            response["message"] = reason;
+            response["isDispensing"] = hardware->isDispensing();
+            response["pumpState"] = hardware->isPumpRunning();
+            
+            String responseStr;
+            serializeJson(response, responseStr);
+            server.send(200, "application/json", responseStr);
+            return;
+        }
+        Logger::info("WebServer", "✅ Pump test: ON - GPIO " + String(SANITIZER_PUMP_PIN) + " set to HIGH");
+    } else {
+        // Turn pump OFF
+        hardware->stopPump();
+        Logger::info("WebServer", "✅ Pump test: OFF - GPIO " + String(SANITIZER_PUMP_PIN) + " set to LOW");
+    }
+    
+    DynamicJsonDocument response(256);
     response["success"] = true;
-    response["message"] = "Pump test completed";
-    response["duration"] = 1;
+    response["message"] = "Pump set to " + String(state ? "ON" : "OFF");
+    response["isDispensing"] = hardware->isDispensing();
+    response["pumpState"] = hardware->isPumpRunning();
+    response["gpioPin"] = SANITIZER_PUMP_PIN;
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+}
+
+void handleGetAutomation() {
+    if (!isAuthenticated()) {
+        server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    
+    DynamicJsonDocument response(256);
+    response["success"] = true;
+    response["autoBrightness"] = hardware->isAutoBrightnessEnabled();
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+}
+
+void handleSetAutomation() {
+    if (!isAuthenticated()) {
+        server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(256);
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (error || !doc.containsKey("autoBrightness")) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+        return;
+    }
+    
+    bool enabled = doc["autoBrightness"].as<bool>();
+    hardware->setAutoBrightness(enabled);
+    
+    Logger::info("WebServer", "🧪 Automation control: Auto-brightness " + String(enabled ? "enabled" : "disabled"));
+    
+    DynamicJsonDocument response(256);
+    response["success"] = true;
+    response["message"] = "Auto-brightness " + String(enabled ? "enabled" : "disabled");
+    response["autoBrightness"] = enabled;
     
     String responseStr;
     serializeJson(response, responseStr);
@@ -2388,6 +2872,109 @@ void handleTestSensors() {
     response["lightRaw"] = rawLightValue;
     response["ledBrightness"] = hardware->getLEDBrightness();
     response["message"] = "Sensors read successfully";
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+}
+
+void handleTestDisplay() {
+    if (!isAuthenticated()) {
+        server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(128);
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (error || !doc.containsKey("testType")) {
+        server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+        return;
+    }
+    
+    String testType = doc["testType"].as<String>();
+    Logger::info("WebServer", "🧪 Display test: " + testType);
+    
+    bool success = false;
+    String message = "";
+    
+    if (!hardware->displayAvailable()) {
+        DynamicJsonDocument response(128);
+        response["success"] = false;
+        response["message"] = "Display not available";
+        String responseStr;
+        serializeJson(response, responseStr);
+        server.send(200, "application/json", responseStr);
+        return;
+    }
+    
+    if (testType == "clear") {
+        uint16_t color = 0x0000;  // Black
+        if (doc.containsKey("color")) {
+            color = doc["color"].as<uint16_t>();
+        }
+        hardware->displayClear(color);
+        success = true;
+        message = "Display cleared";
+    } else if (testType == "pattern") {
+        hardware->displayTestPattern();
+        success = true;
+        message = "Test pattern drawn";
+    } else if (testType == "colors") {
+        hardware->displayTestColors();
+        success = true;
+        message = "Color test drawn";
+    } else if (testType == "text") {
+        hardware->displayTestText();
+        success = true;
+        message = "Text test drawn";
+    } else if (testType == "debug") {
+        String debugText = doc.containsKey("text") ? doc["text"].as<String>() : "Debug Test";
+        uint16_t color = doc.containsKey("color") ? doc["color"].as<uint16_t>() : 0xFFFF;
+        uint8_t size = doc.containsKey("size") ? doc["size"].as<uint8_t>() : 2;
+        hardware->displayDebugText(debugText, color, size);
+        success = true;
+        message = "Debug text displayed";
+    } else {
+        success = false;
+        message = "Unknown test type: " + testType;
+    }
+    
+    DynamicJsonDocument response(256);
+    response["success"] = success;
+    response["message"] = message;
+    response["testType"] = testType;
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+}
+
+void handleTestTouch() {
+    if (!isAuthenticated()) {
+        server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+    }
+    
+    Logger::info("WebServer", "🧪 Touch test: Reading touch state");
+    
+    bool pressed = hardware->isTouchPressed();
+    int irqState = hardware->getTouchIRQState();
+    
+    int16_t x = 0, y = 0;
+    bool hasTouch = hardware->readTouch(&x, &y);
+    
+    DynamicJsonDocument response(256);
+    response["success"] = true;
+    response["pressed"] = pressed;
+    response["irqState"] = irqState;
+    response["hasTouch"] = hasTouch;
+    if (hasTouch) {
+        response["x"] = x;
+        response["y"] = y;
+    }
+    response["message"] = pressed ? "Touch detected" : "No touch";
     
     String responseStr;
     serializeJson(response, responseStr);
