@@ -198,4 +198,4 @@
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/Update/src/Update.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_rom/include/esp_rom_md5.h \
- include/Logger.h include/version.h
+ include/Logger.h include/version.h include/Logger.h

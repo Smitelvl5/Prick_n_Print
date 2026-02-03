@@ -29,6 +29,12 @@ private:
     // Text sanitization for printer compatibility
     String sanitizeForPrinter(const String& text);
     
+    // Layout helpers (use private printer commands)
+    void printHeader(const char* title);
+    void printFooter();
+    void printSeparator();
+    void printDateLine(const char* label, time_t t);
+    
 public:
     PrinterService(HardwareAbstraction* hw);
     ~PrinterService();
@@ -37,6 +43,10 @@ public:
     bool printReceipt(const String& message, bool includeWeatherAndSanitizer, time_t createdTime = 0);
     bool printGroceryList(const String* items, int itemCount);
     bool printBitmap(const uint8_t* bitmap, uint16_t width, uint16_t height);
+    // Preformatted slip (e.g. from TZT: "REMINDER\n----...", "GROCERY LIST\n..."); inits, sanitizes, prints, optional weather, footer, cut
+    bool printPreformatted(const String& body, const String& weatherOneLine = "");
+    // Message only (e.g. from index.html): just the text, no title/weather/dividers; init, print, cut
+    bool printMessageOnly(const String& message);
     
     // Weather management
     void setWeather(const String& weather) { currentWeather = weather; }

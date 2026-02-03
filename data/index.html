@@ -3,9 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Print_n_Prick - Remote control interface for your romantic message dispenser">
-    <meta name="apple-mobile-web-app-title" content="Print_n_Prick">
-    <title>Print_n_Prick Control</title>
+    <meta name="description" content="Print-n-Prick - Thermal printer with a cactus pot. Remote control for your smart cactus care device.">
+    <meta name="apple-mobile-web-app-title" content="Print-n-Prick">
+    <title>Print-n-Prick Control</title>
     <style>
         * {
             margin: 0;
@@ -15,22 +15,46 @@
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #1a120c 0%, #1a3d0e 25%, #2d5016 50%, #4a7c2a 75%, #6b9f3d 100%);
             min-height: 100vh;
             padding: 20px;
+            position: relative;
+            overflow-x: hidden;
+        }
+        body::before {
+            content: '🌵';
+            position: fixed;
+            font-size: 280px;
+            opacity: 0.05;
+            top: -80px;
+            left: -80px;
+            z-index: 0;
+        }
+        body::after {
+            content: '🖨️';
+            position: fixed;
+            font-size: 200px;
+            opacity: 0.05;
+            bottom: -60px;
+            right: -60px;
+            z-index: 0;
         }
         
         .container {
             max-width: 400px;
             margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            background: linear-gradient(135deg, #f5f5f0 0%, #ffffff 100%);
+            border-radius: 24px;
+            box-shadow: 0 12px 40px rgba(26, 18, 12, 0.5), 0 0 0 3px rgba(74, 124, 42, 0.2), inset 0 0 0 1px rgba(62, 39, 35, 0.15);
+            border: 3px solid #4a7c2a;
+            border-left: 4px solid #3e2723;
             overflow: hidden;
+            position: relative;
+            z-index: 1;
         }
         
         .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #2c1810 0%, #2d5016 40%, #4a7c2a 100%);
             color: white;
             padding: 30px 20px;
             text-align: center;
@@ -39,10 +63,11 @@
         .header h1 {
             font-size: 24px;
             margin-bottom: 5px;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
         }
         
         .header p {
-            opacity: 0.9;
+            opacity: 0.95;
             font-size: 14px;
         }
         
@@ -51,11 +76,19 @@
         }
         
         .status-card {
-            background: #f8f9fa;
+            background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
             border-radius: 15px;
             padding: 20px;
             margin-bottom: 20px;
-            border-left: 4px solid #667eea;
+            border: 2px solid #4a7c2a;
+            border-left: 4px solid #8b4513;
+            box-shadow: 0 4px 8px rgba(62, 39, 35, 0.08);
+        }
+        
+        .status-card h3 {
+            color: #2d5016;
+            margin-bottom: 12px;
+            font-size: 16px;
         }
         
         .status-item {
@@ -64,7 +97,7 @@
             align-items: center;
             margin-bottom: 10px;
             padding: 8px 0;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid #e8ecd8;
         }
         
         .status-item:last-child {
@@ -81,9 +114,9 @@
             font-weight: 600;
         }
         
-        .status-ok { color: #28a745; }
+        .status-ok { color: #2d5016; }
         .status-error { color: #dc3545; }
-        .status-warning { color: #ffc107; }
+        .status-warning { color: #8b4513; }
         
         .button-group {
             display: grid;
@@ -103,31 +136,47 @@
             text-align: center;
             text-decoration: none;
             display: inline-block;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
         }
         
         .btn-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #2d5016 0%, #4a7c2a 100%);
             color: white;
         }
         
         .btn-primary:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 6px 14px rgba(45, 80, 22, 0.4);
         }
         
         .btn-success {
-            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            background: linear-gradient(135deg, #2d5016 0%, #4a7c2a 100%);
             color: white;
+        }
+        
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 14px rgba(45, 80, 22, 0.4);
         }
         
         .btn-danger {
-            background: linear-gradient(135deg, #dc3545 0%, #e83e8c 100%);
+            background: linear-gradient(135deg, #8b4513 0%, #a0522d 100%);
             color: white;
         }
         
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 14px rgba(139, 69, 19, 0.4);
+        }
+        
         .btn-warning {
-            background: linear-gradient(135deg, #ffc107 0%, #fd7e14 100%);
+            background: linear-gradient(135deg, #6b9f3d 0%, #5a8a32 100%);
             color: white;
+        }
+        
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 14px rgba(107, 159, 61, 0.4);
         }
         
         .btn:disabled {
@@ -145,16 +194,20 @@
             width: 100%;
             padding: 15px;
             padding-bottom: 35px;
-            border: 2px solid #e9ecef;
+            border: 2px solid #4a7c2a;
+            border-bottom: 3px solid #3e2723;
             border-radius: 12px;
             font-size: 16px;
-            transition: border-color 0.3s ease;
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
             box-sizing: border-box;
+            background: #fff;
         }
         
         .message-input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #6b9f3d;
+            border-bottom-color: #8b4513;
+            box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
         }
         
         .char-counter {
@@ -162,12 +215,12 @@
             bottom: 8px;
             right: 12px;
             font-size: 12px;
-            color: #6c757d;
+            color: #3e2723;
             font-weight: 500;
         }
         
         .char-counter.warning {
-            color: #ffc107;
+            color: #8b4513;
         }
         
         .char-counter.danger {
@@ -192,11 +245,13 @@
         }
         
         .notification.success {
-            background: #28a745;
+            background: linear-gradient(135deg, #2d5016 0%, #4a7c2a 100%);
+            border: 1px solid #6b9f3d;
         }
         
         .notification.error {
-            background: #dc3545;
+            background: linear-gradient(135deg, #8b4513 0%, #a0522d 100%);
+            border: 1px solid #c17a4a;
         }
         
         .loading {
@@ -206,8 +261,9 @@
         }
         
         .spinner {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #667eea;
+            border: 3px solid #e8ecd8;
+            border-top-color: #4a7c2a;
+            border-right-color: #8b4513;
             border-radius: 50%;
             width: 30px;
             height: 30px;
@@ -224,8 +280,8 @@
             position: absolute;
             top: 20px;
             right: 20px;
-            background: rgba(255,255,255,0.2);
-            border: none;
+            background: rgba(255,255,255,0.25);
+            border: 1px solid rgba(255,255,255,0.3);
             color: white;
             padding: 8px;
             border-radius: 50%;
@@ -234,107 +290,26 @@
         }
         
         .info-box {
-            background: #e3f2fd;
-            border: 1px solid #2196f3;
-            border-radius: 8px;
+            background: linear-gradient(135deg, #e8f5e9 0%, #f1f8e9 100%);
+            border: 2px solid #4a7c2a;
+            border-left: 4px solid #6b9f3d;
+            border-radius: 12px;
             padding: 15px;
             margin-bottom: 20px;
             font-size: 14px;
-            color: #1565c0;
+            color: #1b5e20;
         }
         
-        /* Schedule Configuration Styles */
-        .schedule-section {
-            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            border-radius: 15px;
-            padding: 20px;
-            margin: 20px 0;
-            border: 2px solid #dee2e6;
-        }
-        
-        .schedule-section h3 {
-            margin: 0 0 10px 0;
-            color: #495057;
-            font-size: 18px;
-        }
-        
-        .schedule-info {
-            color: #6c757d;
-            font-size: 14px;
-            margin: 0 0 15px 0;
-            line-height: 1.4;
-        }
-        
-        .schedule-controls {
-            margin-bottom: 15px;
-        }
-        
-        .schedule-controls label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #495057;
-        }
-        
-        .schedule-select {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #dee2e6;
-            border-radius: 8px;
-            font-size: 14px;
-            background: white;
-            margin-bottom: 15px;
-            transition: border-color 0.3s ease;
-        }
-        
-        .schedule-select:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        
-        .schedule-buttons {
-            display: flex;
-            gap: 10px;
-        }
-        
-        .schedule-buttons .btn {
-            flex: 1;
-            font-size: 14px;
-            padding: 10px 15px;
-        }
-        
-        .schedule-note {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            border-radius: 8px;
-            padding: 12px;
-            font-size: 13px;
-            color: #856404;
-        }
-        
-        .schedule-note p {
-            margin: 5px 0;
-        }
-        
-        .schedule-note strong {
-            color: #856404;
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <button class="refresh-btn" onclick="refreshStatus()">🔄</button>
-            <h1>🧴 Print_n_Prick</h1>
-            <p>Hand Sanitizer Dispenser</p>
+            <h1>🌵 Print-n-Prick</h1>
+            <p>Thermal printer with a cactus pot</p>
         </div>
         
         <div class="content">
-            <div class="info-box">
-                <strong>🌐 Remote Access Ready!</strong><br>
-                This interface works from anywhere in the world. Your ESP32 communicates through Firebase, so you can control it remotely.
-            </div>
-            
             <div class="status-card">
                 <h3>📊 System Status</h3>
                 <div id="status-content">
@@ -342,62 +317,6 @@
                         <span class="status-label">WiFi</span>
                         <span class="status-value" id="wifi-status">Loading...</span>
                     </div>
-                    <div class="status-item">
-                        <span class="status-label">IR Sensor</span>
-                        <span class="status-value" id="ir-status">Loading...</span>
-                    </div>
-                    <div class="status-item">
-                        <span class="status-label">Dispensing</span>
-                        <span class="status-value" id="dispensing-status">Loading...</span>
-                    </div>
-                    <div class="status-item">
-                        <span class="status-label">Last Update</span>
-                        <span class="status-value" id="last-update">Loading...</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="btn btn-success" onclick="startDispensing()">🧴 Start Dispensing</button>
-                <button class="btn btn-danger" onclick="stopDispensing()">⏸️ Stop Dispensing</button>
-            </div>
-            
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="getWeather()">🌤️ Get Weather</button>
-                <button class="btn btn-warning" onclick="refreshStatus()">🔄 Refresh Status</button>
-            </div>
-            
-            <div class="button-group">
-                <button class="btn btn-danger" onclick="clearCommands()" style="width: 100%;">🧹 Clear Past Commands</button>
-            </div>
-            
-            <!-- Schedule Configuration Section -->
-            <div class="schedule-section">
-                <h3>📅 Firebase Check Schedule</h3>
-                <p class="schedule-info">Configure how often the ESP32 checks Firebase for commands (optimized for free tier)</p>
-                
-                <div class="schedule-controls">
-                    <label for="checksPerDay">Checks per day:</label>
-                    <select id="checksPerDay" class="schedule-select">
-                        <option value="1">1 check (5 AM only)</option>
-                        <option value="2">2 checks (5 AM, 5 PM)</option>
-                        <option value="3">3 checks (5 AM, 1 PM, 9 PM)</option>
-                        <option value="4" selected>4 checks (5 AM, 11 AM, 5 PM, 11 PM)</option>
-                        <option value="6">6 checks (every 4 hours)</option>
-                        <option value="8">8 checks (every 3 hours)</option>
-                        <option value="12">12 checks (every 2 hours)</option>
-                        <option value="24">24 checks (every hour)</option>
-                    </select>
-                    
-                    <div class="schedule-buttons">
-                        <button class="btn btn-primary" onclick="updateSchedule()">🔄 Update Schedule</button>
-                        <button class="btn btn-warning" onclick="getScheduleInfo()">📋 Get Current Schedule</button>
-                    </div>
-                </div>
-                
-                <div class="schedule-note">
-                    <p><strong>Note:</strong> 5 AM is always included. Other checks are evenly spaced throughout the day.</p>
-                    <p><strong>Free Tier Optimization:</strong> Fewer checks = lower Firebase usage</p>
                 </div>
             </div>
             
@@ -441,28 +360,25 @@
             document.getElementById('loading').style.display = 'none';
         }
         
-        async function sendCommand(commandType, commandData = '') {
+        async function sendCommand(commandType, commandData = '', options = {}) {
             showLoading();
-            
             try {
                 const command = {
                     id: Date.now().toString(),
                     type: commandType,
                     data: commandData,
                     timestamp: new Date().toISOString(),
-                    processed: false
+                    processed: false,
+                    ...options
                 };
-                
                 const response = await fetch(`${FIREBASE_URL}/commands.json`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(command)
                 });
-                
                 if (response.ok) {
                     showNotification('Command sent successfully!', 'success');
+                    refreshStatus();
                 } else {
                     showNotification('Failed to send command', 'error');
                 }
@@ -490,69 +406,6 @@
         function updateStatusDisplay(status) {
             document.getElementById('wifi-status').textContent = status.wifi ? '✅ Connected' : '❌ Disconnected';
             document.getElementById('wifi-status').className = `status-value ${status.wifi ? 'status-ok' : 'status-error'}`;
-            
-            // Support both old and new status field names for backward compatibility
-            const irDetected = status.irSensor !== undefined ? status.irSensor : (status.soilMoisture !== undefined ? status.soilMoisture : false);
-            document.getElementById('ir-status').textContent = irDetected ? '✅ Detected' : '⚪ Clear';
-            document.getElementById('ir-status').className = `status-value ${irDetected ? 'status-ok' : 'status-warning'}`;
-            
-            // Support both old and new status field names for backward compatibility
-            const isDispensing = status.dispensing !== undefined ? status.dispensing : (status.watering !== undefined ? status.watering : false);
-            document.getElementById('dispensing-status').textContent = isDispensing ? '🔄 Active' : '⏸️ Inactive';
-            document.getElementById('dispensing-status').className = `status-value ${isDispensing ? 'status-warning' : 'status-ok'}`;
-            
-            document.getElementById('last-update').textContent = status.timestamp || 'N/A';
-        }
-        
-        function startDispensing() {
-            sendCommand('dispense_start', 'start');
-        }
-        
-        function stopDispensing() {
-            sendCommand('dispense_stop', 'stop');
-        }
-        
-        function getWeather() {
-            sendCommand('weather', 'get_weather');
-        }
-        
-        async function clearCommands() {
-            if (!confirm('Are you sure you want to clear all processed commands? This cannot be undone.')) {
-                return;
-            }
-            
-            showLoading();
-            
-            try {
-                // Get all commands
-                const response = await fetch(`${FIREBASE_URL}/commands.json`);
-                if (response.ok) {
-                    const commands = await response.json();
-                    let deletedCount = 0;
-                    
-                    if (commands) {
-                        for (const [commandId, commandData] of Object.entries(commands)) {
-                            if (commandData.processed) {
-                                // Delete processed command
-                                const deleteResponse = await fetch(`${FIREBASE_URL}/commands/${commandId}.json`, {
-                                    method: 'DELETE'
-                                });
-                                if (deleteResponse.ok) {
-                                    deletedCount++;
-                                }
-                            }
-                        }
-                    }
-                    
-                    showNotification(`Cleared ${deletedCount} processed commands!`, 'success');
-                } else {
-                    showNotification('Failed to get commands', 'error');
-                }
-            } catch (error) {
-                showNotification('Error clearing commands: ' + error.message, 'error');
-            } finally {
-                hideLoading();
-            }
         }
         
         function sendMessage() {
@@ -562,7 +415,8 @@
                     showNotification('Message too long! Maximum 500 characters allowed.', 'error');
                     return;
                 }
-                sendCommand('print', message);
+                // source: "web" → printer shows message only (no title, date, weather). Shortcut uses "shortcut" or omits for full receipt.
+                sendCommand('print', message, { source: 'web' });
                 document.getElementById('messageInput').value = '';
                 updateCharCounter();
             } else {
@@ -570,7 +424,6 @@
             }
         }
         
-        // Character counter functionality
         const messageInput = document.getElementById('messageInput');
         const charCounter = document.getElementById('charCounter');
         
@@ -578,44 +431,20 @@
             const length = messageInput.value.length;
             const maxLength = 500;
             charCounter.textContent = `${length}/${maxLength} characters`;
-            
-            // Update counter color based on length
             charCounter.className = 'char-counter';
-            if (length > maxLength * 0.8) {
-                charCounter.classList.add('warning');
-            }
-            if (length > maxLength * 0.95) {
-                charCounter.classList.add('danger');
-            }
+            if (length > maxLength * 0.8) charCounter.classList.add('warning');
+            if (length > maxLength * 0.95) charCounter.classList.add('danger');
         }
         
-        // Update counter on input
         messageInput.addEventListener('input', updateCharCounter);
-        
-        // Enter key to send message
         messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
-            }
+            if (e.key === 'Enter') sendMessage();
         });
-        
-        // Schedule control functions
-        function updateSchedule() {
-            const checksPerDay = document.getElementById('checksPerDay').value;
-            sendCommand('set_schedule', checksPerDay);
-        }
-        
-        function getScheduleInfo() {
-            sendCommand('get_schedule', 'get_current_schedule');
-        }
         
         // Auto-refresh status every 30 seconds
         setInterval(refreshStatus, 30000);
         
-        // Initial status load
         refreshStatus();
-        
-        // Initialize counter
         updateCharCounter();
     </script>
 </body>

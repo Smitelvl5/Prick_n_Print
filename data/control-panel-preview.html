@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control Panel Preview – Print-n-Prick</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a120c 0%, #1a3d0e 25%, #2d5016 50%, #4a7c2a 75%, #6b9f3d 100%);
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 8px;
+      color: #e8ecd8;
+    }
+    h1 {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: rgba(255,255,255,0.85);
+    }
+    .screen-wrap {
+      border: 2px solid #3e2723;
+      border-radius: 6px;
+      padding: 6px;
+      background: #1a120c;
+      box-shadow: 0 0 24px rgba(26, 18, 12, 0.6), 0 0 0 1px rgba(62, 39, 35, 0.8);
+      /* Maximize preview on small viewports: scale to fill width */
+      width: min(320px, calc(100vw - 24px));
+      max-width: 100%;
+    }
+    .screen {
+      width: 100%;
+      aspect-ratio: 320 / 240;
+      max-height: min(240px, calc(100dvh - 80px));
+      background: linear-gradient(180deg, #1a120c 0%, #1a3d0e 20%, #2d5016 50%, #4a7c2a 100%);
+      border-radius: 4px;
+      position: relative;
+      overflow: hidden;
+      font-size: 14px;
+    }
+    .screen-bg {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      padding-bottom: 8%;
+    }
+    .screen-bg svg {
+      width: 58%;
+      max-height: 95%;
+      opacity: 0.99;
+      object-fit: contain;
+      object-position: center bottom;
+    }
+    .page {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      display: none;
+      flex-direction: column;
+      padding: 4px;
+      min-height: 0;
+    }
+    .page.active { display: flex; }
+
+    /* Screen 1: 4 boxes - maximized, big value font */
+    .boxes {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      flex: 1;
+      min-height: 0;
+    }
+    .box {
+      background: rgba(26, 61, 14, 0.6);
+      border: 1px solid rgba(74, 124, 42, 0.6);
+      border-bottom: 2px solid rgba(62, 39, 35, 0.5);
+      border-radius: 6px;
+      padding: 4px 6px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      align-items: flex-start;
+      min-height: 0;
+    }
+    .box .name {
+      color: #b0b0b0;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.1;
+      flex-shrink: 0;
+    }
+    .box .value {
+      color: #fff;
+      font-size: 48px;
+      font-weight: 700;
+      line-height: 1.1;
+      flex: 1;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+    }
+
+    /* Nav buttons - max size; on page 1 only, push to bottom */
+    .nav {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 0;
+      padding-top: 4px;
+      flex-shrink: 0;
+      gap: 8px;
+    }
+    #page0 .nav,
+    #page1 .nav { margin-top: auto; }
+    .nav button {
+      flex: 1;
+      min-width: 0;
+      height: 30px;
+      border: none;
+      border-radius: 4px;
+      background: linear-gradient(180deg, #2d5016 0%, #1a3d0e 100%);
+      border-bottom: 2px solid #3e2723;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .nav button:active { background: #1a120c; border-bottom-color: #8b4513; }
+
+    /* Combined page: Pump + LED side by side, fill height, same appearance */
+    .combined-content {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      flex: 1;
+      min-height: 0;
+      align-content: start;
+    }
+    .combined-content .pump-content,
+    .combined-content .led-content {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 6px;
+      background: rgba(26, 61, 14, 0.5);
+      border: 1px solid rgba(74, 124, 42, 0.6);
+      border-left: 3px solid rgba(139, 69, 19, 0.5);
+      border-radius: 6px;
+    }
+    .combined-content .pump-title,
+    .combined-content .led-title {
+      font-size: 22px;
+      color: #fff;
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 0;
+    }
+    .combined-content .pump-row,
+    .combined-content .cal-label {
+      font-size: 16px;
+      font-weight: 600;
+      color: #e0e0e0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0;
+      line-height: 1.3;
+    }
+    .combined-content .pump-slider {
+      height: 18px;
+      margin: 0;
+      border-radius: 4px;
+    }
+    .combined-content .cal-btns {
+      display: flex;
+      gap: 6px;
+      margin: 0;
+    }
+    .combined-content .cal-btns button {
+      flex: 1;
+      min-width: 0;
+      height: 32px;
+      border: none;
+      border-radius: 4px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .combined-content .cal-btns .cal-on { background: #4a7c2a; color: #fff; }
+    .combined-content .cal-btns .cal-off { background: #3e2723; color: #e8ecd8; }
+    .combined-content .toggle { width: 40px; height: 24px; border-radius: 12px; }
+    .combined-content .toggle::after { width: 20px; height: 20px; top: 2px; left: 2px; }
+    .combined-content .toggle.on::after { left: 22px; }
+
+    /* Sensor row: above Prev/Next on page 2, same look as panel rows */
+    .sensor-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 0 2px;
+      flex-shrink: 0;
+      border-top: 1px solid rgba(62, 39, 35, 0.6);
+      margin-top: 2px;
+    }
+    .sensor-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex: 1;
+      min-width: 0;
+      color: #e0e0e0;
+      font-size: 16px;
+      font-weight: 600;
+      padding: 0 2px;
+    }
+    .sensor-item .toggle { flex-shrink: 0; }
+    #page1 .sensor-row .toggle {
+      width: 40px;
+      height: 24px;
+      border-radius: 12px;
+      background: #3e2723;
+    }
+    #page1 .sensor-row .toggle.on { background: #4a7c2a; }
+    #page1 .sensor-row .toggle::after {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #fff;
+      top: 2px;
+      left: 2px;
+    }
+    #page1 .sensor-row .toggle.on::after { left: 22px; }
+
+    /* Screen 2: Pump - content height only, nav right below */
+    .pump-content { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
+    .pump-title { color: #fff; font-weight: 700; font-size: 18px; margin-bottom: 0; line-height: 1.2; }
+    .pump-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0;
+      color: #e0e0e0;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+    .pump-slider {
+      width: 100%;
+      height: 10px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: linear-gradient(90deg, #1a3d0e 0%, #2d5016 100%);
+      border-radius: 3px;
+      margin-bottom: 2px;
+    }
+    .pump-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #6b9f3d;
+      border: 1px solid #8b4513;
+      cursor: pointer;
+    }
+    .pump-row.switch { margin-top: 2px; }
+    .toggle {
+      width: 36px;
+      height: 20px;
+      border-radius: 10px;
+      background: #3e2723;
+      cursor: pointer;
+      position: relative;
+    }
+    .toggle.on { background: #4a7c2a; }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #fff;
+      top: 2px;
+      left: 2px;
+      transition: left 0.2s;
+    }
+    .toggle.on::after { left: 18px; }
+
+    /* Screen 3: LED - content height only, nav right below */
+    .led-content { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
+    .led-title { color: #fff; font-weight: 700; font-size: 18px; margin-bottom: 0; line-height: 1.2; }
+    .led-slider-wrap {
+      height: 14px;
+      background: linear-gradient(90deg, #1a3d0e 0%, #2d5016 100%);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 4px;
+    }
+    .led-slider-fill {
+      height: 100%;
+      width: 0%;
+      background: #6b9f3d;
+      border-radius: 3px;
+      transition: width 0.1s;
+    }
+    .cal-label { color: #e0e0e0; font-size: 14px; font-weight: 600; margin: 1px 0; }
+    .cal-btns { display: flex; gap: 6px; margin: 2px 0; }
+    .cal-btns button {
+      flex: 1;
+      min-width: 0;
+      height: 30px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .cal-btns .cal-off { background: #3e2723; color: #e8ecd8; }
+    .cal-btns .cal-on { background: #4a7c2a; color: #fff; }
+    .cal-hint {
+      font-size: 9px;
+      color: #888;
+      margin-top: 0;
+      line-height: 1.2;
+    }
+    .note {
+      margin-top: 8px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.8);
+      text-align: center;
+      max-width: 100%;
+    }
+    .page-indicator {
+      margin-top: 4px;
+      font-size: 10px;
+      color: rgba(255,255,255,0.85);
+    }
+    /* On very small viewports, let the screen fill available space */
+    @media (max-width: 360px) {
+      body { padding: 4px; }
+      .screen-wrap { width: calc(100vw - 16px); padding: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>🌵 Print-n-Prick — TZT screen preview (320×240)</h1>
+  <div class="screen-wrap">
+    <div class="screen">
+      <div class="screen-bg" aria-hidden="true">
+        <svg viewBox="0 0 80 120" xmlns="http://www.w3.org/2000/svg">
+          <!-- pot -->
+          <path d="M 25 105 L 28 120 L 52 120 L 55 105 Z" fill="#3e2723" opacity="0.9"/>
+          <path d="M 28 108 L 52 108 L 50 105 L 30 105 Z" fill="#4e342e"/>
+          <!-- main body -->
+          <ellipse cx="40" cy="65" rx="14" ry="42" fill="#1b5e20"/>
+          <ellipse cx="40" cy="62" rx="11" ry="38" fill="#2e7d32"/>
+          <!-- left arm -->
+          <ellipse cx="12" cy="45" rx="10" ry="18" fill="#1b5e20" transform="rotate(-25 12 45)"/>
+          <ellipse cx="11" cy="42" rx="7" ry="14" fill="#2e7d32" transform="rotate(-25 11 42)"/>
+          <!-- right arm -->
+          <ellipse cx="68" cy="50" rx="10" ry="18" fill="#1b5e20" transform="rotate(28 68 50)"/>
+          <ellipse cx="69" cy="47" rx="7" ry="14" fill="#2e7d32" transform="rotate(28 69 47)"/>
+          <!-- spines (main body left) -->
+          <line x1="32" y1="28" x2="26" y2="24" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="31" y1="35" x2="26" y2="32" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="32" y1="42" x2="27" y2="40" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="33" y1="52" x2="28" y2="51" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="34" y1="62" x2="29" y2="62" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="35" y1="72" x2="30" y2="73" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="36" y1="82" x2="31" y2="84" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="37" y1="90" x2="32" y2="93" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <!-- spines (main body right) -->
+          <line x1="48" y1="30" x2="54" y2="27" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="49" y1="38" x2="54" y2="35" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="48" y1="46" x2="53" y2="44" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="47" y1="55" x2="52" y2="54" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="46" y1="64" x2="51" y2="65" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="45" y1="74" x2="50" y2="76" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="44" y1="84" x2="49" y2="86" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <line x1="43" y1="92" x2="48" y2="95" stroke="#0d3d0d" stroke-width="0.8" opacity="0.8"/>
+          <!-- spines (left arm) -->
+          <line x1="14" y1="38" x2="8" y2="35" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+          <line x1="16" y1="45" x2="10" y2="45" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+          <line x1="14" y1="52" x2="9" y2="54" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+          <!-- spines (right arm) -->
+          <line x1="66" y1="42" x2="72" y2="40" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+          <line x1="64" y1="50" x2="70" y2="50" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+          <line x1="66" y1="57" x2="71" y2="59" stroke="#0d3d0d" stroke-width="0.7" opacity="0.8"/>
+        </svg>
+      </div>
+      <!-- Screen 1: Status (4 boxes) -->
+      <div class="page active" id="page0">
+        <div class="boxes">
+          <div class="box">
+            <span class="name">Moisture</span>
+            <span class="value" id="moisture">--</span>
+          </div>
+          <div class="box">
+            <span class="name">Sanitizer</span>
+            <span class="value" id="sanitizer">--</span>
+          </div>
+          <div class="box">
+            <span class="name">LED</span>
+            <span class="value" id="led">--</span>
+          </div>
+          <div class="box">
+            <span class="name">Pump</span>
+            <span class="value" id="pump">--</span>
+          </div>
+        </div>
+        <div class="nav">
+          <button type="button" onclick="go(-1)">‹ Prev</button>
+          <button type="button" onclick="go(1)">Next ›</button>
+        </div>
+      </div>
+      <!-- Screen 2: Pump + LED combined -->
+      <div class="page" id="page1">
+        <div class="combined-content">
+          <div class="pump-content">
+            <div class="pump-title">Pump</div>
+            <div class="pump-row">
+              <span>Duration</span>
+              <span id="durationVal">2.0s</span>
+            </div>
+            <input type="range" class="pump-slider" id="duration" min="5" max="255" value="20" oninput="updateDuration(this.value)">
+            <div class="pump-row">
+              <span>Cooldown</span>
+              <span id="cooldownVal">3.0s</span>
+            </div>
+            <input type="range" class="pump-slider" id="cooldown" min="10" max="255" value="30" oninput="updateCooldown(this.value)">
+          </div>
+          <div class="led-content">
+            <div class="led-title">LED</div>
+            <div class="pump-row">
+              <span>Level</span>
+              <span id="ledLevelVal">0%</span>
+            </div>
+            <input type="range" class="pump-slider" id="ledLevel" min="0" max="100" value="0" oninput="updateLedLevel(this.value)">
+            <div class="cal-label">Calibrate</div>
+            <div class="cal-btns">
+              <button type="button" class="cal-off">Min</button>
+              <button type="button" class="cal-on">Max</button>
+            </div>
+          </div>
+        </div>
+        <div class="sensor-row">
+          <div class="sensor-item">
+            <span>Sensor</span>
+            <div class="toggle" id="pumpSensor" onclick="this.classList.toggle('on')"></div>
+          </div>
+          <div class="sensor-item">
+            <span>Sensor</span>
+            <div class="toggle" id="ledSensor" onclick="this.classList.toggle('on')"></div>
+          </div>
+        </div>
+        <div class="nav">
+          <button type="button" onclick="go(-1)">‹ Prev</button>
+          <button type="button" onclick="go(1)">Next ›</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="page-indicator">Page <span id="pageNum">1</span> of 2</p>
+  <p class="note">Print-n-Prick TZT: Screen 1 = status (4 boxes). Screen 2 = pump + LED. Use Prev/Next to switch.</p>
+
+  <script>
+    let currentPage = 0;
+    let ledVal = 0;
+
+    function go(next) {
+      document.getElementById('page' + currentPage).classList.remove('active');
+      currentPage = (currentPage + next) % 2;
+      if (currentPage < 0) currentPage += 2;
+      document.getElementById('page' + currentPage).classList.add('active');
+      document.getElementById('pageNum').textContent = currentPage + 1;
+    }
+
+    function updateDuration(v) {
+      v = parseInt(v, 10);
+      document.getElementById('durationVal').textContent = (v / 10).toFixed(1) + 's';
+    }
+    function updateCooldown(v) {
+      v = parseInt(v, 10);
+      document.getElementById('cooldownVal').textContent = (v / 10).toFixed(1) + 's';
+    }
+    function updateLedLevel(v) {
+      v = parseInt(v, 10);
+      ledVal = v;
+      document.getElementById('ledLevelVal').textContent = v + '%';
+      document.getElementById('led').textContent = v + '%';
+    }
+
+    // Sample data for screen 1
+    document.getElementById('moisture').textContent = '42.5%';
+    document.getElementById('sanitizer').textContent = '78.0%';
+    document.getElementById('led').textContent = '100%';
+    document.getElementById('pump').textContent = 'OFF';
+  </script>
+</body>
+</html>

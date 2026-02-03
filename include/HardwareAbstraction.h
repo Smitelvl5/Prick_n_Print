@@ -3,43 +3,16 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
-#include <SPI.h>
-
-// Configure TFT_eSPI before including it
-#define USER_SETUP_LOADED
-#define ILI9486_DRIVER
-#define TFT_MISO 23   // LCD_D1 / SPI MISO (changed from GPIO 12 to avoid boot failure)
-#define TFT_MOSI 13   // LCD_D0 / SPI MOSI  
-#define TFT_SCLK 14   // SD_SCK / SPI Clock
-#define TFT_CS   22   // LCD_CS (Chip Select - moved from GPIO 15 to avoid strapping pin)
-#define TFT_DC   18   // LCD_RS (Data/Command)
-#define TFT_RST  19   // LCD_RST (Reset)
-// Touch screen disabled to avoid TFT_eSPI parallel mode conflict and save memory
-// #define TOUCH_CS 25   // Touch Controller Chip Select
-// #define TOUCH_IRQ 4   // Touch Interrupt - moved from GPIO 26 to GPIO 4
-#define SPI_FREQUENCY  20000000
-// Memory optimization: Disable DMA and frame buffers to save RAM
-#define ESP32_DMA_CHAN 0  // Disable DMA (0 = no DMA)
-#define ESP32_PARALLEL 0  // Not using parallel interface
-// Reduced font set to save flash memory
-#define LOAD_GLCD
-#define LOAD_FONT2
-#define LOAD_FONT4
-// Removed FONT6, FONT7, FONT8, GFXFF, SMOOTH_FONT to save ~15KB flash
-
-#include <TFT_eSPI.h>
 #include "config.h"
 #include "Logger.h"
 
-// Hardware Abstraction Layer for Print_n_Prick
+// Hardware Abstraction Layer for Print-n-Prick
 class HardwareAbstraction {
 private:
     static const char* TAG;
     HardwareSerial* printerSerial;
-    TFT_eSPI* tft;
     
     // Pin states
-    bool ledState;
     bool pumpState;
     
     // Sensor readings
@@ -47,7 +20,17 @@ private:
     bool irDetected;
     float lightPercent;
     uint8_t ledBrightness;
+    // Light calibration for auto-brightness: min = "turn off" level, max = "turn on" level (< 0 = not set)
+    float lightCalibMinPercent;
+    float lightCalibMaxPercent;
     bool autoBrightnessEnabled;  // Flag to enable/disable automatic brightness control
+    
+    // PWM ramp-up state (1V per second)
+    bool rampActive;
+    uint8_t rampStartPWM;
+    uint8_t rampTargetPWM;
+    uint8_t currentPWM;  // Track current PWM value
+    unsigned long rampStartTime;
     
     // Sanitizer tracking
     float sanitizerLevel;
@@ -55,6 +38,9 @@ private:
     unsigned long lastDispenseTime;
     unsigned long dispenseStartTime;
     bool dispensing;
+    // Runtime config (0 = use config.h defaults)
+    unsigned long maxDispenseDurationMs_;
+    unsigned long dispenseCooldownMs_;
     
 public:
     HardwareAbstraction();
@@ -64,11 +50,6 @@ public:
     bool initialize();
     bool initializePins();
     bool initializePrinter();
-    bool initializeDisplay();
-    
-    // LED Control
-    void setLED(bool state);
-    bool getLEDState() const { return ledState; }
     
     // Pump Control
     bool startPump();
@@ -78,6 +59,10 @@ public:
     unsigned long getDispenseDuration() const;
     bool checkDispenseTimeout();
     bool checkCooldown() const;
+    void setMaxDispenseDurationMs(unsigned long ms);  // 0 = use MAX_DISPENSE_DURATION_MS
+    void setDispenseCooldownMs(unsigned long ms);    // 0 = use DISPENSE_COOLDOWN_MS
+    unsigned long getMaxDispenseDurationMs() const { return maxDispenseDurationMs_; }
+    unsigned long getDispenseCooldownMs() const { return dispenseCooldownMs_; }
     
     // Sensor Reading
     float readMoistureSensor();
@@ -86,13 +71,17 @@ public:
     float getMoisturePercent() const { return moisturePercent; }
     bool isIRDetected() const { return irDetected; }
     float getLightPercent() const { return lightPercent; }
+    /** Set current light level as calibration min (dark / LED off) or max (bright / LED on). */
+    void setLightCalibrationMin(float lightPercent);
+    void setLightCalibrationMax(float lightPercent);
     
     // LED Brightness Control (inverse of light level)
     void updateLEDBrightness();
-    void setLEDBrightness(uint8_t brightness);  // 0-255
+    void setLEDBrightness(uint8_t brightness);  // 0-255 (with soft ramp-up)
     void setAutoBrightness(bool enabled);  // Enable/disable automatic brightness control
     bool isAutoBrightnessEnabled() const { return autoBrightnessEnabled; }
     uint8_t getLEDBrightness() const { return ledBrightness; }
+    void updateLEDRamp();  // Update PWM ramp-up (call in main loop)
     
     // Sanitizer Management
     float getSanitizerLevel() const { return sanitizerLevel; }
@@ -107,21 +96,6 @@ public:
     bool printerWriteString(const String& str);
     bool printerPrintln(const String& str);
     bool printerAvailable() const;
-    
-    // Display Operations
-    TFT_eSPI* getDisplay() { return tft; }
-    bool displayAvailable() const { return tft != nullptr; }
-    void displayDebugText(const String& text, uint16_t color = 0xFFFF, uint8_t size = 2);
-    void displayClear(uint16_t color = 0x0000);
-    void displayTestPattern();
-    void displayTestColors();
-    void displayTestText();
-    
-    // Touch Screen Operations
-    bool initializeTouch();
-    bool isTouchPressed();
-    bool readTouch(int16_t* x, int16_t* y);
-    int getTouchIRQState() const;
     
     // Diagnostic
     void printDiagnostics() const;

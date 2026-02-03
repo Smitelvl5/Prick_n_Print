@@ -239,17 +239,6 @@ bool FirebaseService::saveConfig(const DynamicJsonDocument& doc) {
     return false;
 }
 
-bool FirebaseService::updateStatus(const DynamicJsonDocument& status) {
-    String data;
-    serializeJson(status, data);
-    
-    if (put("/status.json", data)) {
-        Logger::debug(TAG, "Status updated");
-        return true;
-    }
-    return false;
-}
-
 bool FirebaseService::pollCommands(DynamicJsonDocument& commands) {
     String response;
     if (!get("/commands.json", response)) {

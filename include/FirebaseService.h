@@ -5,7 +5,6 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "Logger.h"
-#include "config.h"
 
 class FirebaseService {
 private:
@@ -40,10 +39,9 @@ public:
     bool post(const String& path, const String& data);
     bool deleteData(const String& path);
     
-    // Specialized operations
+    // Specialized operations (config = settings only; no sensor/status data written to Firebase)
     bool loadConfig(DynamicJsonDocument& doc);
     bool saveConfig(const DynamicJsonDocument& doc);
-    bool updateStatus(const DynamicJsonDocument& status);
     bool pollCommands(DynamicJsonDocument& commands);
     
     // Health check

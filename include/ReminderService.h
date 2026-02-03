@@ -51,8 +51,9 @@ public:
     bool load();
     bool save();
     
-    // Export to JSON
+    // Export to JSON (full for save; display excludes printed)
     String toJSON() const;
+    String toJSONForDisplay() const;  // Only active && !printed (so list hides after print)
     bool fromJSON(const String& json);
 };
 

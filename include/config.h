@@ -5,36 +5,13 @@
 // PIN DEFINITIONS
 // ============================================================================
 
-#define LED_PIN 21             // Built-in blue LED (moved from GPIO 2 to avoid strapping pin)
 #define SANITIZER_PUMP_PIN 26  // IRF520 MOSFET Driver Module Gate (pump control via MOSFET module) - moved from GPIO 4
-#define THERMAL_TX_PIN 17      // TX2 - Thermal printer TX (ESP32 TX → Printer RX)
-#define THERMAL_RX_PIN 16      // RX2 - Thermal printer RX (ESP32 RX → Printer TX)
+#define THERMAL_TX_PIN 4       // TX2 - Thermal printer TX (ESP32 TX → Printer RX) - moved from GPIO 17 to avoid flash memory boot issues
+#define THERMAL_RX_PIN 33      // RX2 - Thermal printer RX (ESP32 RX → Printer TX) - moved from GPIO 16 to avoid flash memory boot issues
 #define IR_SENSOR_PIN 32       // Infrared sensor (motion detection)
 #define MOISTURE_SENSOR_PIN 34 // Moisture sensor (analog input, input-only pin)
 #define LIGHT_SENSOR_PIN 35    // LM393 Light Sensor Module (analog input, input-only pin)
 #define LED_PWM_PIN 27         // 12V LED PWM control via MOSFET (moved from GPIO 5 to avoid strapping pin)
-
-// ============================================================================
-// DISPLAY CONFIGURATION
-// ============================================================================
-// TFT Pin Mapping (SPI Mode):
-// LCD_CS    -> GPIO 22 (Chip Select - moved from GPIO 15 to avoid strapping pin)
-// LCD_RS    -> GPIO 18 (Data/Command - DC pin)
-// LCD_SCK   -> GPIO 14 (SPI Clock - LCD_WR in parallel mode)
-// LCD_MOSI  -> GPIO 13 (SPI MOSI - LCD_D0 in parallel mode)
-// LCD_MISO  -> GPIO 23 (SPI MISO - Changed from GPIO 12 to avoid boot issues)
-// LCD_RST   -> GPIO 19 (Reset)
-
-#define LCD_CS_PIN 22          // LCD_CS (Chip Select - moved from GPIO 15 to avoid strapping pin)
-#define LCD_RS_PIN 18          // LCD_RS (Data/Command - DC pin)
-#define LCD_SCK_PIN 14         // LCD_WR / SPI Clock
-#define LCD_MOSI_PIN 13        // LCD_D0 / SPI MOSI
-#define LCD_MISO_PIN 23        // LCD_D1 / SPI MISO (changed from GPIO 12 to avoid boot failure)
-#define LCD_RST_PIN 19         // LCD_RST (Reset)
-
-// Touch Screen Configuration
-#define TOUCH_CS_PIN 25         // Touch Controller Chip Select
-#define TOUCH_IRQ_PIN 4         // Touch Interrupt (optional but recommended) - moved from GPIO 26 to GPIO 4
 
 // ============================================================================
 // THERMAL PRINTER CONFIGURATION
@@ -46,7 +23,10 @@
 // TIMING CONFIGURATION
 // ============================================================================
 
-#define SENSOR_CHECK_INTERVAL 10000     // Check sensors every 10 seconds
+#define SENSOR_CHECK_INTERVAL 2000     // Check sensors every 2 seconds (for status/ESP-NOW; HTTP doesn't need to be fast)
+#define LED_UPDATE_INTERVAL 5000       // Fallback; overridden by SENSOR_ACTUATOR_INTERVAL_MS when auto-brightness is on
+#define SENSOR_ACTUATOR_INTERVAL_MS 50  // Fast path: light sensor → LED (and sensor cache for actuator use). Keeps sensor→actuator response ~50ms.
+#define WIFI_STATUS_CHECK_INTERVAL_MS 5000  // Onboard LED / WiFi status (non-actuator; can be slower to save loop work)
 
 // ============================================================================
 // LED PWM CONFIGURATION
@@ -56,13 +36,25 @@
 #define LED_PWM_FREQUENCY 5000          // PWM frequency in Hz (5kHz)
 #define LED_PWM_RESOLUTION 8            // PWM resolution in bits (8-bit = 0-255)
 
+// LED Voltage Range: 6.5V (minimum) to 12V (maximum)
+// PWM mapping: 0-255 input maps to 6.5V-12V output
+// Minimum PWM value for 6.5V: (6.5V / 12V) * 255 = 138
+#define LED_MIN_VOLTAGE 0.0             // Min voltage when on (V); off = 0V
+#define LED_MAX_VOLTAGE 12.0            // Maximum operating voltage (V)
+#define LED_MIN_PWM_VALUE 0             // PWM for 6.5V (min brightness when on)
+#define LED_MAX_PWM_VALUE 255           // PWM for 12V (full duty cycle)
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 // WiFi Settings
-#define AP_SSID "Print_n_Prick"
+#define AP_SSID "Print-n-Prick"
 #define AP_PASSWORD "08202022"
+// 0 = use saved WiFi; config portal only when no credentials (ask once, then never). 1 = erase and open portal every boot (for re-config only).
+#ifndef FORCE_WIFI_CONFIG_PORTAL
+#define FORCE_WIFI_CONFIG_PORTAL 0
+#endif
 
 // Firebase Settings
 #define FIREBASE_DATABASE_URL "https://printerpot-d96f8-default-rtdb.firebaseio.com"
@@ -78,11 +70,34 @@
 #define WEATHER_LATITUDE 35.074824
 #define WEATHER_LONGITUDE -89.796545
 
+// Onboard blue LED (GPIO 2 on most ESP32 DevKit). Set to -1 to disable.
+#define BOARD_LED_PIN 2
+// 1 = active LOW (LOW=on, most DevKits). 0 = active HIGH (HIGH=on); use if LED turns on then off.
+#define BOARD_LED_ACTIVE_LOW 0
+
 // Sanitizer Dispensing Settings
 #define DISPENSE_COOLDOWN_MS 3000        // Cooldown period: 3 seconds between dispenses (3000ms)
 #define MAX_DISPENSE_DURATION_MS 2000   // Maximum dispense duration: 2 seconds (prevents continuous dumping)
 
 // Web Server Authentication
 #define WEB_PASSWORD "0820"              // Password to access web interface (change in secrets.h if needed)
+
+// ============================================================================
+// ESP-NOW CONFIGURATION (Main ESP32)
+// ============================================================================
+// ESP-NOW is the link between the web UI (on TZT) and hardware (on Main).
+// Flow: Browser -> TZT HTTP server -> TZT sends ESP-NOW command -> Main receives -> hardware runs.
+// If web buttons (pump, printer, LED) do nothing: (1) Both devices same WiFi/SSID and channel,
+// (2) MACs correct: Main uses TZT's MAC here; TZT uses Main's MAC in config_tzt.h (MAIN_ESP32_MAC_ADDRESS).
+
+// TZT Display MAC address (from TZT serial: "MAC: 6C:C8:40:55:85:98")
+// Format: {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+#define TZT_DISPLAY_MAC_ADDRESS {0x6C, 0xC8, 0x40, 0x55, 0x85, 0x98}
+
+// ESP-NOW channel: fallback when WiFi.channel() is 0. Set to your AP's channel (TZT showed 6 for Kanta).
+#define ESP_NOW_CHANNEL 6
+
+// ESP-NOW transmission interval (milliseconds)
+#define ESP_NOW_SEND_INTERVAL 10000  // Send sensor data every 10 seconds (reduces traffic and TZT/Main collisions; GUI still feels responsive)
 
 #endif // CONFIG_H 

@@ -193,27 +193,6 @@
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiUdp.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/Udp.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/cbuf.h \
- .pio/libdeps/esp32-wroom-32/WiFiManager/WiFiManager.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_types.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_private/esp_wifi_private.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_crypto_types.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_private/wifi_os_adapter.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_default.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/Update/src/Update.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_rom/include/esp_rom_md5.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/WebServer.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/HTTP_Method.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/nghttp/port/include/http_parser.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/Uri.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/detail/RequestHandler.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/DNSServer/src/DNSServer.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiUdp.h \
- .pio/libdeps/esp32-wroom-32/WiFiManager/wm_strings_en.h \
- .pio/libdeps/esp32-wroom-32/WiFiManager/wm_consts_en.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/HTTPClient/src/HTTPClient.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiClient.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src/WiFiClientSecure.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src/ssl_client.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/mbedtls/mbedtls/include/mbedtls/platform.h \
@@ -253,46 +232,35 @@
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/mbedtls/port/include/aes/esp_aes.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/include/hal/aes_types.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/mbedtls/mbedtls/include/mbedtls/error.h \
+ .pio/libdeps/esp32-wroom-32/WiFiManager/WiFiManager.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_types.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_private/esp_wifi_private.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_crypto_types.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_private/wifi_os_adapter.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_wifi_default.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/Update/src/Update.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_rom/include/esp_rom_md5.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/WebServer.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/HTTP_Method.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/nghttp/port/include/http_parser.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/Uri.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/detail/RequestHandler.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/DNSServer/src/DNSServer.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiUdp.h \
+ .pio/libdeps/esp32-wroom-32/WiFiManager/wm_strings_en.h \
+ .pio/libdeps/esp32-wroom-32/WiFiManager/wm_consts_en.h \
  .pio/libdeps/esp32-wroom-32/ArduinoJson/src/ArduinoJson.h \
  .pio/libdeps/esp32-wroom-32/ArduinoJson/src/ArduinoJson.hpp \
  .pio/libdeps/esp32-wroom-32/ArduinoJson/src/ArduinoJson/Configuration.hpp \
  include/version.h include/config.h include/Logger.h \
  include/HardwareAbstraction.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/HardwareSerial.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src/SPI.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-spi.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/TFT_eSPI.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/User_Setup_Select.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/TFT_Drivers/ILI9486_Defines.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Processors/TFT_eSPI_ESP32.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/driver/include/driver/spi_master.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/driver/include/driver/spi_common.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/include/soc/lldesc.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_rom/include/esp32/rom/lldesc.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/include/soc/spi_periph.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/periph_defs.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/soc_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/gpio_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/sdio_slave_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/sdmmc_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_struct.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/include/hal/spi_types.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/esp32/include/hal/gpio_ll.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/rtc_cntl_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/rtc_io_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/platform_port/include/hal/misc.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/glcdfont.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font16.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font16.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font32rle.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font32rle.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Extensions/Button.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Extensions/Sprite.h \
  include/config.h include/Logger.h include/PrinterService.h \
- include/HardwareAbstraction.h include/FirebaseService.h \
- include/ReminderService.h include/FirebaseService.h \
- include/OTAUpdateService.h \
+ include/HardwareAbstraction.h include/OTAUpdateService.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src/ArduinoOTA.h \
- include/version.h include/HealthMonitor.h include/RequestQueue.h
+ include/version.h include/EspNowService.h \
+ C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_wifi/include/esp_now.h \
+ include/EspNowProtocol.h include/EspNowProtocol.h include/HardwareTest.h \
+ include/PrinterService.h

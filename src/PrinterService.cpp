@@ -2,6 +2,10 @@
 
 const char* PrinterService::TAG = "Printer";
 
+// Consistent layout for all print types (32 chars = thermal receipt width)
+static const char BORDER_LINE[] = "================================";  // 32 equals
+static const char SEPARATOR_LINE[] = "--------------------------------";  // 32 dashes
+
 PrinterService::PrinterService(HardwareAbstraction* hw) 
     : hardware(hw), currentWeather("N/A") {
 }
@@ -147,6 +151,54 @@ void PrinterService::setInverse(bool enable) {
     delay(10);
 }
 
+// Center a string in a line of width chars (leading spaces).
+static String centerInLine(const char* text, int width) {
+    int len = 0;
+    while (text[len] != '\0' && len < 64) len++;
+    if (len >= width) return String(text);
+    int pad = (width - len) / 2;
+    String out;
+    while (pad-- > 0) out += ' ';
+    out += text;
+    return out;
+}
+
+void PrinterService::printHeader(const char* title) {
+    sendCenterAlign();
+    delay(15);
+    hardware->printerPrintln(BORDER_LINE);
+    setBold(true);
+    sendLeftAlign();
+    hardware->printerPrintln(centerInLine(title, 32));
+    setBold(false);
+    sendCenterAlign();
+    delay(15);
+    hardware->printerPrintln(BORDER_LINE);
+    delay(50);
+}
+
+void PrinterService::printFooter() {
+    hardware->printerPrintln(BORDER_LINE);
+    delay(50);
+    sendCutPaper();
+}
+
+void PrinterService::printSeparator() {
+    hardware->printerPrintln(SEPARATOR_LINE);
+    delay(50);
+}
+
+void PrinterService::printDateLine(const char* label, time_t t) {
+    struct tm* info = (t > 0) ? localtime(&t) : nullptr;
+    if (info) {
+        char buffer[32];
+        strftime(buffer, sizeof(buffer), "%b %d, %Y %I:%M %p", info);
+        hardware->printerPrintln(String(label) + buffer);
+    }
+    hardware->printerPrintln("");
+    delay(50);
+}
+
 String PrinterService::sanitizeForPrinter(const String& text) {
     // Replace common emojis with text equivalents that thermal printers can handle
     String result = text;
@@ -256,79 +308,45 @@ bool PrinterService::printReceipt(const String& message, bool includeWeatherAndS
         return false;
     }
     
-    // Sanitize message for printer compatibility
     String cleanMessage = sanitizeForPrinter(message);
-    
     Logger::info(TAG, "Printing receipt: \"" + cleanMessage.substring(0, 30) + "...\"");
     
-    // Initialize printer
     sendInitialize();
-    sendCenterAlign();
+    printHeader(includeWeatherAndSanitizer ? "MESSAGE" : "REMINDER");
     
-    // Header
-    hardware->printerPrintln("================================");
-    setBold(true);
+    sendLeftAlign();
     if (includeWeatherAndSanitizer) {
-        hardware->printerPrintln("SMIT'S MESSAGE");
-    } else {
-        hardware->printerPrintln("REMINDER");
-    }
-    setBold(false);
-    hardware->printerPrintln("================================");
-    delay(50);
-    
-    // Date/Time
-    if (includeWeatherAndSanitizer) {
-        sendLeftAlign();
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
-            char buffer[30];
-            strftime(buffer, sizeof(buffer), "%b %d, %Y %I:%M %p", &timeinfo);
-            hardware->printerPrintln("Date: " + String(buffer));
-        }
-        hardware->printerPrintln("");
-        delay(50);
+        printDateLine("Date: ", time(nullptr));
     } else if (createdTime > 0) {
-        sendLeftAlign();
-        struct tm* createdInfo = localtime(&createdTime);
-        if (createdInfo) {
-            char buffer[30];
-            strftime(buffer, sizeof(buffer), "%b %d, %Y %I:%M %p", createdInfo);
-            hardware->printerPrintln("Set on: " + String(buffer));
-        }
+        printDateLine("Set on: ", createdTime);
+    } else {
         hardware->printerPrintln("");
         delay(50);
     }
+    printSeparator();
     
-    // Message (Normal size - matches grocery list style)
     sendCenterAlign();
     hardware->printerPrintln(cleanMessage);
     delay(50);
     
-    // Weather and Sanitizer info (for user messages only)
     if (includeWeatherAndSanitizer) {
-        hardware->printerPrintln("--------------------------------");
-        delay(50);
-        
+        printSeparator();
         sendLeftAlign();
-        hardware->printerPrintln("Today's Weather:");
-        hardware->printerPrintln("  " + sanitizeForPrinter(currentWeather));
+        hardware->printerPrintln("Weather:");
+        if (currentWeather.length() > 0 && currentWeather != "N/A")
+            hardware->printerPrintln("  " + sanitizeForPrinter(currentWeather));
+        else
+            hardware->printerPrintln("  -");
         delay(50);
-        
-        hardware->printerWriteString("Moisture: ");
+        hardware->printerWriteString("Moisture:");
         hardware->printerWriteString(String(hardware->getMoisturePercent(), 1));
-        hardware->printerWriteString("%  Sanitizer: ");
+        hardware->printerWriteString("%  Sanitizer:");
         hardware->printerWriteString(String(hardware->getSanitizerLevel(), 1));
         hardware->printerPrintln("%");
         delay(50);
     }
     
-    // Footer
-    hardware->printerPrintln("================================");
-    delay(50);
-    
-    sendCutPaper();
-    
+    printFooter();
     Logger::info(TAG, "Receipt printed successfully");
     return true;
 }
@@ -346,42 +364,92 @@ bool PrinterService::printGroceryList(const String* items, int itemCount) {
     
     Logger::info(TAG, "Printing grocery list (" + String(itemCount) + " items)");
     
-    // Initialize printer
     sendInitialize();
-    sendCenterAlign();
-    
-    // Header
-    hardware->printerPrintln("================================");
-    setBold(true);
-    hardware->printerPrintln("GROCERY LIST");
-    setBold(false);
-    hardware->printerPrintln("================================");
-    delay(50);
-    
-    // Date
+    printHeader("GROCERY LIST");
     sendLeftAlign();
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        char buffer[30];
-        strftime(buffer, sizeof(buffer), "%b %d, %Y %I:%M %p", &timeinfo);
-        hardware->printerPrintln("Date: " + String(buffer));
-    }
-    hardware->printerPrintln("");
-    delay(50);
+    printDateLine("Date: ", time(nullptr));
+    printSeparator();
     
-    // Items (sanitize each item for printer compatibility)
     for (int i = 0; i < itemCount; i++) {
         hardware->printerWriteString(String(i + 1) + ". ");
         hardware->printerPrintln(sanitizeForPrinter(items[i]));
         delay(20);
     }
     
-    hardware->printerPrintln("================================");
-    delay(50);
-    
-    sendCutPaper();
-    
+    printSeparator();
+    printFooter();
     Logger::info(TAG, "Grocery list printed successfully");
+    return true;
+}
+
+// True if line is a known slip title (same styling as printHeader)
+static bool isKnownTitle(const String& line) {
+    return line == "MESSAGE" || line == "REMINDER" || line == "GROCERY LIST" || line == "TODO LIST";
+}
+
+bool PrinterService::printPreformatted(const String& body, const String& weatherOneLine) {
+    if (!isReady()) {
+        Logger::error(TAG, "Printer not ready");
+        return false;
+    }
+    sendInitialize();
+    sendLeftAlign();
+    int start = 0;
+    bool firstLine = true;
+    while (start < (int)body.length()) {
+        int end = body.indexOf('\n', start);
+        if (end < 0) end = body.length();
+        String line = body.substring(start, end);
+        line.trim();  // strip \r if any
+        start = end + 1;
+        // First line: if it's a known title, use same centered+bold header as Shortcut path
+        if (firstLine && isKnownTitle(line)) {
+            printHeader(line.c_str());
+            firstLine = false;
+            delay(20);
+            continue;
+        }
+        firstLine = false;
+        if (line.length() > 0)
+            hardware->printerPrintln(sanitizeForPrinter(line));
+        else
+            hardware->printerPrintln("");
+        delay(20);
+    }
+    if (weatherOneLine.length() > 0) {
+        printSeparator();
+        hardware->printerPrintln(sanitizeForPrinter(weatherOneLine));
+        delay(20);
+    }
+    hardware->printerPrintln("");
+    printSeparator();
+    printFooter();
+    Logger::info(TAG, "Preformatted print complete");
+    return true;
+}
+
+bool PrinterService::printMessageOnly(const String& message) {
+    if (!isReady()) {
+        Logger::error(TAG, "Printer not ready");
+        return false;
+    }
+    sendInitialize();
+    sendLeftAlign();
+    String clean = sanitizeForPrinter(message);
+    if (clean.length() > 0) {
+        int start = 0;
+        while (start < (int)clean.length()) {
+            int end = clean.indexOf('\n', start);
+            if (end < 0) end = clean.length();
+            String line = clean.substring(start, end);
+            hardware->printerPrintln(line.length() > 0 ? line : "");
+            start = end + 1;
+            delay(15);
+        }
+    }
+    hardware->printerPrintln("");
+    sendCutPaper();
+    Logger::info(TAG, "Message-only print complete");
     return true;
 }
 

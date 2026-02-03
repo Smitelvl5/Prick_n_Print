@@ -109,37 +109,37 @@ const Reminder* ReminderService::getReminderById(const String& id) const {
     return nullptr;
 }
 
+// Due window: fire if now is in [scheduledTime, scheduledTime + DUE_WINDOW_SEC]
+// Cleanup: deactivate only when now > scheduledTime + CLEANUP_AFTER_SEC
+#define REMINDER_DUE_WINDOW_SEC 300   // 5 min window so we catch even with 60s check interval
+#define REMINDER_CLEANUP_AFTER_SEC 300
+
 void ReminderService::checkReminders(std::function<void(const Reminder&)> callback) {
     time_t now = time(nullptr);
     bool needsCleanup = false;
-    
-    // First, clean up past reminders that have already passed
-    for (int i = 0; i < reminderCount; i++) {
-        if (reminders[i].active && now > reminders[i].scheduledTime + 60) {
-            // Reminder has passed (more than 1 minute past scheduled time)
-            // Mark as inactive to remove it
-            reminders[i].active = false;
-            needsCleanup = true;
-            Logger::debug(TAG, "Removed past reminder: " + reminders[i].id);
-        }
-    }
-    
-    // Compact array if we removed any reminders
-    if (needsCleanup) {
-        compactReminders();
-    }
-    
-    // Check for reminders that are due now
+
+    // Check for due reminders FIRST (never deactivate one we could fire this run)
     for (int i = 0; i < reminderCount; i++) {
         if (reminders[i].active && !reminders[i].printed) {
-            // Check if it's time (within 1 minute window)
-            if (now >= reminders[i].scheduledTime && 
-                now <= reminders[i].scheduledTime + 60) {
+            if (now >= reminders[i].scheduledTime &&
+                now <= reminders[i].scheduledTime + REMINDER_DUE_WINDOW_SEC) {
                 Logger::info(TAG, "Reminder due: " + reminders[i].message);
                 callback(reminders[i]);
                 markAsPrinted(reminders[i].id);
             }
         }
+    }
+
+    // Then clean up past reminders (beyond the window)
+    for (int i = 0; i < reminderCount; i++) {
+        if (reminders[i].active && now > reminders[i].scheduledTime + REMINDER_CLEANUP_AFTER_SEC) {
+            reminders[i].active = false;
+            needsCleanup = true;
+            Logger::debug(TAG, "Removed past reminder: " + reminders[i].id);
+        }
+    }
+    if (needsCleanup) {
+        compactReminders();
     }
 }
 
@@ -196,6 +196,21 @@ String ReminderService::toJSON() const {
         }
     }
     
+    String json;
+    serializeJson(doc, json);
+    return json;
+}
+
+String ReminderService::toJSONForDisplay() const {
+    DynamicJsonDocument doc(8192);
+    for (int i = 0; i < reminderCount; i++) {
+        if (reminders[i].active && !reminders[i].printed) {
+            JsonObject obj = doc.createNestedObject(reminders[i].id);
+            obj["message"] = reminders[i].message;
+            obj["scheduledTime"] = reminders[i].scheduledTime;
+            obj["createdTime"] = reminders[i].createdTime;
+        }
+    }
     String json;
     serializeJson(doc, json);
     return json;

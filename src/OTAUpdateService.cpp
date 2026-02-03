@@ -1,49 +1,55 @@
+/*
+ * OTAUpdateService - Over-the-air firmware updates via ArduinoOTA
+ */
+
 #include "OTAUpdateService.h"
+#include "Logger.h"
+#include <ArduinoOTA.h>
 
 const char* OTAUpdateService::TAG = "OTA";
 
-OTAUpdateService::OTAUpdateService() 
-    : enabled(false) {
+OTAUpdateService::OTAUpdateService()
+    : enabled(false), hostname(""), password("") {
 }
 
 OTAUpdateService::~OTAUpdateService() {
+    ArduinoOTA.end();
 }
 
 bool OTAUpdateService::initialize(const String& deviceHostname, const String& otaPassword) {
     hostname = deviceHostname;
     password = otaPassword;
-    
+    enabled = true;
+
     ArduinoOTA.setHostname(hostname.c_str());
-    
     if (password.length() > 0) {
         ArduinoOTA.setPassword(password.c_str());
-        Logger::info(TAG, "OTA password protection enabled");
     }
-    
+
     ArduinoOTA.onStart(onStart);
     ArduinoOTA.onEnd(onEnd);
     ArduinoOTA.onProgress(onProgress);
     ArduinoOTA.onError(onError);
-    
+
     ArduinoOTA.begin();
-    enabled = true;
-    
-    Logger::info(TAG, "OTA updates enabled");
-    Logger::info(TAG, "  Hostname: " + hostname);
-    Logger::info(TAG, "  Version: " + String(FIRMWARE_VERSION));
-    
+    Logger::info(TAG, "OTA ready - hostname: " + hostname);
     return true;
 }
 
 void OTAUpdateService::setPassword(const String& pwd) {
     password = pwd;
-    ArduinoOTA.setPassword(pwd.c_str());
-    Logger::info(TAG, "OTA password updated");
+    if (enabled && password.length() > 0) {
+        ArduinoOTA.setPassword(password.c_str());
+    }
 }
 
 void OTAUpdateService::enable(bool state) {
     enabled = state;
-    Logger::info(TAG, "OTA " + String(state ? "enabled" : "disabled"));
+    if (!enabled) {
+        ArduinoOTA.end();
+    } else {
+        ArduinoOTA.begin();
+    }
 }
 
 void OTAUpdateService::handle() {
@@ -53,38 +59,30 @@ void OTAUpdateService::handle() {
 }
 
 void OTAUpdateService::onStart() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-        type = "sketch";
-    } else {
-        type = "filesystem";
-    }
-    Logger::info(TAG, "Starting OTA update: " + type);
+    Logger::info(TAG, "OTA update starting...");
 }
 
 void OTAUpdateService::onEnd() {
-    Logger::info(TAG, "OTA update completed");
+    Logger::info(TAG, "OTA update complete");
 }
 
 void OTAUpdateService::onProgress(unsigned int progress, unsigned int total) {
-    static int lastPercent = -1;
-    int percent = (progress * 100) / total;
-    
-    if (percent != lastPercent && percent % 10 == 0) {
-        Logger::info(TAG, "OTA Progress: " + String(percent) + "%");
-        lastPercent = percent;
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 500) {
+        Logger::debug(TAG, "OTA progress: " + String((progress * 100) / total) + "%");
+        lastLog = millis();
     }
 }
 
 void OTAUpdateService::onError(ota_error_t error) {
-    String errorMsg;
-    switch(error) {
-        case OTA_AUTH_ERROR: errorMsg = "Auth Failed"; break;
-        case OTA_BEGIN_ERROR: errorMsg = "Begin Failed"; break;
-        case OTA_CONNECT_ERROR: errorMsg = "Connect Failed"; break;
-        case OTA_RECEIVE_ERROR: errorMsg = "Receive Failed"; break;
-        case OTA_END_ERROR: errorMsg = "End Failed"; break;
-        default: errorMsg = "Unknown Error"; break;
+    const char* msg = "";
+    switch (error) {
+        case OTA_AUTH_ERROR:    msg = "Auth failed"; break;
+        case OTA_BEGIN_ERROR:    msg = "Begin failed"; break;
+        case OTA_CONNECT_ERROR:  msg = "Connect failed"; break;
+        case OTA_RECEIVE_ERROR:  msg = "Receive failed"; break;
+        case OTA_END_ERROR:      msg = "End failed"; break;
+        default:                 msg = "Unknown error"; break;
     }
-    Logger::error(TAG, "OTA Error: " + errorMsg);
+    Logger::error(TAG, "OTA error: " + String(msg));
 }

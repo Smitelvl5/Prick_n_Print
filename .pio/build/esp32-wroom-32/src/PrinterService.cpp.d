@@ -136,36 +136,4 @@
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
  include/HardwareAbstraction.h \
  C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/HardwareSerial.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src/SPI.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-spi.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/TFT_eSPI.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/cores/esp32/Print.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/User_Setup_Select.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/TFT_Drivers/ILI9486_Defines.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Processors/TFT_eSPI_ESP32.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/driver/include/driver/spi_master.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/driver/include/driver/spi_common.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/include/soc/lldesc.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_rom/include/esp32/rom/lldesc.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/include/soc/spi_periph.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/periph_defs.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/soc_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/gpio_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/sdio_slave_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/sdmmc_pins.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/spi_struct.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/include/hal/spi_types.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/esp32/include/hal/gpio_ll.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/rtc_cntl_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/soc/esp32/include/soc/rtc_io_reg.h \
- C:/Users/Smite/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/hal/platform_port/include/hal/misc.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/glcdfont.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font16.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font16.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font32rle.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Fonts/Font32rle.c \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Extensions/Button.h \
- .pio/libdeps/esp32-wroom-32/TFT_eSPI/Extensions/Sprite.h \
  include/config.h include/Logger.h
