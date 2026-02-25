@@ -21,9 +21,33 @@
 // ============================================================================
 // PIN DEFINITIONS (TZT ESP32 LVGL 2.4" 240x320 integrated module)
 // ============================================================================
-// Fixed by PCB (no breakout pins). Actual pins are in TFT_eSPI_Setup/User_Setup.h:
+// Fixed by PCB (no breakout pins). Pins are in include/User_Setup.h (copied to TFT_eSPI by script):
 //   TFT: DC 2, CS 15, SCLK 14, MOSI 13, MISO 12, RST -1, BL 27
-//   Touch: TOUCH_CS 33 (XPT2046, shared SPI)
+//   Touch: TOUCH_CS 33 (XPT2046, shared SPI) — must match User_Setup.h
+#ifndef TZT_TOUCH_CS
+#define TZT_TOUCH_CS 33
+#endif
+// Touch calibration: affine transform coefficients (from test/calibration tool)
+// screenX = TOUCH_AX*rawX + TOUCH_BX*rawY + TOUCH_CX
+// screenY = TOUCH_AY*rawX + TOUCH_BY*rawY + TOUCH_CY
+#define TOUCH_AX   0.098444f
+#define TOUCH_BX  -0.000961f
+#define TOUCH_CX -34.178f
+#define TOUCH_AY   0.000785f
+#define TOUCH_BY   0.073316f
+#define TOUCH_CY -35.711f
+#define TOUCH_Z_PRESSED 800   // rawZ above this = finger on screen (idle ~725)
+
+// Backlight pin: set explicitly in code so display is visible even if TFT_eSPI
+// was compiled with default User_Setup (which may not define TFT_BL).
+#ifndef TZT_TFT_BL_PIN
+#define TZT_TFT_BL_PIN 27
+#endif
+// Backlight PWM: full brightness = 255; use LEDC channel 1 (main board uses 0 for 12V LED)
+#define TZT_TFT_BL_LEDC_CHANNEL  1
+#define TZT_TFT_BL_LEDC_FREQ     5000
+#define TZT_TFT_BL_LEDC_RES      8
+#define TZT_TFT_BL_BRIGHTNESS    255   // 0-255, 255 = full
 
 // ============================================================================
 // LVGL CONFIGURATION
@@ -52,7 +76,7 @@
 // ============================================================================
 // ESP-NOW communication with Main ESP32
 
-// Main ESP32 MAC address (from Main serial: "MAC: 6C:C8:40:4E:E6:24")
+// Main ESP32 MAC — set from Main board serial at boot ("MAC: xx:xx:xx:xx:xx:xx"). Wrong = no sensor data.
 // Format: {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
 #define MAIN_ESP32_MAC_ADDRESS {0x6C, 0xC8, 0x40, 0x4E, 0xE6, 0x24}
 
@@ -65,12 +89,25 @@
 #define ESP_NOW_CHANNEL 6
 
 // ============================================================================
-// FIREBASE CONFIGURATION (TZT Display)
+// BACKEND: Firebase OR HTTP Web Server (TZT Display)
 // ============================================================================
-// TZT Display now handles all Firebase communication
+// Set USE_HTTP_BACKEND to 1 to use your own server (no Firebase). Set to 0 for Firebase.
 
+#ifndef USE_HTTP_BACKEND
+#define USE_HTTP_BACKEND 1
+#endif
+
+#if USE_HTTP_BACKEND
+// Your server URL (no trailing slash). ESP32 will GET/PUT/DELETE /api/commands, /api/audio, /api/images, etc.
+#ifndef BACKEND_URL
+#define BACKEND_URL "http://192.168.1.100:5000"
+#endif
+#define BACKEND_TIMEOUT 10000
+#else
+// Firebase Realtime Database (used when USE_HTTP_BACKEND is 0)
 #define FIREBASE_DATABASE_URL "https://printerpot-d96f8-default-rtdb.firebaseio.com"
-#define FIREBASE_TIMEOUT 10000          // 10 seconds timeout for Firebase operations
+#define FIREBASE_TIMEOUT 10000
+#endif
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"

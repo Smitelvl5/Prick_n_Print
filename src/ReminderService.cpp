@@ -3,8 +3,8 @@
 
 const char* ReminderService::TAG = "Reminder";
 
-ReminderService::ReminderService(FirebaseService* fb) 
-    : reminderCount(0), firebase(fb) {
+ReminderService::ReminderService(IBackendService* backend) 
+    : reminderCount(0), backend(backend) {
 }
 
 ReminderService::~ReminderService() {
@@ -144,19 +144,19 @@ void ReminderService::checkReminders(std::function<void(const Reminder&)> callba
 }
 
 bool ReminderService::load() {
-    if (!firebase) {
-        Logger::error(TAG, "Firebase not initialized");
+    if (!backend) {
+        Logger::error(TAG, "Backend not initialized");
         return false;
     }
     
     String response;
-    if (!firebase->get("/reminders.json", response)) {
-        Logger::warn(TAG, "Failed to load reminders from Firebase");
+    if (!backend->get("/reminders.json", response)) {
+        Logger::warn(TAG, "Failed to load reminders from backend");
         return false;
     }
     
     if (response == "null" || response.length() == 0) {
-        Logger::info(TAG, "No reminders in Firebase");
+        Logger::info(TAG, "No reminders in backend");
         reminderCount = 0;
         return true;
     }
@@ -165,16 +165,14 @@ bool ReminderService::load() {
 }
 
 bool ReminderService::save() {
-    if (!firebase) {
-        Logger::error(TAG, "Firebase not initialized");
+    if (!backend) {
+        Logger::error(TAG, "Backend not initialized");
         return false;
     }
     
     String json = toJSON();
-    // Note: This will be queued by the caller if using RequestQueue
-    // For now, save directly but could be made async later
-    if (!firebase->put("/reminders.json", json)) {
-        Logger::warn(TAG, "Failed to save reminders to Firebase (will retry)");
+    if (!backend->put("/reminders.json", json)) {
+        Logger::warn(TAG, "Failed to save reminders to backend (will retry)");
         return false;
     }
     

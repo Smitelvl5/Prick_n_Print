@@ -90,9 +90,9 @@
 // If web buttons (pump, printer, LED) do nothing: (1) Both devices same WiFi/SSID and channel,
 // (2) MACs correct: Main uses TZT's MAC here; TZT uses Main's MAC in config_tzt.h (MAIN_ESP32_MAC_ADDRESS).
 
-// TZT Display MAC address (from TZT serial: "MAC: 6C:C8:40:55:85:98")
+// TZT Display MAC address — MUST match TZT serial "This MAC: xx:xx:xx:xx:xx:xx"
 // Format: {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-#define TZT_DISPLAY_MAC_ADDRESS {0x6C, 0xC8, 0x40, 0x55, 0x85, 0x98}
+#define TZT_DISPLAY_MAC_ADDRESS {0xF4, 0x2D, 0xC9, 0x6D, 0x6E, 0x60}
 
 // ESP-NOW channel: fallback when WiFi.channel() is 0. Set to your AP's channel (TZT showed 6 for Kanta).
 #define ESP_NOW_CHANNEL 6

@@ -4,7 +4,7 @@
 #include <Arduino.h>
 #include <time.h>
 #include "Logger.h"
-#include "FirebaseService.h"
+#include "IBackendService.h"
 
 #define MAX_REMINDERS 50
 
@@ -24,14 +24,14 @@ private:
     static const char* TAG;
     Reminder reminders[MAX_REMINDERS];
     int reminderCount;
-    FirebaseService* firebase;
+    IBackendService* backend;
     
     String generateId();
     int findReminderIndex(const String& id);
     void compactReminders();
     
 public:
-    ReminderService(FirebaseService* fb);
+    ReminderService(IBackendService* backend);
     ~ReminderService();
     
     // Reminder management

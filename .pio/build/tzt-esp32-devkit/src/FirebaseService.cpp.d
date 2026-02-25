@@ -238,4 +238,4 @@
  .pio/libdeps/tzt-esp32-devkit/ArduinoJson/src/ArduinoJson.h \
  .pio/libdeps/tzt-esp32-devkit/ArduinoJson/src/ArduinoJson.hpp \
  .pio/libdeps/tzt-esp32-devkit/ArduinoJson/src/ArduinoJson/Configuration.hpp \
- include/Logger.h
+ include/Logger.h include/IBackendService.h

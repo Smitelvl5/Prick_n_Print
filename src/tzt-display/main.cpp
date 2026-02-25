@@ -14,18 +14,29 @@
 #if !defined(TZT_HEADLESS)
 #include <lvgl.h>
 #include <TFT_eSPI.h>
+#include <JPEGDecoder.h>
 #endif
 
 #include "version.h"
 #include "config_tzt.h"
 #include "EspNowProtocol.h"
+#include "IBackendService.h"
+#if USE_HTTP_BACKEND
+#include "HttpBackendService.h"
+#else
 #include "FirebaseService.h"
+#endif
 #include "ReminderService.h"
+#include "SDCardService.h"
+#include <SD.h>
+#include "AudioService.h"
 #include "Logger.h"
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #include <string.h>
+#include <cmath>
 
 WebServer server(8080);
 
@@ -40,37 +51,117 @@ static const char* const JSON_FAIL_UNAUTHORIZED = "{\"error\":\"Unauthorized\"}"
     #define ESPNOW_LOG(msg) do {} while(0)
 #endif
 
+#define DEBUG_LOOP 0  // 1 = verbose loop/panel/gesture logs; 0 = quiet (errors and key events only)
+
+// Cached sensor data from Main (received via ESP-NOW) - declared early for calculateSensorHash()
+SensorDataPacket lastSensorData;
+bool lastSensorDataValid = false;
+unsigned long lastSensorDataReceiveTime = 0;  // Track when we last received data from Main
+volatile bool sensorDataNeedsPanelUpdate = false;  // Set in recv callback; loop() refreshes GUI
+
 #if !defined(TZT_HEADLESS)
 // Display and control panel (LVGL) - 3 screens with left/right nav
 static TFT_eSPI tft;
-// Display buffer: 320*20 = 6400 pixels * 2 bytes = 12.8KB per buffer. If memory constrained, use (TZT_SCREEN_WIDTH * 10).
+static volatile bool displayFlushing = false;  // true while flush callback is writing to TFT (skip touch read to avoid SPI conflict)
+// Display buffer: 320*20 fits in ESP32 DRAM; larger = smoother but overflows (320*30/40 overflow)
 #define TZT_DISP_BUF_PIXELS  (TZT_SCREEN_WIDTH * 20)
 static lv_disp_draw_buf_t draw_buf;
+static lv_disp_drv_t disp_drv;
 static lv_color_t disp_buf1[TZT_DISP_BUF_PIXELS];
 static lv_color_t disp_buf2[TZT_DISP_BUF_PIXELS];
-static lv_obj_t* screen1 = nullptr;
-static lv_obj_t* screen2 = nullptr;
-static lv_obj_t* screen3 = nullptr;
+static lv_obj_t* screen1 = nullptr;  // Home: latest message
+static lv_obj_t* screen2 = nullptr;  // Sensors (read-only)
+static lv_obj_t* screen3 = nullptr;  // Message history (SD card)
+static lv_obj_t* screen4 = nullptr;  // Media hub (Audio / Images)
+static lv_obj_t* audioListScreen = nullptr;   // sub-screen: audio list + now playing
+static lv_obj_t* imageListScreen = nullptr;   // sub-screen: image gallery list
 static int currentScreenIndex = 0;
+#define SCREEN_COUNT 5
+// Screen 1: message
+static lv_obj_t* labelMessage = nullptr;
+static String lastPrintMessage = "(No messages yet)";
+// Screen 3: message history
+static lv_obj_t* historyList = nullptr;
+static lv_obj_t* historyDetail = nullptr;
+static lv_obj_t* historyDetailLabel = nullptr;
+static void refreshHistoryList();
+static void historyItemCb(lv_event_t* e);
+static void historyBackCb(lv_event_t* e);
+// Screen 4: audio player
+static lv_obj_t* audioList = nullptr;
+static lv_obj_t* audioHeaderBar = nullptr;
+static lv_obj_t* audioStopBtn = nullptr;
+static void updateAudioHeaderState();
+#define MAX_AUDIO_FILES 20
+static String audioFileNames[MAX_AUDIO_FILES];
+static int audioFileCount = 0;
+static void refreshAudioList();
+static void audioFileCb(lv_event_t* e);
+static void audioStopCb(lv_event_t* e);
+// Screen 5: image gallery
+#define MAX_IMAGE_FILES 30
+static String imageFileNames[MAX_IMAGE_FILES];
+static int imageFileCount = 0;
+static lv_obj_t* imageList = nullptr;
+static lv_obj_t* imageViewerScreen = nullptr;  // overlay with Back button when viewing
+static void refreshImageList();
+static void imageFileCb(lv_event_t* e);
+static void imageBackCb(lv_event_t* e);
+static void drawSdJpegToTft(const char* path, int maxY = 240);
+static String currentImagePath;  // set when image viewer is open so we redraw JPEG each frame
+// Screen 2: sensor labels + progress bars
 static lv_obj_t* labelMoisture = nullptr;
 static lv_obj_t* labelSanitizer = nullptr;
 static lv_obj_t* labelLED = nullptr;
 static lv_obj_t* labelPump = nullptr;
-static lv_obj_t* labelPumpDuration = nullptr;
-static lv_obj_t* labelPumpCooldown = nullptr;
-static lv_obj_t* slDuration = nullptr;
-static lv_obj_t* slCooldown = nullptr;
-static lv_obj_t* btnStart = nullptr;
-static lv_obj_t* btnStop = nullptr;
-static lv_obj_t* swDispense = nullptr;
-static lv_obj_t* slLed = nullptr;
-static lv_obj_t* btnTurnOff = nullptr;
-static lv_obj_t* btnTurnOn = nullptr;
-static lv_obj_t* swBright = nullptr;
+static lv_obj_t* barMoisture = nullptr;
+static lv_obj_t* barSanitizer = nullptr;
+static lv_obj_t* barLED = nullptr;
 static unsigned long lastPanelUpdate = 0;
-static uint32_t lastSensorHash = 0;  // Only redraw panel when sensor data changes
+static uint32_t lastSensorHash = 0;
 static void createControlPanel();
 static void updateControlPanelStatus();
+// Status bar (persistent top layer: time only; WiFi shown on Settings tab)
+static lv_obj_t* statusBar = nullptr;
+static lv_obj_t* statusTimeLabel = nullptr;
+static lv_obj_t* statusWifiLabel = nullptr;  // created on Settings screen, updated by updateStatusBar()
+static void updateStatusBar();
+// Home screen sensor summary strip
+static lv_obj_t* homeSensorStrip = nullptr;
+// Volume: inline on Settings only (no slide-up panel)
+static lv_obj_t* volumeSlider = nullptr;
+static lv_obj_t* settingsVolumeValueLabel = nullptr;
+static lv_obj_t* settingsScreen = nullptr;
+static bool settingsVisible = false;
+static void volumeSliderCb(lv_event_t* e);
+static void settingsBackCb(lv_event_t* e);
+static void gesture_timer_cb(lv_timer_t* t);
+
+// Layout: status bar, content, bottom nav
+#define TZT_STATUS_H   18
+#define TZT_NAV_BAR_H  48
+#define TZT_CONTENT_TOP    TZT_STATUS_H
+#define TZT_CONTENT_H      (TZT_SCREEN_HEIGHT - TZT_STATUS_H - TZT_NAV_BAR_H)
+// Finger-friendly: minimum touch targets and consistent spacing (48px min for tap targets)
+#define TZT_MIN_TOUCH_H    48
+#define TZT_LIST_ITEM_H    48
+#define TZT_HEADER_BAR_H   48
+#define TZT_BTN_PAD_V      6
+#define TZT_LIST_PAD       8
+static lv_obj_t* navBarContainer = nullptr;
+static lv_obj_t* navBtns[5] = { nullptr };
+static void updateNavHighlight(int index);
+static void navBtnCb(lv_event_t* e);
+static void goToScreenIndex(int index);
+static void showNavBar();
+static void hideNavBar();
+// Splash: show splash.jpg at startup until UI is ready (defer createControlPanel to first loop).
+// Copy scripts/splash.jpg to the root of the SD card as /splash.jpg (optional; black screen if missing).
+#define SPLASH_PATH       "/splash.jpg"
+#define SPLASH_MIN_MS     10000  // Minimum time splash is visible (10 seconds)
+static bool splashVisible = false;
+static unsigned long splashReadyAt = 0;
+static void drawSplashToTft();    // Draw splash to TFT before LVGL (raw); no-op if file missing
 static uint32_t calculateSensorHash() {
     if (!lastSensorDataValid) return 0;
     return ((uint32_t)((int)(lastSensorData.moisturePercent * 10)) << 24) |
@@ -86,10 +177,6 @@ static uint32_t calculateSensorHash() {
 bool espNowInitialized = false;
 uint8_t mainESP32Mac[6] = MAIN_ESP32_MAC_ADDRESS;
 
-// Cached sensor data from Main (received via ESP-NOW)
-SensorDataPacket lastSensorData;
-bool lastSensorDataValid = false;
-unsigned long lastSensorDataReceiveTime = 0;  // Track when we last received data from Main
 // Optimistic cache for settings not in sensor packet (for HTTP GET /api/status)
 static int lastPumpDurationTenths = -1;   // 0-255 = 0-25.5s, -1 = not set
 static int lastPumpCooldownTenths = -1;    // 0-255 = 0-25.5s, -1 = not set
@@ -139,10 +226,19 @@ static unsigned long pendingSettingNextSendAt = 0;
 void enqueueSettingCommand(uint8_t commandType, uint8_t param1, uint8_t param2, const char* message = "");
 static bool sendingFromSettingsQueue = false;  // So onDataSentStatic doesn't set retryPending for queue sends
 
-// Firebase + Reminders
-FirebaseService* firebase = nullptr;
+// Backend (Firebase or HTTP server) + Reminders
+IBackendService* backend = nullptr;
 ReminderService* reminderService = nullptr;
 bool remindersNeedSave = false;  // Flag to save reminders in background
+
+// SD Card
+SDCardService sdCard;
+
+// Test endpoints: show image on display from HTTP (path set in handler, drawn in loop)
+static String pendingTestImagePath;
+
+// Audio
+AudioService audioSvc;
 
 // Groceries (Firebase)
 #define MAX_GROCERY_ITEMS 50
@@ -174,8 +270,9 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
         // Chunked print: resend current chunk from loop (don't use generic retry to avoid duplicates)
         if (pendingChunkTotal > 0 && (lastSentCommandType == CMD_PRINT_CHUNK || lastSentCommandType == CMD_PRINT_CHUNK_START)) {
             chunkResendAt = millis() + 600;
-            if (millis() - lastFailLog > 15000) {
-                Serial.println("[ESP-NOW] send failed, resending chunk in 600ms");
+            if (millis() - lastFailLog > 20000) {
+                Serial.println("[ESP-NOW] send failed, resending chunk");
+                lastFailLog = millis();
             }
         } else if (pendingSettingRemainingSends == 0) {
             // Don't set retryPending when a setting is in flight — settings queue resends on ACK timeout
@@ -185,16 +282,17 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
                 retryPending = true;
                 retryAt = millis() + 600;
                 retryCount++;
-                if (millis() - lastFailLog > 15000) {
-                    Serial.println("[ESP-NOW] send failed, retrying in 600ms");
+                if (millis() - lastFailLog > 20000) {
+                    Serial.println("[ESP-NOW] send failed, retrying");
+                    lastFailLog = millis();
                 }
             }
         }
-        if (millis() - lastFailLog > 10000) {
+        if (millis() - lastFailLog > 15000) {
             lastFailLog = millis();
-            Serial.println("[ESP-NOW] send failed (status=" + String((int)status) + ")");
+            Serial.println("[ESP-NOW] send failed status=" + String((int)status));
             if (!esp_now_is_peer_exist(mac_addr)) {
-                Serial.println("   Peer not in list, re-adding...");
+                Serial.println("   Re-adding peer...");
                 // Try to re-add peer immediately
                 esp_now_peer_info_t peerInfo;
                 memset(&peerInfo, 0, sizeof(peerInfo));
@@ -240,7 +338,7 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
             }
             lastSensorDataValid = true;
             lastSensorDataReceiveTime = millis();
-            Serial.println("[TZT] Rcvd: sensor");
+            sensorDataNeedsPanelUpdate = true;  // Refresh GUI on next loop (don't call LVGL from callback)
         } else {
             Serial.println("⚠️ ESP-NOW: Invalid checksum in sensor data");
         }
@@ -517,329 +615,725 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
 }
 
 #if !defined(TZT_HEADLESS)
+// LVGL touch input: XPT2046 on shared HSPI (TOUCH_CS 33)
+// Uses getTouchRaw() + affine calibration (6 coefficients from config_tzt.h)
+// Panel idles at rawZ ~725; TOUCH_Z_PRESSED (800) separates idle from real press
+// Debounce: 2 consecutive matching reads to change state (filters SPI noise and wrong-position taps)
+static uint8_t touchDebounceCount = 0;
+static const uint8_t TOUCH_DEBOUNCE = 2;
+static bool touchLastState = false;
+static int32_t touchLastX = 0, touchLastY = 0;
+// Gesture: record start on press, on release set pending for timer to process
+static int32_t touchStartX = 0, touchStartY = 0;
+static volatile bool gesturePending = false;
+static int32_t gestureStartX = 0, gestureStartY = 0;
+static int32_t gestureEndX = 0, gestureEndY = 0;
+#define SWIPE_THRESHOLD 40
+#define GESTURE_COOLDOWN_MS 120
+static uint32_t lastGestureTime = 0;
+#define MEDIA_SUBMENU_IGNORE_MS 400  // ignore taps on Media hub buttons right after switching to Media tab
+static uint32_t lastMediaScreenOpenTime = 0;
+static void touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
+    (void)indev_drv;
+    if (displayFlushing) {
+        data->point.x = touchLastX;
+        data->point.y = touchLastY;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    bool pressed = tft.getTouchRawZ() > TOUCH_Z_PRESSED;
+    uint16_t rx, ry;
+    tft.getTouchRaw(&rx, &ry);
+    int32_t sx = (int32_t)(TOUCH_AX * rx + TOUCH_BX * ry + TOUCH_CX);
+    int32_t sy = (int32_t)(TOUCH_AY * rx + TOUCH_BY * ry + TOUCH_CY);
+    if (sx < 0) sx = 0; if (sx >= TZT_SCREEN_WIDTH) sx = TZT_SCREEN_WIDTH - 1;
+    if (sy < 0) sy = 0; if (sy >= TZT_SCREEN_HEIGHT) sy = TZT_SCREEN_HEIGHT - 1;
+
+    if (pressed && touchLastState) {
+        touchLastX = sx;
+        touchLastY = sy;
+    }
+    if (pressed != touchLastState) {
+        touchDebounceCount++;
+        if (touchDebounceCount >= TOUCH_DEBOUNCE) {
+            if (pressed) {
+                touchLastX = sx;
+                touchLastY = sy;
+                touchStartX = sx;
+                touchStartY = sy;
+            } else {
+                gestureStartX = touchStartX;
+                gestureStartY = touchStartY;
+                gestureEndX = touchLastX;
+                gestureEndY = touchLastY;
+                gesturePending = true;
+            }
+            touchLastState = pressed;
+            touchDebounceCount = 0;
+        }
+    } else {
+        touchDebounceCount = 0;
+    }
+    data->point.x = touchLastX;
+    data->point.y = touchLastY;
+    data->state = touchLastState ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
 // LVGL display flush callback: send buffer to TFT
 static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t* color_map) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
+    displayFlushing = true;
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushPixels((uint16_t*)color_map, w * h);
     tft.endWrite();
+    displayFlushing = false;
     lv_disp_flush_ready(drv);
 }
 
-// Nav: user_data = 0 prev, 1 next
+// Nav: change screen by index (used by gesture and Back from settings)
+static lv_obj_t* screenByIndex(int idx) {
+    switch (idx) {
+        case 0: return screen1;
+        case 1: return screen2;
+        case 2: return screen3;
+        case 3: return screen4;
+        case 4: return settingsScreen;
+        default: return screen1;
+    }
+}
+
+// True if we're on one of the 4 main nav screens (swipe between these only)
+static bool isOnMainScreen() {
+    lv_obj_t* act = lv_scr_act();
+    return (act == screen1 || act == screen2 || act == screen3 || act == screen4);
+}
+static void goToScreen(int dir) {
+    currentScreenIndex = (currentScreenIndex + dir + SCREEN_COUNT) % SCREEN_COUNT;
+    if (currentScreenIndex == 2) refreshHistoryList();
+    lv_obj_t* scr = screenByIndex(currentScreenIndex);
+    lv_scr_load_anim(scr,
+        dir > 0 ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+        180, 0, false);
+    updateNavHighlight(currentScreenIndex);
+}
+
+static void goToScreenIndex(int index) {
+    if (index < 0 || index >= SCREEN_COUNT) return;
+    if (index == currentScreenIndex) return;
+    int dir = (index > currentScreenIndex) ? 1 : -1;
+    currentScreenIndex = index;
+    if (currentScreenIndex == 3) lastMediaScreenOpenTime = (uint32_t)millis();
+    if (currentScreenIndex == 2) refreshHistoryList();
+    lv_obj_t* scr = screenByIndex(currentScreenIndex);
+    lv_scr_load_anim(scr,
+        dir > 0 ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+        180, 0, false);
+    updateNavHighlight(currentScreenIndex);
+}
+
 static void navBtnCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int dir = (int)(uintptr_t)lv_event_get_user_data(e);
-    currentScreenIndex = (currentScreenIndex + (dir ? 1 : -1) + 3) % 3;
-    lv_obj_t* scr = (currentScreenIndex == 0) ? screen1 : (currentScreenIndex == 1) ? screen2 : screen3;
-    lv_scr_load(scr);
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    goToScreenIndex(idx);
 }
 
-// Command button: user_data = (void*)(uintptr_t)command_type
-static void cmdBtnCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    uintptr_t cmd = (uintptr_t)lv_event_get_user_data(e);
-    if (cmd == CMD_DISPENSE_START) {
-        lastSensorData.isDispensing = true;
-        lastSensorDataValid = true;
-        updateControlPanelStatus();
-        sendPumpCommandRepeated(CMD_DISPENSE_START);
-    } else if (cmd == CMD_DISPENSE_STOP) {
-        lastSensorData.isDispensing = false;
-        lastSensorDataValid = true;
-        updateControlPanelStatus();
-        sendPumpCommandRepeated(CMD_DISPENSE_STOP);
-    } else if (cmd == CMD_RESET_SANITIZER) sendCommandViaESPNow(CMD_RESET_SANITIZER);
-    else if (cmd == CMD_TEST_PRINTER) sendCommandViaESPNow(CMD_TEST_PRINTER);
-}
-
-// LED slider (screen 3): optimistic UI, then enqueue for reliable send
-static void ledSliderCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    lv_obj_t* slider = lv_event_get_target(e);
-    int val = lv_slider_get_value(slider);
-    lastSensorData.ledBrightness = (uint8_t)val;
-    lastSensorDataValid = true;
-    settingsNeedSave = true;
-    updateControlPanelStatus();
-    enqueueSettingCommand(CMD_SET_LED_BRIGHTNESS, (uint8_t)val, val > 0 ? 1 : 0, "");
-}
-
-// Pump duration slider: value 0-255 = 0-25.5s (x100ms), optimistic label + enqueue on release
-static void pumpDurationCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED && lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-    lv_obj_t* slider = lv_event_get_target(e);
-    int val = lv_slider_get_value(slider);
-    if (labelPumpDuration) lv_label_set_text_fmt(labelPumpDuration, "%d.%ds", val / 10, val % 10);
-    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-        lastPumpDurationTenths = val;
-        settingsNeedSave = true;
-        enqueueSettingCommand(CMD_SET_PUMP_DURATION, (uint8_t)val, 0, "");
+static void updateNavHighlight(int index) {
+    for (int i = 0; i < SCREEN_COUNT && navBtns[i]; i++) {
+        if (i == index)
+            lv_obj_set_style_bg_color(navBtns[i], lv_color_hex(0x2a5514), 0);
+        else
+            lv_obj_set_style_bg_color(navBtns[i], lv_color_hex(0x0a1806), 0);
     }
 }
 
-// Pump cooldown slider: value 0-255 = 0-25.5s, optimistic label + enqueue on release
-static void pumpCooldownCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED && lv_event_get_code(e) != LV_EVENT_RELEASED) return;
-    lv_obj_t* slider = lv_event_get_target(e);
-    int val = lv_slider_get_value(slider);
-    if (labelPumpCooldown) lv_label_set_text_fmt(labelPumpCooldown, "%d.%ds", val / 10, val % 10);
-    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-        lastPumpCooldownTenths = val;
-        settingsNeedSave = true;
-        enqueueSettingCommand(CMD_SET_PUMP_COOLDOWN, (uint8_t)val, 0, "");
+static void showNavBar() {
+    if (navBarContainer) lv_obj_clear_flag(navBarContainer, LV_OBJ_FLAG_HIDDEN);
+    if (statusBar) lv_obj_clear_flag(statusBar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void hideNavBar() {
+    if (navBarContainer) lv_obj_add_flag(navBarContainer, LV_OBJ_FLAG_HIDDEN);
+    if (statusBar) lv_obj_add_flag(statusBar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void updateStatusBar() {
+    if (!statusTimeLabel) return;
+    struct tm ti;
+    time_t now = time(nullptr);
+    localtime_r(&now, &ti);
+    if (ti.tm_year > 100) {
+        char tbuf[12];
+        strftime(tbuf, sizeof(tbuf), "%I:%M %p", &ti);
+        if (tbuf[0] == '0') memmove(tbuf, tbuf + 1, strlen(tbuf));
+        lv_label_set_text(statusTimeLabel, tbuf);
     }
-}
-
-// Auto dispense toggle (screen 2): optimistic UI, then enqueue
-static void autoDispenseCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    lv_obj_t* sw = lv_event_get_target(e);
-    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    lastSensorData.autoDispense = on;
-    lastSensorDataValid = true;
-    settingsNeedSave = true;
-    updateControlPanelStatus();
-    enqueueSettingCommand(CMD_SET_AUTO_DISPENSE, on ? 1 : 0, 0, "");
-}
-
-// Calibrate buttons (screen 3): enqueue for reliable send (no UI state to update)
-static void calibrateBtnCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    uintptr_t isMax = (uintptr_t)lv_event_get_user_data(e);
-    enqueueSettingCommand(CMD_SET_LIGHT_CALIBRATION, (uint8_t)(isMax ? 1 : 0), 0, "");
-}
-
-// Auto brightness toggle (screen 3): optimistic UI, then enqueue
-static void autoBrightnessCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    lv_obj_t* sw = lv_event_get_target(e);
-    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    lastSensorData.autoBrightness = on;
-    lastSensorDataValid = true;
-    settingsNeedSave = true;
-    updateControlPanelStatus();
-    enqueueSettingCommand(CMD_SET_AUTO_BRIGHTNESS, on ? 1 : 0, 0, "");
+    if (statusWifiLabel) {
+        if (WiFi.status() == WL_CONNECTED) {
+            lv_label_set_text(statusWifiLabel, WiFi.SSID().length() ? WiFi.SSID().c_str() : "Connected");
+            lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0x6ab82e), 0);
+        } else {
+            lv_label_set_text(statusWifiLabel, "Disconnected");
+            lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0xaaaaaa), 0);
+        }
+    }
 }
 
 static void setScreenStyle(lv_obj_t* scr) {
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a3d0e), 0);
     lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0x4a7c2a), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 }
 
-// Add nav buttons at bottom of a screen (compact)
-static void addNavButtons(lv_obj_t* scr) {
-    int btnW = 80;
-    int btnH = 26;
-    int y = TZT_SCREEN_HEIGHT - btnH - 4;
-    lv_obj_t* left = lv_btn_create(scr);
-    lv_obj_set_size(left, btnW, btnH);
-    lv_obj_set_pos(left, 4, y);
-    lv_obj_set_style_bg_color(left, lv_color_hex(0x2d5016), 0);
-    lv_obj_t* lbl = lv_label_create(left);
-    lv_label_set_text(lbl, LV_SYMBOL_LEFT " Prev");
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(lbl);
-    lv_obj_add_event_cb(left, navBtnCb, LV_EVENT_CLICKED, (void*)0);
-    lv_obj_t* right = lv_btn_create(scr);
-    lv_obj_set_size(right, btnW, btnH);
-    lv_obj_set_pos(right, TZT_SCREEN_WIDTH - 4 - btnW, y);
-    lv_obj_set_style_bg_color(right, lv_color_hex(0x2d5016), 0);
-    lbl = lv_label_create(right);
-    lv_label_set_text(lbl, "Next " LV_SYMBOL_RIGHT);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(lbl);
-    lv_obj_add_event_cb(right, navBtnCb, LV_EVENT_CLICKED, (void*)1);
+// Pressed-state style applied to every button for tactile feedback
+static lv_style_t style_btn_pressed;
+static bool btn_style_inited = false;
+static void applyBtnPressStyle(lv_obj_t* btn) {
+    if (!btn_style_inited) {
+        lv_style_init(&style_btn_pressed);
+        lv_style_set_bg_color(&style_btn_pressed, lv_color_hex(0x5a9c3a));
+        lv_style_set_transform_width(&style_btn_pressed, -2);
+        lv_style_set_transform_height(&style_btn_pressed, -2);
+        btn_style_inited = true;
+    }
+    lv_obj_add_style(btn, &style_btn_pressed, LV_STATE_PRESSED);
+}
+
+static void gesture_timer_cb(lv_timer_t* t) {
+    (void)t;
+    if (!gesturePending) return;
+    gesturePending = false;
+    int32_t dx = gestureEndX - gestureStartX;
+    int32_t dy = gestureEndY - gestureStartY;
+    int32_t adx = dx < 0 ? -dx : dx;
+    int32_t ady = dy < 0 ? -dy : dy;
+    if (adx < SWIPE_THRESHOLD && ady < SWIPE_THRESHOLD) return;
+    if (settingsVisible) {
+        if (ady > adx && dy > 0) return;
+        if (ady > adx && dy < 0) { settingsVisible = false; showNavBar(); lv_scr_load(screenByIndex(currentScreenIndex)); updateNavHighlight(currentScreenIndex); return; }
+        if (adx >= ady) { settingsVisible = false; showNavBar(); lv_scr_load(screenByIndex(currentScreenIndex)); updateNavHighlight(currentScreenIndex); return; }
+        return;
+    }
+    // Navigation only via tab buttons; no horizontal swipe; Settings via Settings tab
+}
+
+static void volumeSliderCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    lv_obj_t* slider = lv_event_get_target(e);
+    if (!slider) return;
+    int32_t v = lv_slider_get_value(slider);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    audioSvc.setVolume((float)v / 100.0f);
+    if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", (int)v);
+}
+
+static void settingsBackCb(lv_event_t* e) {
+    (void)e;
+    settingsVisible = false;
+    currentScreenIndex = 0;
+    showNavBar();
+    lv_scr_load(screen1);
+    updateNavHighlight(0);
+}
+
+static void mediaOpenAudioCb(lv_event_t* e) {
+    (void)e;
+    if ((uint32_t)millis() - lastMediaScreenOpenTime < MEDIA_SUBMENU_IGNORE_MS) return;
+    refreshAudioList();
+    hideNavBar();
+    lv_scr_load_anim(audioListScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+static void mediaOpenImagesCb(lv_event_t* e) {
+    (void)e;
+    if ((uint32_t)millis() - lastMediaScreenOpenTime < MEDIA_SUBMENU_IGNORE_MS) return;
+    refreshImageList();
+    hideNavBar();
+    lv_scr_load_anim(imageListScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+static void audioBackToMediaCb(lv_event_t* e) {
+    (void)e;
+    currentScreenIndex = 3;
+    lastMediaScreenOpenTime = (uint32_t)millis();
+    lv_scr_load_anim(screen4, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    showNavBar();
+    updateNavHighlight(3);
+}
+
+static void imageListBackCb(lv_event_t* e) {
+    (void)e;
+    currentScreenIndex = 3;
+    lastMediaScreenOpenTime = (uint32_t)millis();
+    lv_scr_load_anim(screen4, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    showNavBar();
+    updateNavHighlight(3);
 }
 
 static void createControlPanel() {
-    // Screen 1: 4 boxes (Moisture, Sanitizer, LED, Pump) + nav - tight layout, big value font
+    // ---- Screen 1: Home (latest message + sensor summary) ----
     screen1 = lv_obj_create(NULL);
     setScreenStyle(screen1);
-    int pad = 4;
-    int gap = 4;
-    int boxW = (TZT_SCREEN_WIDTH - pad * 2 - gap) / 2;
-    int boxH = (TZT_SCREEN_HEIGHT - pad * 2 - 26 - 4) / 2 - gap / 2;  // nav 26 + 4
-    int y0 = pad;
-    auto addBox = [&](int col, int row, const char* name, lv_obj_t*& valueLabel) {
-        int x = pad + col * (boxW + gap);
-        int y = y0 + row * (boxH + gap);
-        lv_obj_t* box = lv_obj_create(screen1);
-        lv_obj_set_size(box, boxW, boxH);
-        lv_obj_set_pos(box, x, y);
-        lv_obj_set_style_bg_color(box, lv_color_hex(0x2d5016), 0);
-        lv_obj_set_style_border_color(box, lv_color_hex(0x4a7c2a), 0);
-        lv_obj_set_style_pad_all(box, 2, 0);
-        lv_obj_t* title = lv_label_create(box);
-        lv_label_set_text(title, name);
-        lv_obj_set_style_text_color(title, lv_color_hex(0xaaaaaa), 0);
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
-        lv_obj_align(title, LV_ALIGN_TOP_LEFT, 2, 0);
-        lv_obj_t* val = lv_label_create(box);
-        lv_label_set_text(val, "--");
-        lv_obj_set_style_text_color(val, lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_text_font(val, &lv_font_montserrat_16, 0);
-        lv_obj_align(val, LV_ALIGN_BOTTOM_LEFT, 2, -1);
-        valueLabel = val;
-    };
-    addBox(0, 0, "Moisture", labelMoisture);
-    addBox(1, 0, "Sanitizer", labelSanitizer);
-    addBox(0, 1, "LED", labelLED);
-    addBox(1, 1, "Pump", labelPump);
-    addNavButtons(screen1);
+    #define HOME_STRIP_H 22
+    int msgBoxH = TZT_CONTENT_H - HOME_STRIP_H - 2;
+    lv_obj_t* msgBox = lv_obj_create(screen1);
+    lv_obj_set_size(msgBox, TZT_SCREEN_WIDTH - 8, msgBoxH);
+    lv_obj_set_pos(msgBox, 4, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_color(msgBox, lv_color_hex(0x142e0a), 0);
+    lv_obj_set_style_bg_opa(msgBox, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(msgBox, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(msgBox, 1, 0);
+    lv_obj_set_style_pad_all(msgBox, 6, 0);
+    lv_obj_set_style_radius(msgBox, 4, 0);
+    lv_obj_add_flag(msgBox, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scrollbar_mode(msgBox, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(msgBox, LV_DIR_VER);
+    labelMessage = lv_label_create(msgBox);
+    lv_label_set_long_mode(labelMessage, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(labelMessage, TZT_SCREEN_WIDTH - 28);
+    lv_label_set_text(labelMessage, lastPrintMessage.c_str());
+    lv_obj_set_style_text_color(labelMessage, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_set_style_text_font(labelMessage, &lv_font_montserrat_16, 0);
+    // Compact sensor summary at bottom of home screen
+    homeSensorStrip = lv_label_create(screen1);
+    lv_obj_set_style_text_color(homeSensorStrip, lv_color_hex(0x99cc77), 0);
+    lv_obj_set_style_text_font(homeSensorStrip, &lv_font_montserrat_14, 0);
+    lv_label_set_text(homeSensorStrip, LV_SYMBOL_CHARGE " --   San --   LED --   Pump --");
+    lv_obj_set_pos(homeSensorStrip, 8, TZT_CONTENT_TOP + msgBoxH + 4);
 
-    // Screen 2: Pump - tight layout, big font
+    // ---- Screen 2: Sensor Data with progress bars ----
     screen2 = lv_obj_create(NULL);
     setScreenStyle(screen2);
-    int sy = 2;
-    lv_obj_t* h2 = lv_label_create(screen2);
-    lv_label_set_text(h2, "Pump");
-    lv_obj_set_style_text_color(h2, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(h2, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(h2, 4, sy);
-    sy += 14;
-    lv_obj_t* lDur = lv_label_create(screen2);
-    lv_label_set_text(lDur, "Duration:");
-    lv_obj_set_style_text_color(lDur, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_text_font(lDur, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lDur, 4, sy);
-    labelPumpDuration = lv_label_create(screen2);
-    lv_label_set_text(labelPumpDuration, "2.0s");
-    lv_obj_set_style_text_color(labelPumpDuration, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(labelPumpDuration, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(labelPumpDuration, TZT_SCREEN_WIDTH - 52, sy);
-    sy += 12;
-    slDuration = lv_slider_create(screen2);
-    lv_obj_set_size(slDuration, TZT_SCREEN_WIDTH - 16, 12);
-    lv_obj_set_pos(slDuration, 4, sy);
-    lv_slider_set_range(slDuration, 5, 255);
-    lv_slider_set_value(slDuration, 20, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(slDuration, lv_color_hex(0x2d5016), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(slDuration, lv_color_hex(0x6b9f3d), LV_PART_INDICATOR);
-    lv_obj_set_style_opa(slDuration, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_set_style_opa(slDuration, LV_OPA_50, LV_PART_INDICATOR | LV_STATE_DISABLED);
-    lv_obj_add_event_cb(slDuration, pumpDurationCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(slDuration, pumpDurationCb, LV_EVENT_RELEASED, nullptr);
-    sy += 14;
-    lv_obj_t* lCo = lv_label_create(screen2);
-    lv_label_set_text(lCo, "Cooldown:");
-    lv_obj_set_style_text_color(lCo, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_text_font(lCo, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(lCo, 4, sy);
-    labelPumpCooldown = lv_label_create(screen2);
-    lv_label_set_text(labelPumpCooldown, "3.0s");
-    lv_obj_set_style_text_color(labelPumpCooldown, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(labelPumpCooldown, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(labelPumpCooldown, TZT_SCREEN_WIDTH - 52, sy);
-    sy += 12;
-    slCooldown = lv_slider_create(screen2);
-    lv_obj_set_size(slCooldown, TZT_SCREEN_WIDTH - 16, 12);
-    lv_obj_set_pos(slCooldown, 4, sy);
-    lv_slider_set_range(slCooldown, 10, 255);
-    lv_slider_set_value(slCooldown, 30, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(slCooldown, lv_color_hex(0x2d5016), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(slCooldown, lv_color_hex(0x6b9f3d), LV_PART_INDICATOR);
-    lv_obj_set_style_opa(slCooldown, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_set_style_opa(slCooldown, LV_OPA_50, LV_PART_INDICATOR | LV_STATE_DISABLED);
-    lv_obj_add_event_cb(slCooldown, pumpCooldownCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(slCooldown, pumpCooldownCb, LV_EVENT_RELEASED, nullptr);
-    sy += 16;
-    btnStart = lv_btn_create(screen2);
-    lv_obj_set_size(btnStart, 76, 26);
-    lv_obj_set_pos(btnStart, 4, sy);
-    lv_obj_set_style_bg_color(btnStart, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_opa(btnStart, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_t* lbl2 = lv_label_create(btnStart);
-    lv_label_set_text(lbl2, "Start");
-    lv_obj_set_style_text_font(lbl2, &lv_font_montserrat_14, 0);
-    lv_obj_center(lbl2);
-    lv_obj_add_event_cb(btnStart, cmdBtnCb, LV_EVENT_CLICKED, (void*)(uintptr_t)CMD_DISPENSE_START);
-    btnStop = lv_btn_create(screen2);
-    lv_obj_set_size(btnStop, 76, 26);
-    lv_obj_set_pos(btnStop, 84, sy);
-    lv_obj_set_style_bg_color(btnStop, lv_color_hex(0x8b4513), 0);
-    lv_obj_set_style_opa(btnStop, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_t* lbl3 = lv_label_create(btnStop);
-    lv_label_set_text(lbl3, "Stop");
-    lv_obj_set_style_text_font(lbl3, &lv_font_montserrat_14, 0);
-    lv_obj_center(lbl3);
-    lv_obj_add_event_cb(btnStop, cmdBtnCb, LV_EVENT_CLICKED, (void*)(uintptr_t)CMD_DISPENSE_STOP);
-    sy += 28;
-    lv_obj_t* swLabel = lv_label_create(screen2);
-    lv_label_set_text(swLabel, "Sensor");
-    lv_obj_set_style_text_color(swLabel, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_text_font(swLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(swLabel, 4, sy);
-    swDispense = lv_switch_create(screen2);
-    lv_obj_set_size(swDispense, 40, 20);
-    lv_obj_set_pos(swDispense, TZT_SCREEN_WIDTH - 46, sy - 1);
-    lv_obj_add_event_cb(swDispense, autoDispenseCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    addNavButtons(screen2);
+    {
+        int pad = 4, gap = 3;
+        int boxW = (TZT_SCREEN_WIDTH - pad * 2 - gap) / 2;
+        int boxH = (TZT_CONTENT_H - gap) / 2;
+        int y0 = TZT_CONTENT_TOP;
+        auto addSensorCard = [&](int col, int row, const char* icon, const char* name,
+                                  lv_obj_t*& valueLabel, lv_obj_t*& bar) {
+            int x = pad + col * (boxW + gap);
+            int y = y0 + row * (boxH + gap);
+            lv_obj_t* box = lv_obj_create(screen2);
+            lv_obj_set_size(box, boxW, boxH);
+            lv_obj_set_pos(box, x, y);
+            lv_obj_set_style_bg_color(box, lv_color_hex(0x1e4210), 0);
+            lv_obj_set_style_border_color(box, lv_color_hex(0x3a6820), 0);
+            lv_obj_set_style_border_width(box, 1, 0);
+            lv_obj_set_style_pad_all(box, 5, 0);
+            lv_obj_set_style_radius(box, 6, 0);
+            lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t* header = lv_label_create(box);
+            char hbuf[32]; snprintf(hbuf, sizeof(hbuf), "%s %s", icon, name);
+            lv_label_set_text(header, hbuf);
+            lv_obj_set_style_text_color(header, lv_color_hex(0x99bb88), 0);
+            lv_obj_set_style_text_font(header, &lv_font_montserrat_14, 0);
+            lv_obj_set_pos(header, 0, 0);
+            lv_obj_t* val = lv_label_create(box);
+            lv_label_set_text(val, "--");
+            lv_obj_set_style_text_color(val, lv_color_hex(0xffffff), 0);
+            lv_obj_set_style_text_font(val, &lv_font_montserrat_18, 0);
+            lv_obj_align(val, LV_ALIGN_CENTER, 0, 2);
+            valueLabel = val;
+            if (bar != (lv_obj_t*)1) {
+                bar = lv_bar_create(box);
+                lv_obj_set_size(bar, boxW - 14, 10);
+                lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -2);
+                lv_bar_set_range(bar, 0, 100);
+                lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(bar, lv_color_hex(0x0d1f07), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(bar, lv_color_hex(0x6ab82e), LV_PART_INDICATOR);
+                lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
+                lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
+            } else {
+                bar = nullptr;
+            }
+        };
+        lv_obj_t* noBar = (lv_obj_t*)1;
+        addSensorCard(0, 0, LV_SYMBOL_CHARGE, "Moisture", labelMoisture, barMoisture);
+        addSensorCard(1, 0, LV_SYMBOL_REFRESH, "Sanitizer", labelSanitizer, barSanitizer);
+        addSensorCard(0, 1, LV_SYMBOL_SETTINGS, "LED", labelLED, barLED);
+        addSensorCard(1, 1, LV_SYMBOL_POWER, "Pump", labelPump, noBar);
+    }
 
-    // Screen 3: LED - tight layout, big font
+    // ---- Screen 3: History (messages from SD) ----
     screen3 = lv_obj_create(NULL);
     setScreenStyle(screen3);
-    sy = 2;
-    lv_obj_t* h3 = lv_label_create(screen3);
-    lv_label_set_text(h3, "LED");
-    lv_obj_set_style_text_color(h3, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(h3, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(h3, 4, sy);
-    sy += 14;
-    slLed = lv_slider_create(screen3);
-    lv_obj_set_size(slLed, TZT_SCREEN_WIDTH - 16, 14);
-    lv_obj_set_pos(slLed, 4, sy);
-    lv_slider_set_range(slLed, 0, 255);
-    lv_slider_set_value(slLed, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(slLed, lv_color_hex(0x2d5016), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(slLed, lv_color_hex(0x6b9f3d), LV_PART_INDICATOR);
-    lv_obj_set_style_opa(slLed, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_set_style_opa(slLed, LV_OPA_50, LV_PART_INDICATOR | LV_STATE_DISABLED);
-    lv_obj_add_event_cb(slLed, ledSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    sy += 18;
-    lv_obj_t* calLabel = lv_label_create(screen3);
-    lv_label_set_text(calLabel, "Calibrate");
-    lv_obj_set_style_text_color(calLabel, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_text_font(calLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(calLabel, 4, sy);
-    sy += 14;
-    btnTurnOff = lv_btn_create(screen3);
-    lv_obj_set_size(btnTurnOff, 100, 26);
-    lv_obj_set_pos(btnTurnOff, 4, sy);
-    lv_obj_set_style_bg_color(btnTurnOff, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_opa(btnTurnOff, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_t* lblOff = lv_label_create(btnTurnOff);
-    lv_label_set_text(lblOff, "Turn off");
-    lv_obj_set_style_text_font(lblOff, &lv_font_montserrat_14, 0);
-    lv_obj_center(lblOff);
-    lv_obj_add_event_cb(btnTurnOff, calibrateBtnCb, LV_EVENT_CLICKED, (void*)0);
-    btnTurnOn = lv_btn_create(screen3);
-    lv_obj_set_size(btnTurnOn, 100, 26);
-    lv_obj_set_pos(btnTurnOn, 112, sy);
-    lv_obj_set_style_bg_color(btnTurnOn, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_opa(btnTurnOn, LV_OPA_50, LV_PART_MAIN | LV_STATE_DISABLED);
-    lv_obj_t* lblOn = lv_label_create(btnTurnOn);
-    lv_label_set_text(lblOn, "Turn on");
-    lv_obj_set_style_text_font(lblOn, &lv_font_montserrat_14, 0);
-    lv_obj_center(lblOn);
-    lv_obj_add_event_cb(btnTurnOn, calibrateBtnCb, LV_EVENT_CLICKED, (void*)1);
-    sy += 28;
-    lv_obj_t* swLedLabel = lv_label_create(screen3);
-    lv_label_set_text(swLedLabel, "Sensor");
-    lv_obj_set_style_text_color(swLedLabel, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_style_text_font(swLedLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(swLedLabel, 4, sy);
-    swBright = lv_switch_create(screen3);
-    lv_obj_set_size(swBright, 40, 20);
-    lv_obj_set_pos(swBright, TZT_SCREEN_WIDTH - 46, sy - 1);
-    lv_obj_add_event_cb(swBright, autoBrightnessCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    addNavButtons(screen3);
+    historyList = lv_list_create(screen3);
+    lv_obj_set_size(historyList, TZT_SCREEN_WIDTH - 4, TZT_CONTENT_H);
+    lv_obj_set_pos(historyList, 2, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_color(historyList, lv_color_hex(0x142e0a), 0);
+    lv_obj_set_style_bg_opa(historyList, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(historyList, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(historyList, 1, 0);
+    lv_obj_set_style_pad_all(historyList, TZT_LIST_PAD, 0);
+    lv_obj_set_style_radius(historyList, 4, 0);
+    lv_obj_set_scrollbar_mode(historyList, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(historyList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(historyList, LV_DIR_VER);
+    refreshHistoryList();
+
+    historyDetail = lv_obj_create(screen3);
+    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH - 8, TZT_CONTENT_H);
+    lv_obj_set_pos(historyDetail, 4, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_color(historyDetail, lv_color_hex(0x0d1f07), 0);
+    lv_obj_set_style_bg_opa(historyDetail, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(historyDetail, lv_color_hex(0x4a7c2a), 0);
+    lv_obj_set_style_border_width(historyDetail, 2, 0);
+    lv_obj_set_style_radius(historyDetail, 8, 0);
+    lv_obj_set_style_pad_all(historyDetail, TZT_LIST_PAD, 0);
+    lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(historyDetail, LV_DIR_VER);
+    lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+
+    historyDetailLabel = lv_label_create(historyDetail);
+    lv_label_set_long_mode(historyDetailLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(historyDetailLabel, TZT_SCREEN_WIDTH - 56);
+    lv_obj_set_style_text_color(historyDetailLabel, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_set_style_text_font(historyDetailLabel, &lv_font_montserrat_16, 0);
+
+    lv_obj_t* backBtn = lv_btn_create(historyDetail);
+    applyBtnPressStyle(backBtn);
+    lv_obj_set_size(backBtn, 100, TZT_MIN_TOUCH_H);
+    lv_obj_align(backBtn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_radius(backBtn, 6, 0);
+    lv_obj_t* backLbl = lv_label_create(backBtn);
+    lv_label_set_text(backLbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(backLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(backLbl);
+    lv_obj_add_event_cb(backBtn, historyBackCb, LV_EVENT_CLICKED, nullptr);
+
+    // ---- Screen 4: Media hub (Audio + Images) ----
+    screen4 = lv_obj_create(NULL);
+    setScreenStyle(screen4);
+    {
+        int mediaBtnW = TZT_SCREEN_WIDTH - TZT_LIST_PAD * 2;
+        int mediaGap = 6;
+        int mediaBtnH = (TZT_CONTENT_H - TZT_LIST_PAD * 2 - mediaGap) / 2;
+        int mediaY = TZT_CONTENT_TOP + TZT_LIST_PAD;
+        lv_obj_t* audioHubBtn = lv_btn_create(screen4);
+        applyBtnPressStyle(audioHubBtn);
+        lv_obj_set_size(audioHubBtn, mediaBtnW, mediaBtnH);
+        lv_obj_set_pos(audioHubBtn, TZT_LIST_PAD, mediaY);
+        lv_obj_set_style_bg_color(audioHubBtn, lv_color_hex(0x1e4210), 0);
+        lv_obj_set_style_border_color(audioHubBtn, lv_color_hex(0x3a6820), 0);
+        lv_obj_set_style_border_width(audioHubBtn, 1, 0);
+        lv_obj_set_style_radius(audioHubBtn, 8, 0);
+        lv_obj_t* audioIcon = lv_label_create(audioHubBtn);
+        lv_label_set_text(audioIcon, LV_SYMBOL_AUDIO);
+        lv_obj_set_style_text_font(audioIcon, &lv_font_montserrat_18, 0);
+        lv_obj_align(audioIcon, LV_ALIGN_LEFT_MID, 4, -6);
+        lv_obj_t* audioTitle = lv_label_create(audioHubBtn);
+        lv_label_set_text(audioTitle, "Play Audio");
+        lv_obj_set_style_text_font(audioTitle, &lv_font_montserrat_16, 0);
+        lv_obj_align(audioTitle, LV_ALIGN_LEFT_MID, 30, -6);
+        lv_obj_t* audioHint = lv_label_create(audioHubBtn);
+        lv_label_set_text(audioHint, "Browse and play sound files from SD");
+        lv_obj_set_style_text_font(audioHint, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(audioHint, lv_color_hex(0x88aa77), 0);
+        lv_obj_align(audioHint, LV_ALIGN_LEFT_MID, 4, 12);
+        lv_obj_add_event_cb(audioHubBtn, mediaOpenAudioCb, LV_EVENT_CLICKED, nullptr);
+
+        lv_obj_t* imagesHubBtn = lv_btn_create(screen4);
+        applyBtnPressStyle(imagesHubBtn);
+        lv_obj_set_size(imagesHubBtn, mediaBtnW, mediaBtnH);
+        lv_obj_set_pos(imagesHubBtn, TZT_LIST_PAD, mediaY + mediaBtnH + mediaGap);
+        lv_obj_set_style_bg_color(imagesHubBtn, lv_color_hex(0x1e4210), 0);
+        lv_obj_set_style_border_color(imagesHubBtn, lv_color_hex(0x3a6820), 0);
+        lv_obj_set_style_border_width(imagesHubBtn, 1, 0);
+        lv_obj_set_style_radius(imagesHubBtn, 8, 0);
+        lv_obj_t* imgIcon = lv_label_create(imagesHubBtn);
+        lv_label_set_text(imgIcon, LV_SYMBOL_IMAGE);
+        lv_obj_set_style_text_font(imgIcon, &lv_font_montserrat_18, 0);
+        lv_obj_align(imgIcon, LV_ALIGN_LEFT_MID, 4, -6);
+        lv_obj_t* imgTitle = lv_label_create(imagesHubBtn);
+        lv_label_set_text(imgTitle, "View Images");
+        lv_obj_set_style_text_font(imgTitle, &lv_font_montserrat_16, 0);
+        lv_obj_align(imgTitle, LV_ALIGN_LEFT_MID, 30, -6);
+        lv_obj_t* imgHint = lv_label_create(imagesHubBtn);
+        lv_label_set_text(imgHint, "Browse photos and images from SD");
+        lv_obj_set_style_text_font(imgHint, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(imgHint, lv_color_hex(0x88aa77), 0);
+        lv_obj_align(imgHint, LV_ALIGN_LEFT_MID, 4, 12);
+        lv_obj_add_event_cb(imagesHubBtn, mediaOpenImagesCb, LV_EVENT_CLICKED, nullptr);
+    }
+
+    // ---- Audio list sub-screen (from Media) ----
+    audioListScreen = lv_obj_create(NULL);
+    setScreenStyle(audioListScreen);
+    audioHeaderBar = lv_obj_create(audioListScreen);
+    lv_obj_set_size(audioHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
+    lv_obj_set_pos(audioHeaderBar, 0, 0);
+    lv_obj_set_style_bg_color(audioHeaderBar, lv_color_hex(0x0d1f07), 0);
+    lv_obj_set_style_border_color(audioHeaderBar, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_border_width(audioHeaderBar, 1, 0);
+    lv_obj_set_style_border_side(audioHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_radius(audioHeaderBar, 0, 0);
+    lv_obj_set_style_pad_all(audioHeaderBar, 0, 0);
+    lv_obj_clear_flag(audioHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* audioBackBtn = lv_btn_create(audioHeaderBar);
+    applyBtnPressStyle(audioBackBtn);
+    lv_obj_set_size(audioBackBtn, 100, TZT_MIN_TOUCH_H);
+    lv_obj_align(audioBackBtn, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_set_style_bg_color(audioBackBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_radius(audioBackBtn, 8, 0);
+    lv_obj_t* audioBackLbl = lv_label_create(audioBackBtn);
+    lv_label_set_text(audioBackLbl, LV_SYMBOL_LEFT " Media");
+    lv_obj_set_style_text_font(audioBackLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(audioBackLbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_center(audioBackLbl);
+    lv_obj_add_event_cb(audioBackBtn, audioBackToMediaCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* audioTitleLbl = lv_label_create(audioHeaderBar);
+    lv_label_set_text(audioTitleLbl, LV_SYMBOL_AUDIO " Audio");
+    lv_obj_set_style_text_color(audioTitleLbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(audioTitleLbl, &lv_font_montserrat_18, 0);
+    lv_obj_align(audioTitleLbl, LV_ALIGN_CENTER, 0, 0);
+    audioStopBtn = lv_btn_create(audioHeaderBar);
+    applyBtnPressStyle(audioStopBtn);
+    lv_obj_set_size(audioStopBtn, 72, TZT_MIN_TOUCH_H);
+    lv_obj_align(audioStopBtn, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_set_style_bg_color(audioStopBtn, lv_color_hex(0xcc3333), 0);
+    lv_obj_set_style_radius(audioStopBtn, 8, 0);
+    lv_obj_t* stopLbl = lv_label_create(audioStopBtn);
+    lv_label_set_text(stopLbl, LV_SYMBOL_STOP);
+    lv_obj_set_style_text_font(stopLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(stopLbl, lv_color_white(), 0);
+    lv_obj_center(stopLbl);
+    lv_obj_add_event_cb(audioStopBtn, audioStopCb, LV_EVENT_CLICKED, nullptr);
+    audioList = lv_list_create(audioListScreen);
+    lv_obj_set_size(audioList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
+    lv_obj_set_pos(audioList, 4, TZT_HEADER_BAR_H + 4);
+    lv_obj_set_style_bg_color(audioList, lv_color_hex(0x1a3d0e), 0);
+    lv_obj_set_style_bg_opa(audioList, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(audioList, lv_color_hex(0x4a7c2a), 0);
+    lv_obj_set_style_border_width(audioList, 2, 0);
+    lv_obj_set_style_pad_all(audioList, TZT_LIST_PAD, 0);
+    lv_obj_set_style_radius(audioList, 6, 0);
+    lv_obj_set_scrollbar_mode(audioList, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(audioList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(audioList, LV_DIR_VER);
+
+    // ---- Image list sub-screen (from Media) ----
+    imageListScreen = lv_obj_create(NULL);
+    setScreenStyle(imageListScreen);
+    lv_obj_t* imageHeaderBar = lv_obj_create(imageListScreen);
+    lv_obj_set_size(imageHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
+    lv_obj_set_pos(imageHeaderBar, 0, 0);
+    lv_obj_set_style_bg_color(imageHeaderBar, lv_color_hex(0x0d1f07), 0);
+    lv_obj_set_style_border_color(imageHeaderBar, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_border_width(imageHeaderBar, 1, 0);
+    lv_obj_set_style_border_side(imageHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_radius(imageHeaderBar, 0, 0);
+    lv_obj_set_style_pad_all(imageHeaderBar, 0, 0);
+    lv_obj_clear_flag(imageHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* imgBackBtn = lv_btn_create(imageHeaderBar);
+    applyBtnPressStyle(imgBackBtn);
+    lv_obj_set_size(imgBackBtn, 100, TZT_MIN_TOUCH_H);
+    lv_obj_align(imgBackBtn, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_set_style_bg_color(imgBackBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_radius(imgBackBtn, 8, 0);
+    lv_obj_t* imgBackLbl = lv_label_create(imgBackBtn);
+    lv_label_set_text(imgBackLbl, LV_SYMBOL_LEFT " Media");
+    lv_obj_set_style_text_font(imgBackLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(imgBackLbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_center(imgBackLbl);
+    lv_obj_add_event_cb(imgBackBtn, imageListBackCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* imageTitleLbl = lv_label_create(imageHeaderBar);
+    lv_label_set_text(imageTitleLbl, LV_SYMBOL_IMAGE " Images");
+    lv_obj_set_style_text_color(imageTitleLbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(imageTitleLbl, &lv_font_montserrat_18, 0);
+    lv_obj_align(imageTitleLbl, LV_ALIGN_CENTER, 0, 0);
+    imageList = lv_list_create(imageListScreen);
+    lv_obj_set_size(imageList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
+    lv_obj_set_pos(imageList, 4, TZT_HEADER_BAR_H + 4);
+    lv_obj_set_style_bg_color(imageList, lv_color_hex(0x1a3d0e), 0);
+    lv_obj_set_style_bg_opa(imageList, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(imageList, lv_color_hex(0x4a7c2a), 0);
+    lv_obj_set_style_border_width(imageList, 2, 0);
+    lv_obj_set_style_pad_all(imageList, TZT_LIST_PAD, 0);
+    lv_obj_set_style_radius(imageList, 6, 0);
+    lv_obj_set_scrollbar_mode(imageList, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(imageList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(imageList, LV_DIR_VER);
+
+    // Image viewer: full screen; tap anywhere to go back to list
+    imageViewerScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(imageViewerScreen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(imageViewerScreen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_opa(imageViewerScreen, LV_OPA_0, 0);
+    lv_obj_set_style_pad_all(imageViewerScreen, 0, 0);
+    lv_obj_add_flag(imageViewerScreen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(imageViewerScreen, imageBackCb, LV_EVENT_CLICKED, nullptr);
 
     currentScreenIndex = 0;
     lv_scr_load(screen1);
+
+    // ---- Bottom navigation bar (icons + labels) ----
+    {
+        lv_obj_t* top = lv_layer_top();
+        navBarContainer = lv_obj_create(top);
+        lv_obj_set_size(navBarContainer, TZT_SCREEN_WIDTH, TZT_NAV_BAR_H);
+        lv_obj_set_pos(navBarContainer, 0, TZT_SCREEN_HEIGHT - TZT_NAV_BAR_H);
+        lv_obj_set_style_bg_color(navBarContainer, lv_color_hex(0x0a1806), 0);
+        lv_obj_set_style_border_color(navBarContainer, lv_color_hex(0x2d5016), 0);
+        lv_obj_set_style_border_width(navBarContainer, 1, 0);
+        lv_obj_set_style_border_side(navBarContainer, LV_BORDER_SIDE_TOP, 0);
+        lv_obj_set_style_radius(navBarContainer, 0, 0);
+        lv_obj_set_style_pad_all(navBarContainer, 0, 0);
+        lv_obj_clear_flag(navBarContainer, LV_OBJ_FLAG_SCROLLABLE);
+        const char* navIcons[]  = { LV_SYMBOL_ENVELOPE, LV_SYMBOL_EYE_OPEN, LV_SYMBOL_LIST, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
+        const char* navLabels[] = { "Home", "Status", "Log", "Media", "Settings" };
+        int btnW = TZT_SCREEN_WIDTH / SCREEN_COUNT;
+        for (int i = 0; i < SCREEN_COUNT; i++) {
+            lv_obj_t* btn = lv_btn_create(navBarContainer);
+            applyBtnPressStyle(btn);
+            lv_obj_set_size(btn, btnW - 1, TZT_NAV_BAR_H - 2);
+            lv_obj_set_pos(btn, i * btnW, 1);
+            lv_obj_set_style_radius(btn, 0, 0);
+            lv_obj_set_style_bg_color(btn, i == 0 ? lv_color_hex(0x2a5514) : lv_color_hex(0x0a1806), 0);
+            lv_obj_set_style_border_width(btn, 0, 0);
+            lv_obj_set_style_shadow_width(btn, 0, 0);
+            lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
+            lv_obj_t* ico = lv_label_create(btn);
+            lv_label_set_text(ico, navIcons[i]);
+            lv_obj_set_style_text_font(ico, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(ico, lv_color_hex(0xccddbb), 0);
+            lv_obj_align(ico, LV_ALIGN_TOP_MID, 0, 0);
+            lv_obj_t* lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, navLabels[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0x99aa88), 0);
+            lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
+            lv_obj_add_event_cb(btn, navBtnCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+            navBtns[i] = btn;
+        }
+    }
+
+    // ---- Status bar (top layer: time + WiFi) ----
+    {
+        lv_obj_t* top = lv_layer_top();
+        statusBar = lv_obj_create(top);
+        lv_obj_set_size(statusBar, TZT_SCREEN_WIDTH, TZT_STATUS_H);
+        lv_obj_set_pos(statusBar, 0, 0);
+        lv_obj_set_style_bg_color(statusBar, lv_color_hex(0x0a1806), 0);
+        lv_obj_set_style_bg_opa(statusBar, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(statusBar, lv_color_hex(0x2d5016), 0);
+        lv_obj_set_style_border_width(statusBar, 1, 0);
+        lv_obj_set_style_border_side(statusBar, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_radius(statusBar, 0, 0);
+        lv_obj_set_style_pad_hor(statusBar, 6, 0);
+        lv_obj_set_style_pad_ver(statusBar, 1, 0);
+        lv_obj_clear_flag(statusBar, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* appName = lv_label_create(statusBar);
+        lv_label_set_text(appName, LV_SYMBOL_HOME " Prick'n'Print");
+        lv_obj_set_style_text_font(appName, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(appName, lv_color_hex(0x88aa77), 0);
+        lv_obj_align(appName, LV_ALIGN_LEFT_MID, 0, 0);
+
+        statusTimeLabel = lv_label_create(statusBar);
+        lv_label_set_text(statusTimeLabel, "--:--");
+        lv_obj_set_style_text_font(statusTimeLabel, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(statusTimeLabel, lv_color_hex(0xaabb99), 0);
+        lv_obj_align(statusTimeLabel, LV_ALIGN_RIGHT_MID, -4, 0);
+    }
+    updateStatusBar();
+
+    // ---- Settings tab (card layout: WiFi + Volume; Back to Home) ----
+    settingsScreen = lv_obj_create(NULL);
+    setScreenStyle(settingsScreen);
+    int setPad = TZT_LIST_PAD, setGap = 6;
+    int setCardW = TZT_SCREEN_WIDTH - setPad * 2;
+    int setCardH = 56;
+
+    // WiFi card (same style as Status/Media cards)
+    lv_obj_t* wifiCard = lv_obj_create(settingsScreen);
+    lv_obj_set_size(wifiCard, setCardW, setCardH);
+    lv_obj_set_pos(wifiCard, setPad, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_color(wifiCard, lv_color_hex(0x1e4210), 0);
+    lv_obj_set_style_border_color(wifiCard, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(wifiCard, 1, 0);
+    lv_obj_set_style_pad_all(wifiCard, TZT_LIST_PAD, 0);
+    lv_obj_set_style_radius(wifiCard, 6, 0);
+    lv_obj_clear_flag(wifiCard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* wifiHeader = lv_label_create(wifiCard);
+    lv_label_set_text(wifiHeader, LV_SYMBOL_WIFI " WiFi");
+    lv_obj_set_style_text_color(wifiHeader, lv_color_hex(0x99bb88), 0);
+    lv_obj_set_style_text_font(wifiHeader, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(wifiHeader, 0, 0);
+    statusWifiLabel = lv_label_create(wifiCard);
+    lv_label_set_text(statusWifiLabel, "--");
+    lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0x6ab82e), 0);
+    lv_obj_set_style_text_font(statusWifiLabel, &lv_font_montserrat_16, 0);
+    lv_obj_align(statusWifiLabel, LV_ALIGN_CENTER, 0, 2);
+
+    // Volume card
+    int volCardY = TZT_CONTENT_TOP + setCardH + setGap;
+    lv_obj_t* volCard = lv_obj_create(settingsScreen);
+    lv_obj_set_size(volCard, setCardW, setCardH + 20);
+    lv_obj_set_pos(volCard, setPad, volCardY);
+    lv_obj_set_style_bg_color(volCard, lv_color_hex(0x1e4210), 0);
+    lv_obj_set_style_border_color(volCard, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(volCard, 1, 0);
+    lv_obj_set_style_pad_all(volCard, TZT_LIST_PAD, 0);
+    lv_obj_set_style_radius(volCard, 6, 0);
+    lv_obj_clear_flag(volCard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* setVolLbl = lv_label_create(volCard);
+    lv_label_set_text(setVolLbl, LV_SYMBOL_VOLUME_MAX " Volume");
+    lv_obj_set_style_text_color(setVolLbl, lv_color_hex(0x99bb88), 0);
+    lv_obj_set_style_text_font(setVolLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(setVolLbl, 0, 0);
+    volumeSlider = lv_slider_create(volCard);
+    lv_slider_set_range(volumeSlider, 0, 100);
+    lv_slider_set_value(volumeSlider, (int32_t)(audioSvc.getVolume() * 100.0f), LV_ANIM_OFF);
+    lv_obj_set_size(volumeSlider, setCardW - 50, 24);
+    lv_obj_set_pos(volumeSlider, 0, 24);
+    lv_obj_set_style_anim_time(volumeSlider, 0, LV_PART_MAIN);  // no animation so knob follows finger directly
+    lv_obj_set_ext_click_area(volumeSlider, 16);                 // easier to hit knob with finger
+    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x2d5016), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x6ab82e), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x8bc34a), LV_PART_KNOB);
+    lv_obj_set_style_radius(volumeSlider, 10, LV_PART_MAIN);
+    lv_obj_set_style_radius(volumeSlider, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(volumeSlider, 14, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(volumeSlider, 10, LV_PART_KNOB);    // larger knob for easier drag
+    lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    settingsVolumeValueLabel = lv_label_create(volCard);
+    int v0 = (int)(audioSvc.getVolume() * 100.0f);
+    lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v0);
+    lv_obj_set_style_text_font(settingsVolumeValueLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(settingsVolumeValueLabel, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_set_pos(settingsVolumeValueLabel, setCardW - 42, 26);
+
+    // Back to Home button (same style as other nav buttons)
+    lv_obj_t* setBackBtn = lv_btn_create(settingsScreen);
+    applyBtnPressStyle(setBackBtn);
+    lv_obj_set_size(setBackBtn, 100, TZT_MIN_TOUCH_H);
+    lv_obj_align(setBackBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(setBackBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_border_color(setBackBtn, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(setBackBtn, 1, 0);
+    lv_obj_set_style_radius(setBackBtn, 8, 0);
+    lv_obj_t* setBackLbl = lv_label_create(setBackBtn);
+    lv_label_set_text(setBackLbl, LV_SYMBOL_HOME " Home");
+    lv_obj_set_style_text_font(setBackLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(setBackLbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_center(setBackLbl);
+    lv_obj_add_event_cb(setBackBtn, settingsBackCb, LV_EVENT_CLICKED, nullptr);
+
+    updateStatusBar();  // set WiFi label on Settings screen
+    updateNavHighlight(0);
+    // Gesture is processed in loop() right before lv_timer_handler() for minimal latency (no 80ms timer delay)
+}
+
+static lv_color_t sensorColor(float val, float warnLow, float critLow) {
+    if (val < critLow) return lv_color_hex(0xff4444);
+    if (val < warnLow) return lv_color_hex(0xffcc00);
+    return lv_color_hex(0x66dd44);
 }
 
 static void updateControlPanelStatus() {
@@ -849,63 +1343,312 @@ static void updateControlPanelStatus() {
         lv_label_set_text(labelSanitizer, "--");
         lv_label_set_text(labelLED, "--");
         lv_label_set_text(labelPump, "--");
+        if (barMoisture) lv_bar_set_value(barMoisture, 0, LV_ANIM_OFF);
+        if (barSanitizer) lv_bar_set_value(barSanitizer, 0, LV_ANIM_OFF);
+        if (barLED) lv_bar_set_value(barLED, 0, LV_ANIM_OFF);
+        if (homeSensorStrip) lv_label_set_text(homeSensorStrip, LV_SYMBOL_CHARGE " --   San --   LED --   Pump --");
         return;
     }
-    lv_label_set_text_fmt(labelMoisture, "%.1f%%", (double)lastSensorData.moisturePercent);
-    lv_label_set_text_fmt(labelSanitizer, "%.1f%%", (double)lastSensorData.sanitizerLevel);
-    lv_label_set_text_fmt(labelLED, "%d%%", (lastSensorData.ledBrightness * 100) / 255);
-    lv_label_set_text_fmt(labelPump, "%s", lastSensorData.isDispensing ? "ON" : "OFF");
-    // Sync sensor toggles from Main (TZT and HTTP stay in sync)
-    if (swDispense) {
-        if (lastSensorData.autoDispense) lv_obj_add_state(swDispense, LV_STATE_CHECKED);
-        else lv_obj_clear_state(swDispense, LV_STATE_CHECKED);
+    char buf[32];
+    float m = lastSensorData.moisturePercent;
+    float s = lastSensorData.sanitizerLevel;
+    int ledPct = (lastSensorData.ledBrightness * 100) / 255;
+    bool pumping = lastSensorData.isDispensing;
+
+    if (std::isfinite(m) && m >= 0 && m <= 100) {
+        snprintf(buf, sizeof(buf), "%.0f%%", (double)m);
+        lv_label_set_text(labelMoisture, buf);
+        lv_obj_set_style_text_color(labelMoisture, sensorColor(m, 40, 20), 0);
+        if (barMoisture) {
+            lv_bar_set_value(barMoisture, (int)m, LV_ANIM_ON);
+            lv_obj_set_style_bg_color(barMoisture, sensorColor(m, 40, 20), LV_PART_INDICATOR);
+        }
+    } else {
+        lv_label_set_text(labelMoisture, "--");
     }
-    if (swBright) {
-        if (lastSensorData.autoBrightness) lv_obj_add_state(swBright, LV_STATE_CHECKED);
-        else lv_obj_clear_state(swBright, LV_STATE_CHECKED);
+    if (std::isfinite(s) && s >= 0 && s <= 100) {
+        snprintf(buf, sizeof(buf), "%.0f%%", (double)s);
+        lv_label_set_text(labelSanitizer, buf);
+        lv_obj_set_style_text_color(labelSanitizer, sensorColor(s, 50, 20), 0);
+        if (barSanitizer) {
+            lv_bar_set_value(barSanitizer, (int)s, LV_ANIM_ON);
+            lv_obj_set_style_bg_color(barSanitizer, sensorColor(s, 50, 20), LV_PART_INDICATOR);
+        }
+    } else {
+        lv_label_set_text(labelSanitizer, "--");
     }
-    // Auto-dispense: when ON, pump sliders usable (control what auto uses); on/off disabled. When OFF, sliders disabled; on/off enabled.
-    bool pumpButtonsDisabled = lastSensorData.autoDispense;
-    bool pumpSlidersDisabled = !lastSensorData.autoDispense;
-    if (slDuration) { if (pumpSlidersDisabled) lv_obj_add_flag(slDuration, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(slDuration, LV_OBJ_FLAG_DISABLED); }
-    if (slCooldown) { if (pumpSlidersDisabled) lv_obj_add_flag(slCooldown, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(slCooldown, LV_OBJ_FLAG_DISABLED); }
-    if (btnStart) { if (pumpButtonsDisabled) lv_obj_add_flag(btnStart, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(btnStart, LV_OBJ_FLAG_DISABLED); }
-    if (btnStop) { if (pumpButtonsDisabled) lv_obj_add_flag(btnStop, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(btnStop, LV_OBJ_FLAG_DISABLED); }
-    // Auto-brightness: when ON, only min/max (calibrate) buttons work; LED slider disabled. When OFF, slider works; min/max disabled.
-    bool ledSliderDisabled = lastSensorData.autoBrightness;
-    bool calButtonsEnabled = lastSensorData.autoBrightness;
-    if (slLed) { if (ledSliderDisabled) lv_obj_add_flag(slLed, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(slLed, LV_OBJ_FLAG_DISABLED); }
-    if (btnTurnOff) { if (!calButtonsEnabled) lv_obj_add_flag(btnTurnOff, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(btnTurnOff, LV_OBJ_FLAG_DISABLED); }
-    if (btnTurnOn) { if (!calButtonsEnabled) lv_obj_add_flag(btnTurnOn, LV_OBJ_FLAG_DISABLED); else lv_obj_clear_flag(btnTurnOn, LV_OBJ_FLAG_DISABLED); }
+    snprintf(buf, sizeof(buf), "%d%%", ledPct);
+    lv_label_set_text(labelLED, buf);
+    if (barLED) lv_bar_set_value(barLED, ledPct, LV_ANIM_ON);
+
+    lv_label_set_text(labelPump, pumping ? "ACTIVE" : "Idle");
+    lv_obj_set_style_text_color(labelPump, pumping ? lv_color_hex(0x66dd44) : lv_color_hex(0x99aa88), 0);
+
+    // Update home screen sensor summary strip
+    if (homeSensorStrip) {
+        char strip[64];
+        snprintf(strip, sizeof(strip), LV_SYMBOL_CHARGE " %.0f%%   San %.0f%%   LED %d%%   %s",
+                 (double)m, (double)s, ledPct, pumping ? "PUMP" : "");
+        lv_label_set_text(homeSensorStrip, strip);
+    }
+    updateStatusBar();
+}
+
+// ── Message History screen helpers ──────────────────────────────
+
+static void refreshHistoryList() {
+    if (!historyList) return;
+    lv_obj_clean(historyList);
+    if (!sdCard.isReady()) {
+        lv_list_add_text(historyList, "SD card not available");
+        return;
+    }
+    int n = sdCard.getMessageCount();
+    if (n == 0) {
+        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+        n = sdCard.getMessageCount();
+    }
+    if (n == 0) {
+        lv_list_add_text(historyList, "No messages saved yet");
+        return;
+    }
+    // Show newest first
+    for (int i = n - 1; i >= 0; i--) {
+        const SavedMessage& m = sdCard.getCachedMessage(i);
+        char label[MSG_PREVIEW_LEN + 20];
+        if (m.timestamp > 1600000000) {
+            struct tm ti;
+            localtime_r(&m.timestamp, &ti);
+            char ts[18];
+            strftime(ts, sizeof(ts), "%m/%d %I:%M%p", &ti);
+            snprintf(label, sizeof(label), "%s  %s", ts, m.preview);
+        } else {
+            snprintf(label, sizeof(label), "%s", m.preview);
+        }
+        lv_obj_t* btn = lv_list_add_btn(historyList, LV_SYMBOL_FILE, label);
+        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
+        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
+        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
+        lv_obj_add_event_cb(btn, historyItemCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+    }
+}
+
+static void historyItemCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    String full = sdCard.readFullMessage(idx);
+    if (full.length() == 0) full = "(could not read message)";
+    if (historyDetailLabel) lv_label_set_text(historyDetailLabel, full.c_str());
+    if (historyDetail) lv_obj_clear_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void historyBackCb(lv_event_t* e) {
+    (void)e;
+    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ── Audio Player screen helpers ─────────────────────────────────
+
+static void refreshAudioList() {
+    if (!audioList) return;
+    lv_obj_clean(audioList);
+    if (!sdCard.isReady()) {
+        lv_list_add_text(audioList, "SD card not available");
+        return;
+    }
+    audioFileCount = sdCard.listAudioFiles(audioFileNames, MAX_AUDIO_FILES);
+    if (audioFileCount == 0) {
+        lv_list_add_text(audioList, "No audio files on SD");
+        return;
+    }
+    for (int i = 0; i < audioFileCount; i++) {
+        lv_obj_t* btn = lv_list_add_btn(audioList, LV_SYMBOL_AUDIO, audioFileNames[i].c_str());
+        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
+        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
+        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
+        lv_obj_add_event_cb(btn, audioFileCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+    }
+    updateAudioHeaderState();
+}
+
+static void updateAudioHeaderState() {
+    bool playing = audioSvc.isPlaying();
+    if (audioHeaderBar) {
+        lv_obj_set_style_bg_color(audioHeaderBar, playing ? lv_color_hex(0x1a3d1a) : lv_color_hex(0x0d1f07), 0);
+    }
+    if (audioStopBtn) {
+        lv_obj_set_style_bg_color(audioStopBtn, playing ? lv_color_hex(0xe85555) : lv_color_hex(0xcc3333), 0);
+    }
+}
+
+static void audioFileCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= audioFileCount) return;
+    String path = String(AUDIO_DIR) + "/" + audioFileNames[idx];
+    // Only one audio at a time: if already playing this file, leave it; else stop any current and play
+    if (audioSvc.isPlaying() && audioSvc.currentFile() == path) return;
+    audioSvc.playFile(path);
+    updateAudioHeaderState();
+}
+
+static void audioStopCb(lv_event_t* e) {
+    (void)e;
+    audioSvc.stop();
+    updateAudioHeaderState();
+}
+
+// ── Splash (raw TFT before LVGL) and Image Gallery ──────────────
+
+#if !defined(TZT_HEADLESS)
+static void drawSplashToTft() {
+    if (sdCard.isReady() && SD.exists(SPLASH_PATH))
+        drawSdJpegToTft(SPLASH_PATH, TZT_SCREEN_HEIGHT);
+}
+static void drawSdJpegToTft(const char* path, int maxY) {
+    if (maxY <= 0) maxY = TZT_SCREEN_HEIGHT;
+    if (!path || path[0] == '\0' || !SD.exists(path)) {
+        static uint32_t lastOpenFailLog = 0;
+        if ((uint32_t)millis() - lastOpenFailLog > 2000) {
+            Serial.println("[Image] open failed: " + String(path ? path : ""));
+            lastOpenFailLog = (uint32_t)millis();
+        }
+        return;
+    }
+    // Decoder opens the file itself (path must have leading / e.g. /data/images/sample.jpg)
+    int decodeResult = JpegDec.decodeSdFile(path);
+    if (decodeResult == 0) {
+        static uint32_t lastDecodeFailLog = 0;
+        static int decodeFailCount = 0;
+        static String lastDecodeFailPath;
+        if (lastDecodeFailPath != path) { lastDecodeFailPath = path; decodeFailCount = 0; }
+        decodeFailCount++;
+        if ((uint32_t)millis() - lastDecodeFailLog > 2000) {
+            Serial.println("[Image] decode failed: " + String(path));
+            lastDecodeFailLog = (uint32_t)millis();
+        }
+        if (decodeFailCount >= 10) {
+            currentImagePath = "";
+            lastDecodeFailPath = "";
+        }
+        return;
+    }
+    int xpos = 0, ypos = 0;
+    uint16_t* pImg;
+    uint16_t mcu_w = JpegDec.MCUWidth;
+    uint16_t mcu_h = JpegDec.MCUHeight;
+    uint32_t max_x = JpegDec.width;
+    uint32_t max_y = JpegDec.height;
+    bool swapBytes = tft.getSwapBytes();
+    tft.setSwapBytes(true);
+    uint32_t min_w = (mcu_w < (int)(max_x % mcu_w)) ? mcu_w : (max_x % mcu_w);
+    uint32_t min_h = (mcu_h < (int)(max_y % mcu_h)) ? mcu_h : (max_y % mcu_h);
+    uint32_t win_w = mcu_w, win_h = mcu_h;
+    max_x += xpos;
+    max_y += ypos;
+    int clip_bottom = (maxY < (int)tft.height()) ? maxY : (int)tft.height();
+    while (JpegDec.read()) {
+        pImg = JpegDec.pImage;
+        int mcu_x = JpegDec.MCUx * mcu_w + xpos;
+        int mcu_y = JpegDec.MCUy * mcu_h + ypos;
+        if (mcu_y >= clip_bottom) { JpegDec.abort(); break; }
+        if (mcu_x + mcu_w <= (int)max_x) win_w = mcu_w; else win_w = min_w;
+        if (mcu_y + mcu_h <= (int)max_y) win_h = mcu_h; else win_h = min_h;
+        if ((mcu_x + win_w) <= (int)tft.width() && (mcu_y + win_h) <= clip_bottom)
+            tft.pushImage(mcu_x, mcu_y, win_w, win_h, pImg);
+        else if ((mcu_y + win_h) >= (int)tft.height())
+            JpegDec.abort();
+    }
+    tft.setSwapBytes(swapBytes);
+}
+#endif
+
+static void refreshImageList() {
+    if (!imageList) return;
+    lv_obj_clean(imageList);
+    if (!sdCard.isReady()) {
+        lv_list_add_text(imageList, "SD card not available");
+        return;
+    }
+    imageFileCount = sdCard.listImageFiles(imageFileNames, MAX_IMAGE_FILES);
+    if (imageFileCount == 0) {
+        lv_list_add_text(imageList, "No images on SD");
+        return;
+    }
+    for (int i = 0; i < imageFileCount; i++) {
+        lv_obj_t* btn = lv_list_add_btn(imageList, LV_SYMBOL_IMAGE, imageFileNames[i].c_str());
+        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
+        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
+        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
+        lv_obj_add_event_cb(btn, imageFileCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+    }
+}
+
+static void imageFileCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= imageFileCount) return;
+    String path = String(IMAGES_DIR) + "/" + imageFileNames[idx];
+    String lower = imageFileNames[idx];
+    lower.toLowerCase();
+#if !defined(TZT_HEADLESS)
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+        currentImagePath = path;
+        hideNavBar();
+        lv_scr_load(imageViewerScreen);
+    } else {
+        Serial.println("[Image] Only JPEG is displayed; file is not .jpg/.jpeg: " + path);
+        currentImagePath = "";
+        hideNavBar();
+        lv_scr_load(imageViewerScreen);
+    }
+#else
+    (void)path;
+    (void)lower;
+#endif
+}
+
+static void imageBackCb(lv_event_t* e) {
+    (void)e;
+    currentImagePath = "";
+    lv_scr_load(imageListScreen);  // stay in Media flow; nav still hidden until Back to Media
 }
 #endif
 
 void loadGroceries() {
+    groceryCount = 0;
     String response;
-    if (!firebase || !firebase->get("/groceries.json", response)) { groceryCount = 0; return; }
-    if (response == "null" || response.length() == 0 || response == "{}") { groceryCount = 0; return; }
+    if (!sdCard.isReady() || !sdCard.readFile(DATA_DIR "/groceries.json", response)) return;
+    if (response == "null" || response.length() == 0 || response == "{}") return;
     size_t capacity = response.length() + 200;
     DynamicJsonDocument doc(capacity);
-    if (deserializeJson(doc, response)) { groceryCount = 0; return; }
+    if (deserializeJson(doc, response)) return;
     JsonArray arr = doc.as<JsonArray>();
-    groceryCount = 0;
     for (size_t i = 0; i < arr.size() && groceryCount < MAX_GROCERY_ITEMS; i++)
         groceryItems[groceryCount++] = arr[i].as<String>();
 }
 
 void saveGroceries() {
-    if (!firebase) return;
+    if (!sdCard.isReady()) return;
     DynamicJsonDocument doc(4096);
     JsonArray arr = doc.to<JsonArray>();
     for (int i = 0; i < groceryCount; i++) arr.add(groceryItems[i]);
     String json; serializeJson(doc, json);
-    firebase->put("/groceries.json", json);
+    sdCard.writeFile(DATA_DIR "/groceries.json", json);
 }
 
-void loadSettingsFromFirebase() {
-    if (!firebase) return;
+void loadSettingsFromSD() {
+    if (!sdCard.isReady()) return;
+    String response;
+    if (!sdCard.readFile(DATA_DIR "/config.json", response) || response.length() == 0) return;
     DynamicJsonDocument doc(512);
-    if (!firebase->loadConfig(doc)) return;
+    if (deserializeJson(doc, response) != DeserializationError::Ok) return;
     if (doc["ledBrightness"].is<uint8_t>()) {
         lastSensorData.ledBrightness = doc["ledBrightness"].as<uint8_t>();
         lastSensorDataValid = true;
@@ -975,38 +1718,38 @@ static void applyNextBootSetting() {
     bootSettingsIndex++;
 }
 
-void saveSettingsToFirebase() {
-    if (!firebase) return;
+void saveSettingsToSD() {
+    if (!sdCard.isReady()) return;
     DynamicJsonDocument doc(512);
-    if (firebase->loadConfig(doc)) { /* merge into existing */ }
     doc["ledBrightness"] = lastSensorDataValid ? (int)lastSensorData.ledBrightness : 0;
     doc["autoDispense"] = lastSensorDataValid ? lastSensorData.autoDispense : false;
     doc["autoBrightness"] = lastSensorDataValid ? lastSensorData.autoBrightness : false;
     if (lastPumpDurationTenths >= 0) doc["pumpDurationTenths"] = lastPumpDurationTenths;
     if (lastPumpCooldownTenths >= 0) doc["pumpCooldownTenths"] = lastPumpCooldownTenths;
-    firebase->saveConfig(doc);
+    String json; serializeJson(doc, json);
+    sdCard.writeFile(DATA_DIR "/config.json", json);
 }
 
 void loadTodos() {
+    todoCount = 0;
     String response;
-    if (!firebase || !firebase->get("/todos.json", response)) { todoCount = 0; return; }
-    if (response == "null" || response.length() == 0 || response == "{}") { todoCount = 0; return; }
+    if (!sdCard.isReady() || !sdCard.readFile(DATA_DIR "/todos.json", response)) return;
+    if (response == "null" || response.length() == 0 || response == "{}") return;
     size_t capacity = response.length() + 200;
     DynamicJsonDocument doc(capacity);
-    if (deserializeJson(doc, response)) { todoCount = 0; return; }
+    if (deserializeJson(doc, response)) return;
     JsonArray arr = doc.as<JsonArray>();
-    todoCount = 0;
     for (size_t i = 0; i < arr.size() && todoCount < MAX_TODO_ITEMS; i++)
         todoItems[todoCount++] = arr[i].as<String>();
 }
 
 void saveTodos() {
-    if (!firebase) return;
+    if (!sdCard.isReady()) return;
     DynamicJsonDocument doc(4096);
     JsonArray arr = doc.to<JsonArray>();
     for (int i = 0; i < todoCount; i++) arr.add(todoItems[i]);
     String json; serializeJson(doc, json);
-    firebase->put("/todos.json", json);
+    sdCard.writeFile(DATA_DIR "/todos.json", json);
 }
 
 bool isAuthenticated() {
@@ -1073,23 +1816,25 @@ void handleLogin() {
     
     String loginPage = R"HTML(
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#1a3d0e">
     <title>Login - Print-n-Prick</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(74, 124, 42, 0.2); }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a120c 0%, #1a3d0e 25%, #2d5016 50%, #4a7c2a 75%, #6b9f3d 100%);
+            background: linear-gradient(180deg, #0d1f07 0%, #1a3d0e 50%, #2d5016 100%);
             min-height: 100vh;
+            min-height: 100dvh;
             margin: 0;
-            padding: 12px;
+            padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
             color: #333;
             position: relative;
             -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
         }
         body::before { content: '🌵'; position: fixed; font-size: 150px; opacity: 0.03; top: -50px; left: -50px; z-index: 0; }
         body::after { content: '🖨️'; position: fixed; font-size: 120px; opacity: 0.03; bottom: -40px; right: -40px; z-index: 0; }
@@ -1160,11 +1905,12 @@ void handleLogin() {
         @media (min-width: 768px) { .login-page .tagline { font-size: 14px; margin-bottom: 30px; } }
         .login-page button {
             width: 100%;
-            padding: 18px;
+            min-height: 44px;
+            padding: 14px 18px;
             font-size: 17px;
             border: none;
             border-radius: 12px;
-            background: linear-gradient(135deg, #2c1810 0%, #2d5016 50%, #4a7c2a 100%);
+            background: linear-gradient(180deg, #2d5016 0%, #4a7c2a 100%);
             color: white;
             font-weight: 600;
             cursor: pointer;
@@ -1636,6 +2382,70 @@ void handleTestSensors() {
     server.send(200, "application/json", s);
 }
 
+void handleTestSendMessage() {
+    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+    String text = "Test message from TZT at " + String(millis());
+    String body = server.arg("plain");
+    if (body.length() > 0) {
+        DynamicJsonDocument doc(512);
+        if (deserializeJson(doc, body) == DeserializationError::Ok && doc["text"].as<String>().length() > 0)
+            text = doc["text"].as<String>();
+    }
+    if (sdCard.isReady())
+        sdCard.saveMessage(text, "test");
+    bool ok = sendPrintChunked(text, true);
+#if !defined(TZT_HEADLESS)
+    lastPrintMessage = text;
+    if (labelMessage) lv_label_set_text(labelMessage, text.c_str());
+#endif
+    if (ok)
+        server.send(200, "application/json", JSON_SUCCESS);
+    else
+        server.send(500, "application/json", "{\"success\":false,\"error\":\"Send failed\"}");
+}
+
+void handleTestPlayAudio() {
+    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+    if (!sdCard.isReady()) { server.send(503, "application/json", "{\"error\":\"SD card not available\"}"); return; }
+    String names[MAX_AUDIO_FILES];
+    int n = sdCard.listAudioFiles(names, MAX_AUDIO_FILES);
+    String file;
+    String body = server.arg("plain");
+    if (body.length() > 0) {
+        DynamicJsonDocument doc(256);
+        if (deserializeJson(doc, body) == DeserializationError::Ok && doc["file"].as<String>().length() > 0)
+            file = doc["file"].as<String>();
+    }
+    if (file.length() == 0 && n > 0) file = names[0];
+    if (file.length() == 0) { server.send(404, "application/json", "{\"error\":\"No audio files on SD. Put files in " AUDIO_DIR "\"}"); return; }
+    String path = String(AUDIO_DIR) + "/" + file;
+    bool ok = audioSvc.playFile(path);
+    server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Playback failed\"}");
+}
+
+void handleTestShowImage() {
+    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+#if defined(TZT_HEADLESS)
+    server.send(501, "application/json", "{\"error\":\"Display not available\"}");
+    return;
+#else
+    if (!sdCard.isReady()) { server.send(503, "application/json", "{\"error\":\"SD card not available\"}"); return; }
+    String names[MAX_IMAGE_FILES];
+    int n = sdCard.listImageFiles(names, MAX_IMAGE_FILES);
+    String file;
+    String body = server.arg("plain");
+    if (body.length() > 0) {
+        DynamicJsonDocument doc(256);
+        if (deserializeJson(doc, body) == DeserializationError::Ok && doc["file"].as<String>().length() > 0)
+            file = doc["file"].as<String>();
+    }
+    if (file.length() == 0 && n > 0) file = names[0];
+    if (file.length() == 0) { server.send(404, "application/json", "{\"error\":\"No images on SD. Put files in " IMAGES_DIR "\"}"); return; }
+    pendingTestImagePath = String(IMAGES_DIR) + "/" + file;
+    server.send(200, "application/json", JSON_SUCCESS);
+#endif
+}
+
 void handleFavicon() {
     server.send(204);
 }
@@ -1645,209 +2455,181 @@ void handleRoot() {
     // Optional: if client sends Accept-Encoding: gzip, serve pre-compressed .gz from SPIFFS/LittleFS for large HTML
     const char* html = R"HTML(
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Print-n-Prick - Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Prick'n'Print">
+    <meta name="theme-color" content="#1a3d0e">
+    <title>Print-n-Prick</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(74, 124, 42, 0.2); }
+        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(74, 124, 42, 0.25); }
+        html { -webkit-text-size-adjust: 100%; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a120c 0%, #1a3d0e 25%, #2d5016 50%, #4a7c2a 75%, #6b9f3d 100%);
+            background: linear-gradient(180deg, #0d1f07 0%, #1a3d0e 35%, #2d5016 70%, #1a3d0e 100%);
             min-height: 100vh;
+            min-height: 100dvh;
             margin: 0;
-            padding: 12px;
+            padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+            padding-left: max(10px, env(safe-area-inset-left));
+            padding-right: max(10px, env(safe-area-inset-right));
+            padding-top: max(10px, env(safe-area-inset-top));
+            padding-bottom: max(16px, env(safe-area-inset-bottom));
             color: #333;
             position: relative;
             -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
         }
         body::before {
             content: '🌵';
             position: fixed;
-            font-size: 150px;
-            opacity: 0.03;
-            top: -50px;
-            left: -50px;
+            font-size: 140px;
+            opacity: 0.04;
+            top: -30px;
+            left: -30px;
             z-index: 0;
-        }
-        body::after {
-            content: '🖨️';
-            position: fixed;
-            font-size: 120px;
-            opacity: 0.03;
-            bottom: -40px;
-            right: -40px;
-            z-index: 0;
-        }
-        @media (min-width: 768px) {
-            body::before { font-size: 300px; top: -100px; left: -100px; }
-            body::after { font-size: 250px; bottom: -80px; right: -80px; }
         }
         .container {
-            max-width: 600px;
+            max-width: 480px;
             margin: 0 auto;
-            background: linear-gradient(135deg, #f5f5f0 0%, #ffffff 100%);
+            background: rgba(255,255,255,0.97);
             border-radius: 20px;
-            padding: 20px;
-            box-shadow: 0 12px 40px rgba(26, 18, 12, 0.5), 0 0 0 3px rgba(74, 124, 42, 0.2);
-            border: 3px solid #4a7c2a;
+            padding: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+            border: 2px solid #4a7c2a;
             position: relative;
             z-index: 1;
         }
-        @media (min-width: 768px) {
-            .container { border-radius: 24px; padding: 24px; }
-        }
         .header {
             text-align: center;
-            margin-bottom: 20px;
-            padding-bottom: 16px;
-            border-bottom: 3px solid #4a7c2a;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #4a7c2a;
         }
-        @media (min-width: 768px) {
-            .header { margin-bottom: 24px; padding-bottom: 20px; }
-        }
-        .header-icon { font-size: 42px; margin-bottom: 8px; display: block; }
-        @media (min-width: 768px) { .header-icon { font-size: 48px; } }
+        .header-icon { font-size: 36px; margin-bottom: 4px; display: block; }
         h1 {
             color: #2d5016;
-            font-size: 28px;
+            font-size: 24px;
             font-weight: 700;
-            margin-bottom: 4px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 2px;
         }
-        @media (min-width: 768px) { h1 { font-size: 32px; } }
-        .tagline { color: #666; font-size: 12px; font-style: italic; }
-        @media (min-width: 768px) { .tagline { font-size: 13px; } }
+        .tagline { color: #555; font-size: 13px; }
         .sensor-grid {
             display: grid;
-            grid-template-columns: 1fr;
-            gap: 12px;
-            margin: 20px 0;
-        }
-        @media (min-width: 480px) {
-            .sensor-grid { grid-template-columns: repeat(2, 1fr); }
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin: 14px 0;
         }
         .sensor-card {
-            background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
-            padding: 16px;
-            border-radius: 16px;
+            background: linear-gradient(135deg, #fff 0%, #f0f5ec 100%);
+            padding: 14px;
+            border-radius: 14px;
             text-align: center;
             border: 2px solid #4a7c2a;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            transition: transform 0.2s;
+            min-height: 72px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
             -webkit-touch-callout: none;
             user-select: none;
         }
-        .sensor-card:active { transform: scale(0.98); }
-        @media (hover: hover) {
-            .sensor-card:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 6px 12px rgba(0,0,0,0.15);
-            }
-        }
-        .sensor-icon { font-size: 28px; margin-bottom: 8px; }
-        @media (min-width: 768px) { .sensor-icon { font-size: 32px; } }
+        .sensor-card:active { transform: scale(0.98); opacity: 0.95; }
+        .sensor-icon { font-size: 24px; margin-bottom: 4px; }
         .sensor-label {
             font-size: 11px;
             color: #666;
-            margin-bottom: 6px;
             font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.3px;
         }
-        @media (min-width: 768px) { .sensor-label { font-size: 12px; } }
-        .sensor-value { font-size: 24px; font-weight: 700; color: #2d5016; }
-        @media (min-width: 768px) { .sensor-value { font-size: 28px; } }
+        .sensor-value { font-size: 20px; font-weight: 700; color: #2d5016; }
         .btn-group {
             display: flex;
             gap: 10px;
-            margin: 20px 0;
+            margin: 14px 0;
             flex-wrap: wrap;
         }
         button, .btn {
             flex: 1;
-            min-width: 120px;
-            padding: 16px 20px;
+            min-width: 0;
+            min-height: 44px;
+            padding: 12px 16px;
             border: none;
             border-radius: 12px;
-            background: linear-gradient(135deg, #2c1810 0%, #2d5016 50%, #4a7c2a 100%);
+            background: linear-gradient(180deg, #2d5016 0%, #3a6820 100%);
             color: white;
             font-weight: 600;
             cursor: pointer;
-            font-size: 15px;
-            transition: all 0.3s;
-            box-shadow: 0 4px 8px rgba(26, 18, 12, 0.3);
+            font-size: 16px;
+            transition: transform 0.15s, box-shadow 0.15s;
+            box-shadow: 0 3px 8px rgba(45, 80, 22, 0.35);
             text-decoration: none;
-            display: inline-block;
-            text-align: center;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
             -webkit-touch-callout: none;
             user-select: none;
         }
-        @media (min-width: 768px) {
-            button, .btn { padding: 14px 20px; }
-        }
         button:active, .btn:active {
-            transform: scale(0.98);
-            box-shadow: 0 2px 6px rgba(26, 18, 12, 0.3);
+            transform: scale(0.97);
+            box-shadow: 0 1px 4px rgba(26, 18, 12, 0.3);
         }
-        @media (hover: hover) {
-            button:hover, .btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 6px 12px rgba(45, 80, 22, 0.4);
-            }
-            button:active, .btn:active { transform: translateY(0) scale(0.98); }
-        }
-        .btn-danger { background: linear-gradient(135deg, #8b4513 0%, #a0522d 100%); }
-        .btn-secondary { background: linear-gradient(135deg, #3e2723 0%, #5d4037 100%); }
+        .btn-danger { background: linear-gradient(180deg, #8b4513 0%, #a0522d 100%); }
+        .btn-secondary { background: linear-gradient(180deg, #3e2723 0%, #5d4037 100%); }
         .section {
-            margin: 20px 0;
-            padding: 16px;
-            background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
-            border-radius: 16px;
+            margin: 14px 0;
+            padding: 14px;
+            background: linear-gradient(135deg, #fff 0%, #f8faf6 100%);
+            border-radius: 14px;
             border: 2px solid #4a7c2a;
             border-left: 4px solid #3e2723;
         }
-        @media (min-width: 768px) {
-            .section { margin: 24px 0; padding: 20px; }
-        }
         .section-title {
-            font-size: 18px;
+            font-size: 17px;
             font-weight: 700;
             color: #2d5016;
-            margin-bottom: 14px;
+            margin-bottom: 12px;
             display: flex;
             align-items: center;
             gap: 8px;
+            min-height: 44px;
+            padding: 4px 0;
         }
-        @media (min-width: 768px) {
-            .section-title { font-size: 20px; margin-bottom: 16px; }
+        .collapsible .section-title {
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            list-style: none;
         }
+        .collapsible .section-title::after {
+            content: '▼';
+            font-size: 12px;
+            margin-left: auto;
+            transition: transform 0.2s;
+            color: #4a7c2a;
+        }
+        .collapsible[open] .section-title::after { transform: rotate(-180deg); }
         .input-group {
             display: flex;
             gap: 8px;
-            margin: 12px 0;
+            margin: 10px 0;
             flex-wrap: wrap;
         }
         input[type="text"], input[type="datetime-local"] {
-            flex: 1;
-            min-width: 150px;
-            padding: 12px 16px;
+            flex: 1 1 100%;
+            min-width: 0;
+            min-height: 44px;
+            padding: 12px 14px;
             border: 2px solid #4a7c2a;
-            border-bottom: 2px solid #3e2723;
             border-radius: 10px;
             font-size: 16px;
             font-family: inherit;
             background: #fff;
         }
-        @media (min-width: 768px) {
-            input[type="text"], input[type="datetime-local"] { font-size: 14px; }
-        }
         input[type="text"]:focus, input[type="datetime-local"]:focus {
             outline: none;
             border-color: #6b9f3d;
-            border-bottom-color: #8b4513;
             box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
         }
         .list-container {
@@ -1855,183 +2637,144 @@ void handleRoot() {
             overflow-y: auto;
             -webkit-overflow-scrolling: touch;
             background: #fff;
-            padding: 12px;
+            padding: 10px;
             border-radius: 10px;
-            margin: 12px 0;
-            border: 1px solid #3e2723;
+            margin: 10px 0;
+            border: 1px solid #c5d4b8;
             min-height: 60px;
         }
         .section.reminders-section .list-container,
         .section.grocery-section .list-container {
-            max-height: 240px;
-            min-height: 100px;
-        }
-        @media (min-width: 768px) {
-            .section.reminders-section .list-container,
-            .section.grocery-section .list-container {
-                max-height: 280px;
-                min-height: 120px;
-            }
+            max-height: 220px;
         }
         .list-item {
             padding: 12px 10px;
             margin: 6px 0;
-            background: #f8f9fa;
-            border-radius: 8px;
+            background: #f0f5ec;
+            border-radius: 10px;
             border-left: 4px solid #4a7c2a;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 8px;
-            font-size: 14px;
+            gap: 10px;
+            font-size: 15px;
             min-height: 48px;
         }
-        @media (min-width: 768px) {
-            .list-item { padding: 10px; min-height: auto; }
-        }
         .list-item:nth-child(odd) { border-left-color: #8b4513; }
-        .list-item small { color: #5d4037; font-size: 11px; }
+        .list-item small { color: #5d4037; font-size: 12px; }
         .list-item button {
-            padding: 8px 14px;
-            font-size: 13px;
-            min-width: auto;
+            min-height: 40px;
+            padding: 10px 14px;
+            font-size: 15px;
+            min-width: 0;
             flex: 0 0 auto;
+            border-radius: 10px;
         }
-        @media (min-width: 768px) {
-            .list-item button { padding: 6px 12px; font-size: 12px; }
-        }
-        .empty-state { text-align: center; color: #999; font-style: italic; padding: 20px; }
+        .empty-state { text-align: center; color: #777; font-style: italic; padding: 16px; font-size: 14px; }
         .control-grid {
             display: grid;
             grid-template-columns: 1fr;
-            gap: 12px;
-            margin: 20px 0;
-            min-width: 0;
-        }
-        @media (min-width: 640px) {
-            .control-grid { grid-template-columns: 1fr 1fr; }
+            gap: 14px;
+            margin: 14px 0;
         }
         .control-half {
-            background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+            background: #fff;
             border: 2px solid #4a7c2a;
-            border-left: 3px solid #8b4513;
+            border-left: 4px solid #8b4513;
             border-radius: 12px;
             padding: 14px;
-            min-width: 0;
             display: flex;
             flex-direction: column;
         }
         .control-half .ctrl-title {
-            font-size: 17px;
+            font-size: 16px;
             font-weight: 700;
             color: #2d5016;
             margin-bottom: 10px;
-            flex-shrink: 0;
         }
-        @media (min-width: 768px) { .control-half .ctrl-title { font-size: 18px; } }
         .slider-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 8px;
-            font-size: 14px;
+            margin-bottom: 6px;
+            font-size: 15px;
             color: #5d4037;
             font-weight: 600;
-            gap: 8px;
-            min-width: 0;
+            min-height: 28px;
         }
-        .slider-row span:first-child { flex-shrink: 0; white-space: nowrap; }
-        .slider-row .val { color: #2d5016; min-width: 36px; text-align: right; flex-shrink: 0; }
+        .slider-row .val { color: #2d5016; min-width: 40px; text-align: right; }
         .ctrl-slider {
             width: 100%;
-            min-width: 0;
-            height: 10px;
-            border-radius: 5px;
-            margin-bottom: 10px;
+            height: 12px;
+            border-radius: 6px;
+            margin-bottom: 12px;
             -webkit-appearance: none;
-            background: linear-gradient(90deg, #1a3d0e 0%, #2d5016 100%);
+            background: #c5d4b8;
             box-sizing: border-box;
         }
-        .ctrl-slider:disabled {
-            opacity: 0.45;
-            cursor: not-allowed;
-            pointer-events: none;
-        }
-        .ctrl-slider:disabled::-webkit-slider-thumb { cursor: not-allowed; }
-        .ctrl-slider:disabled::-moz-range-thumb { cursor: not-allowed; }
-        @media (min-width: 768px) {
-            .ctrl-slider { height: 8px; border-radius: 4px; }
-        }
+        .ctrl-slider:disabled { opacity: 0.5; pointer-events: none; }
         .ctrl-slider::-webkit-slider-thumb {
             -webkit-appearance: none;
-            width: 24px;
-            height: 24px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
-            background: #6b9f3d;
-            border: 2px solid #8b4513;
+            background: #4a7c2a;
+            border: 2px solid #2d5016;
             cursor: pointer;
+            margin-top: -8px;
         }
         .ctrl-slider::-moz-range-thumb {
-            width: 24px;
-            height: 24px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
-            background: #6b9f3d;
-            border: 2px solid #8b4513;
+            background: #4a7c2a;
+            border: 2px solid #2d5016;
             cursor: pointer;
         }
-        @media (min-width: 768px) {
-            .ctrl-slider::-webkit-slider-thumb { width: 20px; height: 20px; }
-            .ctrl-slider::-moz-range-thumb { width: 20px; height: 20px; }
+        .cal-btns, .pump-btns { display: flex; gap: 10px; margin-top: 12px; }
+        .cal-btns button, .pump-btns button {
+            flex: 1;
+            min-height: 44px;
+            padding: 12px;
+            font-size: 16px;
+            border-radius: 10px;
         }
-        .cal-btns { display: flex; gap: 8px; margin-top: auto; padding-top: 12px; flex-shrink: 0; }
-        .cal-btns button { flex: 1; min-width: 0; padding: 12px 10px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
-        .cal-btns button:disabled { opacity: 0.45; cursor: not-allowed; }
-        @media (min-width: 768px) { .cal-btns button { padding: 10px; } }
+        .cal-btns button:disabled, .pump-btns button:disabled { opacity: 0.5; }
         .cal-btns .cal-off { background: #3e2723; color: #e8ecd8; }
         .cal-btns .cal-on { background: #4a7c2a; color: #fff; }
-        .pump-btns { display: flex; gap: 8px; margin-top: auto; padding-top: 12px; flex-shrink: 0; }
-        .pump-btns button { flex: 1; min-width: 0; padding: 12px 10px; font-size: 14px; }
-        .pump-btns button:disabled { opacity: 0.45; cursor: not-allowed; }
-        @media (min-width: 768px) { .pump-btns button { padding: 10px; } }
         .sensor-toggle-row {
             display: grid;
-            grid-template-columns: 1fr;
-            gap: 12px;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
             margin-top: 12px;
             padding-top: 12px;
-            border-top: 1px solid #3e2723;
-        }
-        @media (min-width: 480px) {
-            .sensor-toggle-row { grid-template-columns: 1fr 1fr; }
+            border-top: 1px solid #c5d4b8;
         }
         .sensor-toggle-item {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-size: 14px;
+            font-size: 15px;
             color: #5d4037;
             font-weight: 600;
             min-height: 44px;
         }
         .tog {
-            width: 50px;
-            height: 28px;
-            border-radius: 14px;
+            width: 52px;
+            height: 30px;
+            border-radius: 15px;
             background: #3e2723;
             cursor: pointer;
             position: relative;
             flex-shrink: 0;
-            transition: background 0.3s;
-        }
-        @media (min-width: 768px) {
-            .tog { width: 44px; height: 24px; border-radius: 12px; }
+            transition: background 0.2s;
         }
         .tog.on { background: #4a7c2a; }
         .tog::after {
             content: '';
             position: absolute;
-            width: 24px;
-            height: 24px;
+            width: 26px;
+            height: 26px;
             border-radius: 50%;
             background: #fff;
             top: 2px;
@@ -2039,17 +2782,12 @@ void handleRoot() {
             transition: left 0.2s;
             box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
-        @media (min-width: 768px) {
-            .tog::after { width: 20px; height: 20px; }
-        }
         .tog.on::after { left: 24px; }
-        @media (min-width: 768px) { .tog.on::after { left: 22px; } }
-        textarea.reminder-msg {
+        textarea.reminder-msg, textarea.todo-msg {
             width: 100%;
-            min-height: 120px;
-            padding: 12px 16px;
+            min-height: 100px;
+            padding: 12px 14px;
             border: 2px solid #4a7c2a;
-            border-bottom: 2px solid #3e2723;
             border-radius: 10px;
             font-size: 16px;
             font-family: inherit;
@@ -2057,44 +2795,16 @@ void handleRoot() {
             resize: vertical;
             box-sizing: border-box;
         }
-        @media (min-width: 768px) { textarea.reminder-msg { font-size: 14px; min-height: 130px; } }
-        textarea.reminder-msg:focus {
+        textarea.reminder-msg:focus, textarea.todo-msg:focus {
             outline: none;
             border-color: #6b9f3d;
-            border-bottom-color: #8b4513;
             box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
         }
-        textarea.todo-msg {
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #4a7c2a;
-            border-bottom: 2px solid #3e2723;
-            border-radius: 10px;
-            font-size: 16px;
-            font-family: inherit;
-            background: #fff;
-            resize: vertical;
-            box-sizing: border-box;
-        }
-        @media (min-width: 768px) { textarea.todo-msg { font-size: 14px; } }
-        textarea.todo-msg:focus {
-            outline: none;
-            border-color: #6b9f3d;
-            border-bottom-color: #8b4513;
-            box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
-        }
-        button, .btn, .sensor-card, .tog, .list-item button {
-            -webkit-user-select: none;
-            user-select: none;
-        }
-        @supports (padding: env(safe-area-inset-bottom)) {
-            body {
-                padding-top: max(12px, env(safe-area-inset-top));
-                padding-bottom: max(12px, env(safe-area-inset-bottom));
-                padding-left: max(12px, env(safe-area-inset-left));
-                padding-right: max(12px, env(safe-area-inset-right));
-            }
-        }
+        details.collapsible { margin: 10px 0; }
+        details.collapsible .section { margin: 0; border-radius: 14px; }
+        details.collapsible > summary { list-style: none; }
+        details.collapsible > summary::-webkit-details-marker { display: none; }
+        .section-title-wrap { display: flex; align-items: center; width: 100%; }
     </style>
 </head>
 <body>
@@ -2102,7 +2812,7 @@ void handleRoot() {
         <div class="header">
             <span class="header-icon">🌵💌</span>
             <h1>Print-n-Prick</h1>
-            <p class="tagline">Smart Cactus Care & Thermal Printing</p>
+            <p class="tagline">Smart cactus care & thermal printing</p>
         </div>
         
         <div class="sensor-grid">
@@ -2143,8 +2853,9 @@ void handleRoot() {
             <a href="/logout" class="btn btn-secondary">🚪 Logout</a>
         </div>
         
+        <details class="collapsible">
+        <summary class="section-title">⏰ Reminders</summary>
         <div class="section reminders-section">
-            <div class="section-title">⏰ Reminders</div>
             <div class="input-group">
                 <textarea class="reminder-msg" id="rmMsg" placeholder="📝 Reminder message..." rows="5"></textarea>
             </div>
@@ -2161,9 +2872,11 @@ void handleRoot() {
                 <div class="empty-state">No reminders yet</div>
             </div>
         </div>
+        </details>
         
+        <details class="collapsible">
+        <summary class="section-title">🛒 Grocery List</summary>
         <div class="section grocery-section">
-            <div class="section-title">🛒 Grocery List</div>
             <div class="input-group" style="flex-wrap: wrap;">
                 <input type="text" id="glItem" placeholder="🛒 Add item..." style="flex: 1 1 100%; min-width: 100%;">
             </div>
@@ -2176,9 +2889,11 @@ void handleRoot() {
                 <div class="empty-state">No items yet</div>
             </div>
         </div>
+        </details>
         
+        <details class="collapsible">
+        <summary class="section-title">✅ Todo List</summary>
         <div class="section grocery-section">
-            <div class="section-title">✅ Todo List</div>
             <div class="input-group" style="flex-wrap: wrap;">
                 <textarea class="todo-msg" id="tlItem" placeholder="✅ Add task..." rows="2" style="flex: 1 1 100%; min-width: 100%; resize: vertical; box-sizing: border-box;"></textarea>
             </div>
@@ -2191,9 +2906,11 @@ void handleRoot() {
                 <div class="empty-state">No tasks yet</div>
             </div>
         </div>
+        </details>
         
+        <details class="collapsible" open>
+        <summary class="section-title">💧 Pump & LED</summary>
         <div class="section">
-            <div class="section-title">💧 Pump & LED</div>
             <div class="control-grid">
                 <div class="control-half">
                     <div class="ctrl-title">Pump</div>
@@ -2221,6 +2938,43 @@ void handleRoot() {
                 <div class="sensor-toggle-item"><span>LED sensor</span><div class="tog" id="togLed" onclick="toggleLedSensor(this)" title="Auto brightness"></div></div>
             </div>
         </div>
+        </details>
+
+        <details class="collapsible">
+        <summary class="section-title">📜 Message History</summary>
+        <div class="section">
+            <div class="list-container" id="msgHist" style="max-height:200px;overflow-y:auto;">
+                <div class="empty-state">Loading messages...</div>
+            </div>
+        </div>
+        </details>
+
+        <details class="collapsible">
+        <summary class="section-title">🔊 Audio Files</summary>
+        <div class="section">
+            <div id="audioNow" style="color:#FFD700;font-size:13px;margin-bottom:6px;"></div>
+            <div class="list-container" id="audioFiles" style="max-height:180px;overflow-y:auto;">
+                <div class="empty-state">Loading audio files...</div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:8px;">
+                <button type="button" class="btn-danger" onclick="audioStop()" style="flex:1;">Stop</button>
+                <button type="button" class="btn-success" onclick="loadAudio()" style="flex:1;">Refresh</button>
+            </div>
+        </div>
+        </details>
+
+        <details class="collapsible">
+        <summary class="section-title">🖼️ Images</summary>
+        <div class="section">
+            <div class="list-container" id="imageFiles" style="max-height:180px;overflow-y:auto;">
+                <div class="empty-state">Loading images...</div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:8px;">
+                <button type="button" class="btn-success" onclick="loadImages()" style="flex:1;">Refresh</button>
+            </div>
+            <div style="margin-top:8px;font-size:12px;color:#888;">Add in Firebase: /images → url, name; TZT downloads to SD.</div>
+        </div>
+        </details>
     </div>
     
     <script>
@@ -2544,9 +3298,61 @@ void handleRoot() {
             });
         }
         
+        function loadMessages() {
+            q('/api/messages').then(d => {
+                var c = document.getElementById('msgHist');
+                if (!d.messages || d.messages.length === 0) { c.innerHTML = '<div class="empty-state">No messages saved yet</div>'; return; }
+                c.innerHTML = '';
+                d.messages.forEach(m => {
+                    var el = document.createElement('div');
+                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);font-size:13px;color:#e0e0e0;';
+                    var ts = m.ts > 1600000000 ? new Date(m.ts * 1000).toLocaleString() + ' - ' : '';
+                    el.textContent = ts + m.preview;
+                    c.appendChild(el);
+                });
+            }).catch(function() { document.getElementById('msgHist').innerHTML = '<div class="empty-state">SD card not available</div>'; });
+        }
+
+        function loadAudio() {
+            q('/api/audio').then(d => {
+                var c = document.getElementById('audioFiles');
+                var now = document.getElementById('audioNow');
+                if (d.playing && d.current) now.textContent = 'Now playing: ' + d.current;
+                else now.textContent = '';
+                if (!d.files || d.files.length === 0) { c.innerHTML = '<div class="empty-state">No audio files on SD</div>'; return; }
+                c.innerHTML = '';
+                d.files.forEach(f => {
+                    var el = document.createElement('div');
+                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;';
+                    el.innerHTML = '<span style="color:#e0e0e0;font-size:13px;">' + f + '</span><button onclick="audioPlay(\'' + f.replace(/'/g,"\\'") + '\')" style="padding:4px 12px;border:none;border-radius:4px;background:#4a7c2a;color:#fff;cursor:pointer;">Play</button>';
+                    c.appendChild(el);
+                });
+            }).catch(function() { document.getElementById('audioFiles').innerHTML = '<div class="empty-state">SD card not available</div>'; });
+        }
+
+        function audioPlay(f) { po('/api/audio/play', {file: f}).then(function() { setTimeout(loadAudio, 500); }); }
+        function audioStop() { po('/api/audio/stop').then(function() { setTimeout(loadAudio, 500); }); }
+
+        function loadImages() {
+            q('/api/images').then(d => {
+                var c = document.getElementById('imageFiles');
+                if (!d.files || d.files.length === 0) { c.innerHTML = '<div class="empty-state">No images on SD</div>'; return; }
+                c.innerHTML = '';
+                d.files.forEach(f => {
+                    var el = document.createElement('div');
+                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);font-size:13px;color:#e0e0e0;';
+                    el.textContent = f;
+                    c.appendChild(el);
+                });
+            }).catch(function() { document.getElementById('imageFiles').innerHTML = '<div class="empty-state">SD card not available</div>'; });
+        }
+
         loadReminders();
         loadGroceries();
         loadTodos();
+        loadMessages();
+        loadAudio();
+        loadImages();
         setQuickReminder(0);  // Pre-fill reminder date/time with current so it's not empty
     </script>
 </body>
@@ -2579,6 +3385,9 @@ void setupWebServer() {
     server.on("/api/test/automation", HTTP_POST, handleSetAutomation);
     server.on("/api/test/printer", HTTP_POST, handleTestPrinter);
     server.on("/api/test/sensors", HTTP_GET, handleTestSensors);
+    server.on("/api/test/send-message", HTTP_POST, handleTestSendMessage);
+    server.on("/api/test/play-audio", HTTP_POST, handleTestPlayAudio);
+    server.on("/api/test/show-image", HTTP_POST, handleTestShowImage);
     
     // Reminder endpoints
     server.on("/api/reminders", HTTP_GET, handleGetReminders);
@@ -2624,6 +3433,140 @@ void setupWebServer() {
         server.send(404, "application/json", "{\"success\":false,\"message\":\"Not Found\"}");
     });
     
+    // ── SD Card API endpoints ─────────────────────────────────
+    server.on("/api/messages", HTTP_GET, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        if (!sdCard.isReady()) { server.send(503, "application/json", "{\"error\":\"SD card not available\"}"); return; }
+        int offset = server.hasArg("offset") ? server.arg("offset").toInt() : 0;
+        int limit  = server.hasArg("limit")  ? server.arg("limit").toInt()  : 50;
+        if (limit > 50) limit = 50;
+        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+        int total = sdCard.getMessageCount();
+        DynamicJsonDocument doc(4096);
+        doc["total"] = total;
+        JsonArray arr = doc.createNestedArray("messages");
+        int start = (total > limit + offset) ? total - limit - offset : 0;
+        int end   = total - offset;
+        if (start < 0) start = 0;
+        if (end > total) end = total;
+        for (int i = end - 1; i >= start; i--) {
+            const SavedMessage& m = sdCard.getCachedMessage(i);
+            JsonObject o = arr.createNestedObject();
+            o["id"]  = m.id;
+            o["ts"]  = (unsigned long)m.timestamp;
+            o["src"] = m.source;
+            o["preview"] = m.preview;
+        }
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out);
+    });
+
+    server.on("/api/audio", HTTP_GET, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        if (!sdCard.isReady()) { server.send(503, "application/json", "{\"error\":\"SD card not available\"}"); return; }
+        String names[MAX_AUDIO_FILES];
+        int count = sdCard.listAudioFiles(names, MAX_AUDIO_FILES);
+        DynamicJsonDocument doc(2048);
+        JsonArray arr = doc.createNestedArray("files");
+        for (int i = 0; i < count; i++) arr.add(names[i]);
+        doc["playing"] = audioSvc.isPlaying();
+        doc["current"] = audioSvc.currentFile();
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out);
+    });
+
+    server.on("/api/audio/play", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        String body = server.arg("plain");
+        DynamicJsonDocument doc(256);
+        if (deserializeJson(doc, body) != DeserializationError::Ok) {
+            server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        }
+        String file = doc["file"] | "";
+        if (file.length() == 0) { server.send(400, "application/json", "{\"error\":\"Missing file\"}"); return; }
+        String path = String(AUDIO_DIR) + "/" + file;
+        bool ok = audioSvc.playFile(path);
+        server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Playback failed\"}");
+    });
+
+    server.on("/api/audio/stop", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        audioSvc.stop();
+        server.send(200, "application/json", JSON_SUCCESS);
+    });
+
+    server.on("/api/audio/download", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        String body = server.arg("plain");
+        DynamicJsonDocument doc(512);
+        if (deserializeJson(doc, body) != DeserializationError::Ok) {
+            server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        }
+        String url = doc["url"] | "";
+        String name = doc["name"] | "";
+        if (url.length() == 0 || name.length() == 0) {
+            server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
+            return;
+        }
+        bool ok = audioSvc.downloadToSD(url, name);
+        server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
+    });
+
+    server.on("/api/images", HTTP_GET, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        if (!sdCard.isReady()) { server.send(503, "application/json", "{\"error\":\"SD card not available\"}"); return; }
+        String names[MAX_IMAGE_FILES];
+        int count = sdCard.listImageFiles(names, MAX_IMAGE_FILES);
+        DynamicJsonDocument doc(2048);
+        JsonArray arr = doc.createNestedArray("files");
+        for (int i = 0; i < count; i++) arr.add(names[i]);
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out);
+    });
+
+    server.on("/api/images/download", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        String body = server.arg("plain");
+        DynamicJsonDocument doc(512);
+        if (deserializeJson(doc, body) != DeserializationError::Ok) {
+            server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        }
+        String url = doc["url"] | "";
+        String name = doc["name"] | "";
+        if (url.length() == 0 || name.length() == 0) {
+            server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
+            return;
+        }
+        String path = String(IMAGES_MEDIA_DIR) + "/" + name;
+        if (SD.exists(path)) { server.send(200, "application/json", JSON_SUCCESS); return; }
+        HTTPClient http;
+        http.begin(url);
+        http.setTimeout(15000);
+        bool ok = false;
+        if (http.GET() == HTTP_CODE_OK) {
+            File f = SD.open(path, FILE_WRITE);
+            if (f) {
+                WiFiClient* stream = http.getStreamPtr();
+                uint8_t buf[1024];
+                int total = 0;
+                while (http.connected() && stream->available()) {
+                    int n = stream->readBytes(buf, sizeof(buf));
+                    if (n > 0) { f.write(buf, n); total += n; }
+                }
+                f.close();
+                ok = (total > 0);
+            }
+        }
+        http.end();
+        server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
+    });
+
     server.begin();
     
     Serial.println("🌐 TZT Display Web Server started on http://" + deviceIP + ":8080");
@@ -2635,14 +3578,11 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    esp_task_wdt_init(30, true);   // 30s watchdog, panic on timeout
+    esp_task_wdt_init(60, true);   // 60s so setup (WiFi portal + Firebase + display) doesn't trigger
     esp_task_wdt_add(NULL);        // Current task (loop) is watched
     
-    Serial.println("========================================");
-    Serial.println("TZT ESP32 LVGL Display Module");
-    Serial.println("Version: " + String(FIRMWARE_VERSION));
-    Serial.println("========================================");
-    
+    Serial.println("TZT Display v" + String(FIRMWARE_VERSION));
+
     // Initialize WiFi
     WiFiManager wifiManager;
     wifiManager.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), 
@@ -2653,6 +3593,7 @@ void setup() {
     wifiManager.resetSettings();
     wifiManager.startConfigPortal(TZT_AP_SSID, TZT_AP_PASSWORD);
 #else
+    esp_task_wdt_reset();  // Feed WDT before blocking autoConnect (portal can take 30s+)
     if (!wifiManager.autoConnect(TZT_AP_SSID, TZT_AP_PASSWORD)) {
         Serial.println("WiFi config portal timed out or failed.");
     }
@@ -2660,12 +3601,11 @@ void setup() {
     
     if (WiFi.status() == WL_CONNECTED) {
         deviceIP = WiFi.localIP().toString();
-        Serial.println("WiFi connected! IP: " + deviceIP);
+        Serial.println("WiFi: " + deviceIP + " | " + WiFi.macAddress());
     } else {
         deviceIP = "192.168.4.1";
-        Serial.println("WiFi failed. Running in AP mode.");
+        Serial.println("WiFi: AP mode 192.168.4.1");
     }
-    Serial.println("MAC: " + WiFi.macAddress());
 
 #if (BOARD_LED_PIN >= 0)
     pinMode(BOARD_LED_PIN, OUTPUT);
@@ -2674,22 +3614,48 @@ void setup() {
 
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
+    esp_task_wdt_reset();  // Feed WDT before backend init
     Logger::setLevel(LOG_LEVEL_WARN);
-    firebase = new FirebaseService(FIREBASE_DATABASE_URL, FIREBASE_TIMEOUT);
-    firebase->setRetryPolicy(3, 1000);
-    firebase->setRateLimit(60);
-    reminderService = new ReminderService(firebase);
-    reminderService->load();
+#if USE_HTTP_BACKEND
+    backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT);
+#else
+    backend = new FirebaseService(FIREBASE_DATABASE_URL, FIREBASE_TIMEOUT);
+#endif
+    backend->setRetryPolicy(3, 1000);
+    backend->setRateLimit(60);
+    reminderService = new ReminderService(backend);
+    // Load reminders from SD first (primary persistence)
+    if (sdCard.isReady()) {
+        String r;
+        if (sdCard.readFile(DATA_DIR "/reminders.json", r) && r.length())
+            reminderService->fromJSON(r);
+    }
     loadGroceries();
     loadTodos();
-    loadSettingsFromFirebase();  // Restore LED, autoDispense, autoBrightness, pump duration/cooldown; send to Main
-    Serial.println("Firebase + Reminders + Groceries + Todos + Settings initialized");
+    loadSettingsFromSD();  // Restore LED, autoDispense, autoBrightness, pump duration/cooldown; send to Main
+    Serial.println("Backend + SD + settings OK");
 
+    // Initialize SD card (VSPI — independent of display HSPI)
+    if (sdCard.begin()) {
+        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+        audioSvc.begin();
+    }
+
+    esp_task_wdt_reset();  // Feed WDT before display init
 #if !defined(TZT_HEADLESS)
-    Serial.println("Initializing display and LVGL...");
     tft.init();
     tft.setRotation(1);  // 2.4" 240x320 panel: rotation 1 = 320x240 landscape (matches TZT_SCREEN_*)
     tft.fillScreen(TFT_BLACK);
+    // Backlight PWM for full brightness (digital HIGH can be dim on some boards)
+    ledcSetup(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_LEDC_FREQ, TZT_TFT_BL_LEDC_RES);
+    ledcAttachPin(TZT_TFT_BL_PIN, TZT_TFT_BL_LEDC_CHANNEL);
+    ledcWrite(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_BRIGHTNESS);
+    tft.fillScreen(TFT_BLACK);
+    bool drewSplash = sdCard.isReady() && SD.exists(SPLASH_PATH);
+    drawSplashToTft();  // Show splash.jpg from SD root if present
+    splashVisible = true;
+    // If no splash image, show main UI on first loop; else show splash for SPLASH_MIN_MS
+    splashReadyAt = millis() + (drewSplash ? SPLASH_MIN_MS : 0);
     lv_init();
     lv_disp_draw_buf_init(&draw_buf, disp_buf1, disp_buf2, TZT_DISP_BUF_PIXELS);
     lv_disp_drv_init(&disp_drv);
@@ -2698,15 +3664,18 @@ void setup() {
     disp_drv.draw_buf = &draw_buf;
     disp_drv.flush_cb = lvgl_flush_cb;
     lv_disp_drv_register(&disp_drv);
-    createControlPanel();
-    updateControlPanelStatus();
-    Serial.println("Control panel on display ready.");
+    // Touch input (XPT2046, TOUCH_CS 33 — uses getTouchRaw() + affine calibration from config_tzt.h)
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = touch_read_cb;
+    lv_indev_drv_register(&indev_drv);
+    // createControlPanel() deferred to first loop when splash ends (smooth transition to UI)
 #else
-    Serial.println("TZT_HEADLESS: running without display (LVGL skipped)");
+    Serial.println("TZT_HEADLESS (no display)");
 #endif
-    
-    // Initialize ESP-NOW for sending commands to Main ESP32
-    Serial.println("Initializing ESP-NOW...");
+
+    esp_task_wdt_reset();  // Feed WDT before ESP-NOW and web server
     
     // Check if MAC address is configured
     bool macSet = false;
@@ -2751,20 +3720,15 @@ void setup() {
                 delay(100);  // Small delay for peer to be fully registered
                 if (esp_now_is_peer_exist(mainESP32Mac)) {
                     espNowInitialized = true;
-                    Serial.println("✅ ESP-NOW initialized successfully");
-                    // Send saved settings to Main so it restores LED, toggles, pump duration/cooldown
+                    char macBuf[18];
+                    snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                        mainESP32Mac[0], mainESP32Mac[1], mainESP32Mac[2],
+                        mainESP32Mac[3], mainESP32Mac[4], mainESP32Mac[5]);
+                    Serial.println("ESP-NOW OK → Main " + String(macBuf) + " ch=" + String(peerInfo.channel));
                     if (bootSettingsCount > 0 && bootSettingsIndex < bootSettingsCount)
                         applyNextBootSetting();
-                    Serial.print("   Main ESP32 MAC: ");
-                    for (int i = 0; i < 6; i++) {
-                        if (i > 0) Serial.print(":");
-                        Serial.print(mainESP32Mac[i], HEX);
-                    }
-                    Serial.println();
-                    Serial.println("   This MAC: " + WiFi.macAddress());
-                    Serial.println("   SSID: " + WiFi.SSID() + " WiFi.ch=" + String(WiFi.channel()) + " peer.ch=" + String(peerInfo.channel) + " (Main must match)");
                 } else {
-                    Serial.println("⚠️ ESP-NOW: Peer added but verification failed");
+                    Serial.println("⚠️ ESP-NOW: peer verify failed");
                 }
             } else {
                 String errStr = "";
@@ -2786,10 +3750,9 @@ void setup() {
         Serial.println("   To enable ESP-NOW, set MAIN_ESP32_MAC_ADDRESS in config_tzt.h");
     }
     
-    // Setup web server
     setupWebServer();
-    
-    Serial.println("Setup complete!");
+    Serial.println("Web http://" + deviceIP + ":8080");
+    Serial.println("Ready.");
 }
 
 void loop() {
@@ -2797,14 +3760,75 @@ void loop() {
     server.handleClient();
 
 #if !defined(TZT_HEADLESS)
-    if (labelMoisture && (millis() - lastPanelUpdate >= 500)) {
-        lastPanelUpdate = millis();
-        uint32_t currentHash = calculateSensorHash();
-        if (currentHash != lastSensorHash) {
-            lastSensorHash = currentHash;
+    // Splash: when time is up, create UI and switch to main screen (one-time)
+    if (splashVisible) {
+        if (millis() >= splashReadyAt) {
+            createControlPanel();
             updateControlPanelStatus();
+            lv_scr_load(screen1);
+            splashVisible = false;
+        }
+        delay(2);
+        return;
+    }
+    // Show test image if requested via /api/test/show-image
+    if (pendingTestImagePath.length() > 0) {
+        String path = pendingTestImagePath;
+        pendingTestImagePath = "";
+        displayFlushing = true;
+        drawSdJpegToTft(path.c_str());
+        displayFlushing = false;
+        hideNavBar();
+        lv_scr_load(imageViewerScreen);
+    }
+    if (labelMoisture) {
+        if (sensorDataNeedsPanelUpdate) {
+            sensorDataNeedsPanelUpdate = false;
+            lastPanelUpdate = millis();
+            lastSensorHash = calculateSensorHash();
+            updateControlPanelStatus();
+#if DEBUG_LOOP
+            Serial.println("[Loop] panel update (sensor_flag)");
+#endif
+        } else if (millis() - lastPanelUpdate >= 2000) {
+            uint32_t currentHash = calculateSensorHash();
+            if (currentHash != lastSensorHash) {
+                lastPanelUpdate = millis();
+                lastSensorHash = currentHash;
+                updateControlPanelStatus();
+#if DEBUG_LOOP
+                Serial.println("[Loop] panel update (hash_changed)");
+#endif
+            }
+        }
+        // Update status bar clock every ~10s
+        static unsigned long lastStatusBarUpdate = 0;
+        if (millis() - lastStatusBarUpdate >= 10000) {
+            lastStatusBarUpdate = millis();
+            updateStatusBar();
+        }
+        // Fallback: refresh only if no update for 10s (sensor_flag + hash keep panel fresh)
+        if (lastSensorDataValid && (millis() - lastPanelUpdate >= 10000)) {
+            lastPanelUpdate = millis();
+            lastSensorHash = calculateSensorHash();
+            updateControlPanelStatus();
+#if DEBUG_LOOP
+            Serial.println("[Loop] panel update (2s_fallback)");
+#endif
         }
     }
+    // Process pending gesture immediately so nav feels responsive
+    if (gesturePending) {
+        gesture_timer_cb(nullptr);
+    }
+#if DEBUG_LOOP
+    static unsigned long lastLoopLog = 0;
+    if (millis() - lastLoopLog >= 2000) {
+        lastLoopLog = millis();
+        Serial.printf("[Loop] tick | sensorValid=%d panelAge=%lums\n",
+            lastSensorDataValid ? 1 : 0, labelMoisture ? (unsigned long)(millis() - lastPanelUpdate) : 0);
+    }
+#endif
 #endif
 
     // Timeout: if chunked send in progress but no CHUNK_ACK for 15s, abort so next print can start
@@ -2913,8 +3937,8 @@ void loop() {
         }
     }
 
-    // Save groceries to Firebase in background (debounced: max once per 5s)
-    if (groceriesNeedSave && firebase) {
+    // Save groceries to SD (debounced: max once per 5s)
+    if (groceriesNeedSave && sdCard.isReady()) {
         unsigned long now = millis();
         if (now - lastGrocerySaveTime >= SAVE_DEBOUNCE_MS) {
             groceriesNeedSave = false;
@@ -2923,73 +3947,111 @@ void loop() {
         }
     }
 
-    // Save settings to Firebase (debounced: max once per 5s) so restart remembers LED, toggles, pump duration/cooldown
-    if (settingsNeedSave && firebase) {
+    // Save settings to SD (debounced: max once per 5s) so restart remembers LED, toggles, pump duration/cooldown
+    if (settingsNeedSave && sdCard.isReady()) {
         unsigned long now = millis();
         if (now - lastSettingsSaveTime >= SAVE_DEBOUNCE_MS) {
             settingsNeedSave = false;
             lastSettingsSaveTime = now;
-            saveSettingsToFirebase();
+            saveSettingsToSD();
         }
     }
     
-    // Save todos to Firebase in background (non-blocking, after HTTP response sent)
-    if (todosNeedSave && firebase) {
+    // Save todos to SD
+    if (todosNeedSave && sdCard.isReady()) {
         todosNeedSave = false;
         saveTodos();
     }
     
-    // Save reminders to Firebase in background (non-blocking, after HTTP response sent)
-    if (remindersNeedSave && reminderService) {
-        remindersNeedSave = false;  // Clear flag before save (prevents re-trigger if save fails)
-        reminderService->save();  // Save in background (doesn't block HTTP response)
+    // Save reminders to SD (no Firebase)
+    if (remindersNeedSave && reminderService && sdCard.isReady()) {
+        remindersNeedSave = false;
+        sdCard.writeFile(DATA_DIR "/reminders.json", reminderService->toJSON());
     }
 
-    // OPTIMIZED: Poll Firebase /commands with adaptive interval
-    // Start with 30s, reduce to 10s if commands found (more responsive), back to 30s if idle
+    // Poll backend /commands with adaptive interval (Firebase or HTTP server)
     static unsigned long lastCmd = 0;
-    static unsigned long firebasePollInterval = 30000;  // Start with 30 seconds
+    static unsigned long backendPollInterval = 30000;
     static unsigned long lastCommandFound = 0;
-    
-    // If we found a command recently, poll more frequently (10s) for next 2 minutes
     if (millis() - lastCommandFound < 120000) {
-        firebasePollInterval = 10000;  // Poll every 10s when active
+        backendPollInterval = 10000;
     } else {
-        firebasePollInterval = 30000;  // Back to 30s when idle
+        backendPollInterval = 30000;
     }
     
-    if (firebase && (millis() - lastCmd >= firebasePollInterval)) {
-        lastCmd = millis() + (unsigned long)random(0, 2000);  // Jitter 0–2s to avoid thundering herd
+    if (backend && (millis() - lastCmd >= backendPollInterval)) {
+        lastCmd = millis() + (unsigned long)random(0, 2000);
         DynamicJsonDocument cmds(2048);
-        if (firebase->pollCommands(cmds) && cmds.size() > 0) {
-            lastCommandFound = millis();  // Track when we found commands
+        if (backend->pollCommands(cmds) && cmds.size() > 0) {
+            lastCommandFound = millis();
             for (JsonPair kv : cmds.as<JsonObject>()) {
                 JsonObject c = kv.value();
                 if (c["processed"] | false) continue;
                 String typ = c["type"].as<String>(), data = c["data"].as<String>();
+                // Commands: text → print + save to SD + display; audio → send/save + play; image → send/save + show
                 if (typ == "print") {
-                    // source "web" = message only (no title/date/weather); "shortcut" or missing = full receipt
                     String source = c["source"].as<String>();
-                    bool messageOnly = source.equalsIgnoreCase("web");
+                    bool messageOnly = !source.equalsIgnoreCase("shortcut");
                     sendPrintChunked(data, messageOnly);
-                }
-                else if (typ == "dispense_start" || typ == "water_start") {
-                    lastSensorData.isDispensing = true;
-                    lastSensorDataValid = true;
+                    sdCard.saveMessage(data, source);
 #if !defined(TZT_HEADLESS)
-                    updateControlPanelStatus();
+                    lastPrintMessage = data;
+                    if (labelMessage) {
+                        lv_label_set_text(labelMessage, lastPrintMessage.c_str());
+                    }
 #endif
-                    sendPumpCommandRepeated(CMD_DISPENSE_START);
                 }
-                else if (typ == "dispense_stop" || typ == "water_stop") {
-                    lastSensorData.isDispensing = false;
-                    lastSensorDataValid = true;
+                else if (typ == "download_audio") {
+                    String url = c["url"] | "";
+                    String name = c["name"] | "";
+                    if (url.length() > 0 && name.length() > 0 && sdCard.isReady()) {
+                        if (audioSvc.downloadToSD(url, name)) {
+                            String path = String(AUDIO_DIR) + "/" + name;
+                            audioSvc.playFile(path);
+                        }
+                    }
+                }
+                else if (typ == "play_audio" && data.length() > 0) {
+                    String path = String(AUDIO_DIR) + "/" + data;
+                    audioSvc.playFile(path);
+                }
+                else if (typ == "download_image") {
+                    String url = c["url"] | "";
+                    String name = c["name"] | "";
+                    if (url.length() > 0 && name.length() > 0 && sdCard.isReady()) {
+                        String path = String(IMAGES_MEDIA_DIR) + "/" + name;
+                        HTTPClient http;
+                        http.begin(url);
+                        http.setTimeout(15000);
+                        bool ok = false;
+                        if (http.GET() == HTTP_CODE_OK) {
+                            File f = SD.open(path, FILE_WRITE);
+                            if (f) {
+                                WiFiClient* stream = http.getStreamPtr();
+                                uint8_t buf[1024];
+                                int total = 0;
+                                while (http.connected() && stream->available()) {
+                                    int n = stream->readBytes(buf, sizeof(buf));
+                                    if (n > 0) { f.write(buf, n); total += n; }
+                                }
+                                f.close();
+                                ok = (total > 0);
+                            }
+                        }
+                        http.end();
 #if !defined(TZT_HEADLESS)
-                    updateControlPanelStatus();
+                        if (ok) pendingTestImagePath = path;
 #endif
-                    sendPumpCommandRepeated(CMD_DISPENSE_STOP);
+                    }
                 }
-                firebase->deleteData("/commands/" + String(kv.key().c_str()) + ".json");
+                else if (typ == "show_image" && data.length() > 0) {
+#if !defined(TZT_HEADLESS)
+                    String showPath = String(IMAGES_MEDIA_DIR) + "/" + data;
+                    if (!SD.exists(showPath)) showPath = String(IMAGES_DIR) + "/" + data;
+                    pendingTestImagePath = showPath;
+#endif
+                }
+                backend->deleteData("/commands/" + String(kv.key().c_str()) + ".json");
             }
         }
     }
@@ -3008,8 +4070,91 @@ void loop() {
         });
     }
 
+    // Audio: poll backend /audio for new entries, download to SD
+    static unsigned long lastAudioPoll = 0;
+    if (backend && sdCard.isReady() && (millis() - lastAudioPoll >= 60000)) {
+        lastAudioPoll = millis();
+        String resp;
+        if (backend->get("/audio.json", resp) && resp.length() > 4 && resp != "null") {
+            DynamicJsonDocument adoc(2048);
+            if (deserializeJson(adoc, resp) == DeserializationError::Ok) {
+                for (JsonPair kv : adoc.as<JsonObject>()) {
+                    JsonObject entry = kv.value();
+                    String url = entry["url"] | "";
+                    String name = entry["name"] | "";
+                    bool downloaded = entry["downloaded"] | false;
+                    if (url.length() > 0 && name.length() > 0 && !downloaded) {
+                        if (audioSvc.downloadToSD(url, name)) {
+                            backend->put("/audio/" + String(kv.key().c_str()) + "/downloaded.json", "true");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Images: poll backend /images for new entries, download to SD
+    static unsigned long lastImagesPoll = 0;
+    if (backend && sdCard.isReady() && (millis() - lastImagesPoll >= 60000)) {
+        lastImagesPoll = millis();
+        String resp;
+        if (backend->get("/images.json", resp) && resp.length() > 4 && resp != "null") {
+            DynamicJsonDocument idoc(2048);
+            if (deserializeJson(idoc, resp) == DeserializationError::Ok) {
+                for (JsonPair kv : idoc.as<JsonObject>()) {
+                    JsonObject entry = kv.value();
+                    String url = entry["url"] | "";
+                    String name = entry["name"] | "";
+                    bool downloaded = entry["downloaded"] | false;
+                    if (url.length() > 0 && name.length() > 0 && !downloaded) {
+                        String path = String(IMAGES_MEDIA_DIR) + "/" + name;
+                        if (SD.exists(path)) {
+                            backend->put("/images/" + String(kv.key().c_str()) + "/downloaded.json", "true");
+                        } else {
+                            HTTPClient http;
+                            http.begin(url);
+                            http.setTimeout(15000);
+                            if (http.GET() == HTTP_CODE_OK) {
+                                File f = SD.open(path, FILE_WRITE);
+                                if (f) {
+                                    WiFiClient* stream = http.getStreamPtr();
+                                    uint8_t buf[1024];
+                                    int total = 0;
+                                    while (http.connected() && stream->available()) {
+                                        int n = stream->readBytes(buf, sizeof(buf));
+                                        if (n > 0) { f.write(buf, n); total += n; }
+                                    }
+                                    f.close();
+                                    if (total > 0)
+                                        backend->put("/images/" + String(kv.key().c_str()) + "/downloaded.json", "true");
+                                }
+                            }
+                            http.end();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    audioSvc.loop();
+
 #if !defined(TZT_HEADLESS)
     lv_timer_handler();
+    // Redraw JPEG when image viewer is active so it stays visible (LVGL would overwrite with screen bg).
+    // Throttle to every 200ms to avoid GUI lag (full decode+push every frame was too heavy).
+    static unsigned long lastImageViewerRedraw = 0;
+    if (imageViewerScreen && lv_scr_act() == imageViewerScreen && currentImagePath.length() > 0) {
+        unsigned long now = millis();
+        if (now - lastImageViewerRedraw >= 200) {
+            lastImageViewerRedraw = now;
+            displayFlushing = true;
+            drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
+            displayFlushing = false;
+        }
+    }
+    // Keep audio header/Stop button in sync when playback ends naturally
+    if (audioListScreen && lv_scr_act() == audioListScreen) updateAudioHeaderState();
 #endif
-    delay(5);
+    delay(0);  // Yield only — no fixed delay so LVGL gets more CPU for smoother GUI
 }

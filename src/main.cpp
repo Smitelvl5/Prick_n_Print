@@ -272,6 +272,7 @@ void loop() {
             String full;
             for (uint8_t i = 0; i < printChunkTotal; i++) full += printChunkParts[i];
             uint8_t nChunks = printChunkTotal;
+            bool messageOnly = printChunkMessageOnly;  // Use before reset
             for (int i = 0; i < PRINT_CHUNK_MAX; i++) {
                 printChunkReceived[i] = false;
                 printChunkParts[i] = "";
@@ -282,7 +283,7 @@ void loop() {
             lastChunkPrintDone = millis();  // Cooldown: ignore duplicate chunks for CHUNK_PRINT_COOLDOWN_MS
             sensorPauseUntil = millis() + 500;
             if (full.length() > 0 && hardware && printerService) {
-                if (printChunkMessageOnly) {
+                if (messageOnly) {
                     printerService->printMessageOnly(full);
                 } else if (isPreformattedPrint(full)) {
                     printerService->printPreformatted(full, getWeatherOneLine());

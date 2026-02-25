@@ -679,6 +679,10 @@ void HardwareTest::printTestMenu() {
     Serial.println("║  8 - Test All Sensors                  ║");
     Serial.println("║  9 - Run All Tests                     ║");
     Serial.println("║  0 - Show Menu                         ║");
+    Serial.println("║                                        ║");
+    Serial.println("║  SD Card + Speaker: use test/ project  ║");
+    Serial.println("║  (cd test && pio run -e tzt-sd-speaker ║");
+    Serial.println("║   -t upload -t monitor)                ║");
     Serial.println("╚════════════════════════════════════════╝");
     Serial.println("\nEnter test number (1-9, 0 for menu): ");
 }
@@ -730,7 +734,7 @@ bool HardwareTest::runInteractiveTests() {
         case '8':
             testAllSensors();
             break;
-        case '9':
+        case '9': {
             Serial.println("\n>>> Running all tests...");
             testPump(1000);
             delay(1000);
@@ -745,6 +749,7 @@ bool HardwareTest::runInteractiveTests() {
             testPrinter();
             Serial.println("\n>>> All tests complete!");
             break;
+        }
         case '0':
             printTestMenu();
             return true;  // Continue in test mode

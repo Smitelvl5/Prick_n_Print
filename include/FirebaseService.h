@@ -5,8 +5,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "Logger.h"
+#include "IBackendService.h"
 
-class FirebaseService {
+class FirebaseService : public IBackendService {
 private:
     static const char* TAG;
     String databaseUrl;
@@ -29,24 +30,24 @@ public:
     ~FirebaseService();
     
     // Configuration
-    void setRetryPolicy(int count, int delayMs);
-    void setRateLimit(int requestsPerMinute);
+    void setRetryPolicy(int count, int delayMs) override;
+    void setRateLimit(int requestsPerMinute) override;
     void setAuthToken(const String& token);  // Set authentication token (optional)
     
     // CRUD operations with error handling
-    bool get(const String& path, String& response);
-    bool put(const String& path, const String& data);
+    bool get(const String& path, String& response) override;
+    bool put(const String& path, const String& data) override;
+    bool deleteData(const String& path) override;
     bool post(const String& path, const String& data);
-    bool deleteData(const String& path);
     
     // Specialized operations (config = settings only; no sensor/status data written to Firebase)
-    bool loadConfig(DynamicJsonDocument& doc);
-    bool saveConfig(const DynamicJsonDocument& doc);
-    bool pollCommands(DynamicJsonDocument& commands);
+    bool loadConfig(DynamicJsonDocument& doc) override;
+    bool saveConfig(const DynamicJsonDocument& doc) override;
+    bool pollCommands(DynamicJsonDocument& commands) override;
     
     // Health check
-    bool isHealthy();
-    String getLastError() const { return lastError; }
+    bool isHealthy() override;
+    String getLastError() const override { return lastError; }
     
 private:
     String lastError;
