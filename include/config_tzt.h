@@ -99,8 +99,9 @@
 
 #if USE_HTTP_BACKEND
 // Your server URL (no trailing slash). ESP32 will GET/PUT/DELETE /api/commands, /api/audio, /api/images, etc.
+// Raspberry Pi via port forwarding (public IP, port 80)
 #ifndef BACKEND_URL
-#define BACKEND_URL "http://192.168.1.100:5000"
+#define BACKEND_URL "http://99.156.136.145"
 #endif
 #define BACKEND_TIMEOUT 10000
 #else

@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prick n' Print — Control Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f1419;
+      --surface: #1a2332;
+      --surface-hover: #243044;
+      --border: #2d3a4f;
+      --text: #e6edf3;
+      --text-muted: #8b9eb5;
+      --accent: #58a6ff;
+      --accent-hover: #79b8ff;
+      --success: #3fb950;
+      --danger: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+    .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-muted); font-size: 0.875rem; margin-bottom: 2rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      transition: border-color 0.2s;
+    }
+    .card:hover { border-color: var(--surface-hover); }
+    .card h2 { font-size: 0.875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 1rem; }
+    input[type="text"], textarea {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.9375rem;
+    }
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+    }
+    textarea { min-height: 80px; resize: vertical; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.625rem 1.25rem;
+      font: inherit;
+      font-weight: 500;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--surface-hover); color: var(--text); }
+    .btn-sm { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }
+    .btn-block { width: 100%; margin-top: 0.75rem; }
+    input[type="file"] { display: none; }
+    .file-input-label {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .file-input-label:hover { border-color: var(--accent); color: var(--accent); }
+    .file-input-label.has-file { border-style: solid; color: var(--success); }
+    .history { margin-top: 2rem; }
+    .history h2 { margin-bottom: 1rem; }
+    .history-list { max-height: 400px; overflow-y: auto; }
+    .history-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 0.5rem;
+      font-size: 0.875rem;
+    }
+    .history-item .meta { color: var(--text-muted); font-size: 0.75rem; }
+    .history-item .actions { display: flex; gap: 0.5rem; flex-shrink: 0; }
+    .history-item img.thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; }
+    .empty { color: var(--text-muted); font-size: 0.875rem; padding: 2rem; text-align: center; }
+    .tabs { display: flex; gap: 0; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+    .tabs button { padding: 0.75rem 1.25rem; background: none; border: none; color: var(--text-muted); font: inherit; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+    .tabs button:hover { color: var(--text); }
+    .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .hist-panel { display: none; }
+    .hist-panel.active { display: block; }
+    .history-tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .history-tabs button { padding: 0.5rem 1rem; background: var(--bg); border: 1px solid var(--border); color: var(--text-muted); font: inherit; font-size: 0.875rem; border-radius: 8px; cursor: pointer; }
+    .history-tabs button:hover { border-color: var(--accent); color: var(--accent); }
+    .history-tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn-play { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }
+    .btn-play.playing { background: var(--success); color: #fff; }
+    .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1rem; }
+    .img-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .img-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+    .img-card .info { padding: 0.5rem; font-size: 0.75rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .img-grid .empty { grid-column: 1 / -1; }
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      padding: 0.75rem 1.25rem;
+      background: var(--surface);
+      border: 1px solid var(--success);
+      border-radius: 8px;
+      color: var(--success);
+      font-size: 0.875rem;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      z-index: 1000;
+      animation: slideIn 0.3s ease;
+    }
+    .toast.err { border-color: var(--danger); color: var(--danger); }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Prick n' Print</h1>
+    <p class="subtitle">Control panel — send messages, images, and audio to your device</p>
+
+    <div class="tabs">
+      <button type="button" class="tab-btn active" data-tab="send">Send</button>
+      <button type="button" class="tab-btn" data-tab="history">History</button>
+    </div>
+
+    <div id="panel-send" class="tab-panel active">
+      <div class="grid">
+        <div class="card">
+          <h2>Send message</h2>
+          <form id="msgForm">
+            <textarea id="msgInput" name="message" placeholder="Type a message to print or display…" required></textarea>
+            <button type="submit" class="btn btn-primary btn-block">Send message</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Upload image</h2>
+          <form id="imgForm">
+            <label class="file-input-label" id="imgLabel" for="imgFile">
+              <span>Choose image</span>
+              <span id="imgName"></span>
+            </label>
+            <input type="file" id="imgFile" name="image" accept="image/*">
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top:0.75rem">Upload image</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Upload audio</h2>
+          <form id="audioForm">
+            <label class="file-input-label" id="audioLabel" for="audioFile">
+              <span>Choose audio file</span>
+              <span id="audioName"></span>
+            </label>
+            <input type="file" id="audioFile" name="audio" accept="audio/*">
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top:0.75rem">Upload audio</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-history" class="tab-panel">
+      <div class="history-tabs">
+        <button type="button" class="hist-tab active" data-hist="messages">Messages</button>
+        <button type="button" class="hist-tab" data-hist="images">Images</button>
+        <button type="button" class="hist-tab" data-hist="audio">Audio</button>
+      </div>
+      <div id="history-messages" class="hist-panel active">
+        <div class="history-list" id="historyMessagesList"><div class="empty">Loading…</div></div>
+      </div>
+      <div id="history-images" class="hist-panel">
+        <div class="img-grid" id="historyImagesList"></div>
+      </div>
+      <div id="history-audio" class="hist-panel">
+        <div class="history-list" id="historyAudioList"><div class="empty">Loading…</div></div>
+      </div>
+      <div style="margin-top:1rem">
+        <button type="button" class="btn btn-ghost btn-sm" id="refreshBtn">Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <audio id="audioPlayer" style="display:none"></audio>
+  <div id="toast"></div>
+
+  <script>
+    const API = '';
+    let historyData = { messages: [], images: [], audio: [] };
+    let currentAudioUrl = null;
+
+    function showToast(msg, err = false) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = 'toast' + (err ? ' err' : '');
+      el.style.display = 'block';
+      setTimeout(() => { el.style.display = 'none'; }, 3000);
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return d.toLocaleString();
+    }
+
+    async function loadHistory() {
+      try {
+        const r = await fetch(API + '/api/history');
+        historyData = await r.json();
+        renderHistory();
+      } catch (e) {
+        document.getElementById('historyMessagesList').innerHTML = '<div class="empty">Could not load history.</div>';
+        document.getElementById('historyImagesList').innerHTML = '<div class="empty">Could not load history.</div>';
+        document.getElementById('historyAudioList').innerHTML = '<div class="empty">Could not load history.</div>';
+      }
+    }
+
+    function renderHistory() {
+      const msgs = historyData.messages?.slice(-50).reverse() || [];
+      const imgs = historyData.images?.slice(0, 50) || [];
+      const auds = historyData.audio?.slice(0, 50) || [];
+
+      document.getElementById('historyMessagesList').innerHTML = msgs.length
+        ? msgs.map(m => `<div class="history-item"><div><div>${escapeHtml(m.text)}</div><div class="meta">${formatTime(m.at)}</div></div></div>`).join('')
+        : '<div class="empty">No messages yet.</div>';
+
+      document.getElementById('historyImagesList').innerHTML = imgs.length
+        ? imgs.map(img => {
+            const url = API + '/uploads/' + img.path;
+            return `<div class="img-card"><a href="${url}?dl=1" download><img src="${url}" alt="" loading="lazy" onerror="this.parentElement.parentElement.style.display='none'"></a><div class="info">${escapeHtml(img.name)}</div><a href="${url}?dl=1" download class="btn btn-ghost btn-sm" style="margin:0.5rem;display:inline-block">Download</a></div>`;
+          }).join('')
+        : '<div class="empty">No images yet.</div>';
+
+      document.getElementById('historyAudioList').innerHTML = auds.length
+        ? auds.map(a => {
+            const path = a.path;
+            const url = API + '/uploads/' + path;
+            const safePath = path.replace(/"/g, '&quot;');
+            return `<div class="history-item"><div style="flex:1;min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.name)}</div><div class="meta">Audio clip</div></div><div class="actions"><button type="button" class="btn btn-primary btn-play" data-path="${safePath}">Play</button><a href="${url}" download class="btn btn-ghost btn-sm">Download</a></div></div>`;
+          }).join('')
+        : '<div class="empty">No audio yet.</div>';
+
+      document.querySelectorAll('#historyAudioList .btn-play').forEach(btn => {
+        btn.onclick = () => togglePlay(btn);
+      });
+    }
+
+    function togglePlay(btn) {
+      const url = API + '/uploads/' + (btn.dataset.path || '');
+      const player = document.getElementById('audioPlayer');
+      if (currentAudioUrl === url && !player.paused) {
+        player.pause();
+        btn.textContent = 'Play';
+        btn.classList.remove('playing');
+        return;
+      }
+      player.src = url;
+      player.play();
+      currentAudioUrl = url;
+      document.querySelectorAll('#historyAudioList .btn-play').forEach(b => {
+        b.textContent = 'Play';
+        b.classList.remove('playing');
+      });
+      btn.textContent = 'Pause';
+      btn.classList.add('playing');
+    }
+
+    document.getElementById('audioPlayer').addEventListener('ended', () => {
+      document.querySelectorAll('#historyAudioList .btn-play').forEach(b => {
+        b.textContent = 'Play';
+        b.classList.remove('playing');
+      });
+      currentAudioUrl = null;
+    });
+
+    document.getElementById('msgForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const msg = document.getElementById('msgInput').value.trim();
+      if (!msg) return;
+      try {
+        const r = await fetch(API + '/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
+        const j = await r.json();
+        if (r.ok) { showToast('Message sent'); document.getElementById('msgInput').value = ''; loadHistory(); }
+        else showToast(j.error || 'Failed', true);
+      } catch (e) { showToast('Failed to send', true); }
+    };
+
+    document.getElementById('imgFile').onchange = function() {
+      document.getElementById('imgName').textContent = this.files[0]?.name || '';
+      document.getElementById('imgLabel').classList.toggle('has-file', !!this.files[0]);
+    };
+    document.getElementById('imgForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = document.getElementById('imgFile').files[0];
+      if (!f) { showToast('Choose an image first', true); return; }
+      const fd = new FormData();
+      fd.append('image', f);
+      try {
+        const r = await fetch(API + '/image', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (r.ok) { showToast('Image uploaded'); document.getElementById('imgFile').value = ''; document.getElementById('imgName').textContent = ''; document.getElementById('imgLabel').classList.remove('has-file'); loadHistory(); }
+        else showToast(j.error || 'Failed', true);
+      } catch (e) { showToast('Failed to upload', true); }
+    };
+
+    document.getElementById('audioFile').onchange = function() {
+      document.getElementById('audioName').textContent = this.files[0]?.name || '';
+      document.getElementById('audioLabel').classList.toggle('has-file', !!this.files[0]);
+    };
+    document.getElementById('audioForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const f = document.getElementById('audioFile').files[0];
+      if (!f) { showToast('Choose an audio file first', true); return; }
+      const fd = new FormData();
+      fd.append('audio', f);
+      try {
+        const r = await fetch(API + '/audio', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (r.ok) { showToast('Audio uploaded'); document.getElementById('audioFile').value = ''; document.getElementById('audioName').textContent = ''; document.getElementById('audioLabel').classList.remove('has-file'); loadHistory(); }
+        else showToast(j.error || 'Failed', true);
+      } catch (e) { showToast('Failed to upload', true); }
+    };
+
+    document.getElementById('refreshBtn').onclick = loadHistory;
+
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
+        if (btn.dataset.tab === 'history') loadHistory();
+      };
+    });
+
+    document.querySelectorAll('.hist-tab').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.hist-tab').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.hist-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('history-' + btn.dataset.hist).classList.add('active');
+      };
+    });
+
+    loadHistory();
+  </script>
+</body>
+</html>
