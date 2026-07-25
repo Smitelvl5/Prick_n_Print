@@ -6,23 +6,24 @@
   <title>Prick n' Print — Control Panel</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0f1419;
-      --surface: #1a2332;
-      --surface-hover: #243044;
-      --border: #2d3a4f;
-      --text: #e6edf3;
-      --text-muted: #8b9eb5;
-      --accent: #58a6ff;
-      --accent-hover: #79b8ff;
-      --success: #3fb950;
-      --danger: #f85149;
+      /* Matches the TZT display's on-device palette (src/tzt-display/main.cpp) */
+      --bg: #0a1806;
+      --surface: #142e0a;
+      --surface-hover: #1e4210;
+      --border: #2d5016;
+      --text: #e8e8e8;
+      --text-muted: #99bb88;
+      --accent: #6ab82e;
+      --accent-hover: #8bc34a;
+      --success: #66dd44;
+      --danger: #ff4444;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+      font-family: 'Montserrat', -apple-system, sans-serif;
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
@@ -55,7 +56,7 @@
     input:focus, textarea:focus {
       outline: none;
       border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+      box-shadow: 0 0 0 2px rgba(106, 184, 46, 0.2);
     }
     textarea { min-height: 80px; resize: vertical; }
     .btn {
@@ -127,6 +128,10 @@
     .history-tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
     .btn-play { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }
     .btn-play.playing { background: var(--success); color: #fff; }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { background: #da3633; filter: brightness(1.1); }
+    .hist-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    .hist-actions select { padding: 0.375rem 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font: inherit; font-size: 0.875rem; }
     .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1rem; }
     .img-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
     .img-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
@@ -153,54 +158,30 @@
 <body>
   <div class="container">
     <h1>Prick n' Print</h1>
-    <p class="subtitle">Control panel — send messages, images, and audio to your device</p>
+    <p class="subtitle">Control panel — history and devices (send via iOS Shortcuts)</p>
 
     <div class="tabs">
-      <button type="button" class="tab-btn active" data-tab="send">Send</button>
-      <button type="button" class="tab-btn" data-tab="history">History</button>
+      <button type="button" class="tab-btn active" data-tab="history">History</button>
+      <button type="button" class="tab-btn" data-tab="devices">Devices</button>
     </div>
 
-    <div id="panel-send" class="tab-panel active">
-      <div class="grid">
-        <div class="card">
-          <h2>Send message</h2>
-          <form id="msgForm">
-            <textarea id="msgInput" name="message" placeholder="Type a message to print or display…" required></textarea>
-            <button type="submit" class="btn btn-primary btn-block">Send message</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h2>Upload image</h2>
-          <form id="imgForm">
-            <label class="file-input-label" id="imgLabel" for="imgFile">
-              <span>Choose image</span>
-              <span id="imgName"></span>
-            </label>
-            <input type="file" id="imgFile" name="image" accept="image/*">
-            <button type="submit" class="btn btn-primary btn-block" style="margin-top:0.75rem">Upload image</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h2>Upload audio</h2>
-          <form id="audioForm">
-            <label class="file-input-label" id="audioLabel" for="audioFile">
-              <span>Choose audio file</span>
-              <span id="audioName"></span>
-            </label>
-            <input type="file" id="audioFile" name="audio" accept="audio/*">
-            <button type="submit" class="btn btn-primary btn-block" style="margin-top:0.75rem">Upload audio</button>
-          </form>
-        </div>
-      </div>
-    </div>
-
-    <div id="panel-history" class="tab-panel">
+    <div id="panel-history" class="tab-panel active">
       <div class="history-tabs">
         <button type="button" class="hist-tab active" data-hist="messages">Messages</button>
         <button type="button" class="hist-tab" data-hist="images">Images</button>
         <button type="button" class="hist-tab" data-hist="audio">Audio</button>
+      </div>
+      <div class="hist-actions">
+        <span style="color:var(--text-muted);font-size:0.875rem">Sort:</span>
+        <select id="sortOrder">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+        </select>
+        <button type="button" class="btn btn-ghost btn-sm" id="refreshBtn">Refresh</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="clearMessagesBtn">Clear messages</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="clearImagesBtn">Clear images</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="clearAudioBtn">Clear audio</button>
+        <button type="button" class="btn btn-danger btn-sm" id="clearAllBtn">Clear all</button>
       </div>
       <div id="history-messages" class="hist-panel active">
         <div class="history-list" id="historyMessagesList"><div class="empty">Loading…</div></div>
@@ -211,8 +192,13 @@
       <div id="history-audio" class="hist-panel">
         <div class="history-list" id="historyAudioList"><div class="empty">Loading…</div></div>
       </div>
-      <div style="margin-top:1rem">
-        <button type="button" class="btn btn-ghost btn-sm" id="refreshBtn">Refresh</button>
+    </div>
+
+    <div id="panel-devices" class="tab-panel">
+      <div class="card">
+        <h2>Connected devices</h2>
+        <p class="subtitle" style="margin-bottom:1rem">ESP32s that have sent a heartbeat appear here. TZT Display and Main ESP32 will show when they poll.</p>
+        <div id="devicesList" class="history-list"><div class="empty">Loading…</div></div>
       </div>
     </div>
   </div>
@@ -221,9 +207,10 @@
   <div id="toast"></div>
 
   <script>
-    const API = '';
-    let historyData = { messages: [], images: [], audio: [] };
+    const API = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '';
+    let historyData = { messages: [], images: [], audio: [], devices: {} };
     let currentAudioUrl = null;
+    let sortNewestFirst = true;
 
     function showToast(msg, err = false) {
       const el = document.getElementById('toast');
@@ -246,7 +233,8 @@
 
     async function loadHistory() {
       try {
-        const r = await fetch(API + '/api/history');
+        const r = await fetch(API + '/api/history', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         historyData = await r.json();
         renderHistory();
       } catch (e) {
@@ -256,19 +244,35 @@
       }
     }
 
+    function sortByDate(arr, newestFirst) {
+      return [...arr].sort((a, b) => {
+        const ta = a.at || '';
+        const tb = b.at || '';
+        if (!ta && !tb) return 0;
+        if (!ta) return 1;
+        if (!tb) return -1;
+        return newestFirst ? (tb.localeCompare(ta)) : (ta.localeCompare(tb));
+      });
+    }
+
     function renderHistory() {
-      const msgs = historyData.messages?.slice(-50).reverse() || [];
-      const imgs = historyData.images?.slice(0, 50) || [];
-      const auds = historyData.audio?.slice(0, 50) || [];
+      let msgs = historyData.messages || [];
+      let imgs = sortByDate(historyData.images || [], sortNewestFirst);
+      let auds = sortByDate(historyData.audio || [], sortNewestFirst);
+      if (!sortNewestFirst) msgs = [...msgs].reverse();
+      msgs = msgs.slice(0, 50);
+      imgs = imgs.slice(0, 50);
+      auds = auds.slice(0, 50);
 
       document.getElementById('historyMessagesList').innerHTML = msgs.length
-        ? msgs.map(m => `<div class="history-item"><div><div>${escapeHtml(m.text)}</div><div class="meta">${formatTime(m.at)}</div></div></div>`).join('')
-        : '<div class="empty">No messages yet.</div>';
+        ? msgs.map(m => `<div class="history-item"><div><div>${escapeHtml(m.text)}</div><div class="meta">${formatTime(m.at)}${m.source ? ' · ' + escapeHtml(m.source) : ''}</div></div><div class="actions"><button type="button" class="btn btn-danger btn-sm btn-delete-msg" data-id="${escapeHtml(m.id)}">Delete</button></div></div>`).join('')
+        : '<div class="empty">No pending messages. Send from iOS Shortcuts.</div>';
 
       document.getElementById('historyImagesList').innerHTML = imgs.length
         ? imgs.map(img => {
             const url = API + '/uploads/' + img.path;
-            return `<div class="img-card"><a href="${url}?dl=1" download><img src="${url}" alt="" loading="lazy" onerror="this.parentElement.parentElement.style.display='none'"></a><div class="info">${escapeHtml(img.name)}</div><a href="${url}?dl=1" download class="btn btn-ghost btn-sm" style="margin:0.5rem;display:inline-block">Download</a></div>`;
+            const dateStr = formatTime(img.at) ? `<div class="meta" style="margin-top:0.25rem">${formatTime(img.at)}</div>` : '';
+            return `<div class="img-card"><a href="${url}?dl=1" download><img src="${url}" alt="" loading="lazy" onerror="this.parentElement.parentElement.style.display='none'"></a><div class="info">${escapeHtml(img.name)}${dateStr}</div><div style="margin:0.5rem;display:flex;gap:0.5rem;flex-wrap:wrap"><a href="${url}?dl=1" download class="btn btn-ghost btn-sm">Download</a><button type="button" class="btn btn-danger btn-sm btn-delete-img" data-id="${escapeHtml(img.id)}">Delete</button></div></div>`;
           }).join('')
         : '<div class="empty">No images yet.</div>';
 
@@ -277,13 +281,35 @@
             const path = a.path;
             const url = API + '/uploads/' + path;
             const safePath = path.replace(/"/g, '&quot;');
-            return `<div class="history-item"><div style="flex:1;min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.name)}</div><div class="meta">Audio clip</div></div><div class="actions"><button type="button" class="btn btn-primary btn-play" data-path="${safePath}">Play</button><a href="${url}" download class="btn btn-ghost btn-sm">Download</a></div></div>`;
+            const dateStr = formatTime(a.at) || 'Audio clip';
+            return `<div class="history-item"><div style="flex:1;min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.name)}</div><div class="meta">${dateStr}</div></div><div class="actions"><button type="button" class="btn btn-primary btn-play" data-path="${safePath}">Play</button><a href="${url}" download class="btn btn-ghost btn-sm">Download</a><button type="button" class="btn btn-danger btn-sm btn-delete-audio" data-id="${escapeHtml(a.id)}">Delete</button></div></div>`;
           }).join('')
         : '<div class="empty">No audio yet.</div>';
 
       document.querySelectorAll('#historyAudioList .btn-play').forEach(btn => {
         btn.onclick = () => togglePlay(btn);
       });
+      document.querySelectorAll('.btn-delete-msg').forEach(btn => {
+        btn.onclick = () => deleteItem('commands', btn.dataset.id);
+      });
+      document.querySelectorAll('.btn-delete-img').forEach(btn => {
+        btn.onclick = () => deleteItem('images', btn.dataset.id);
+      });
+      document.querySelectorAll('.btn-delete-audio').forEach(btn => {
+        btn.onclick = () => deleteItem('audio', btn.dataset.id);
+      });
+
+      const devs = historyData.devices || {};
+      const devList = document.getElementById('devicesList');
+      if (devList) {
+        const arr = Object.entries(devs).map(([id, d]) => ({ id, ...d }));
+        devList.innerHTML = arr.length
+          ? arr.map(d => {
+              const ago = d.last_seen ? (() => { const s = Math.round((Date.now() - new Date(d.last_seen)) / 1000); return s < 60 ? s + 's ago' : Math.round(s / 60) + 'm ago'; })() : '';
+              return `<div class="history-item"><div><div>${escapeHtml(d.name || d.id)}</div><div class="meta">${escapeHtml(d.id)} · Last seen ${ago}</div></div></div>`;
+            }).join('')
+          : '<div class="empty">No devices registered. Add a heartbeat from your TZT ESP32 to see it here.</div>';
+      }
     }
 
     function togglePlay(btn) {
@@ -314,55 +340,36 @@
       currentAudioUrl = null;
     });
 
-    document.getElementById('msgForm').onsubmit = async (e) => {
-      e.preventDefault();
-      const msg = document.getElementById('msgInput').value.trim();
-      if (!msg) return;
-      try {
-        const r = await fetch(API + '/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
-        const j = await r.json();
-        if (r.ok) { showToast('Message sent'); document.getElementById('msgInput').value = ''; loadHistory(); }
-        else showToast(j.error || 'Failed', true);
-      } catch (e) { showToast('Failed to send', true); }
-    };
-
-    document.getElementById('imgFile').onchange = function() {
-      document.getElementById('imgName').textContent = this.files[0]?.name || '';
-      document.getElementById('imgLabel').classList.toggle('has-file', !!this.files[0]);
-    };
-    document.getElementById('imgForm').onsubmit = async (e) => {
-      e.preventDefault();
-      const f = document.getElementById('imgFile').files[0];
-      if (!f) { showToast('Choose an image first', true); return; }
-      const fd = new FormData();
-      fd.append('image', f);
-      try {
-        const r = await fetch(API + '/image', { method: 'POST', body: fd });
-        const j = await r.json();
-        if (r.ok) { showToast('Image uploaded'); document.getElementById('imgFile').value = ''; document.getElementById('imgName').textContent = ''; document.getElementById('imgLabel').classList.remove('has-file'); loadHistory(); }
-        else showToast(j.error || 'Failed', true);
-      } catch (e) { showToast('Failed to upload', true); }
-    };
-
-    document.getElementById('audioFile').onchange = function() {
-      document.getElementById('audioName').textContent = this.files[0]?.name || '';
-      document.getElementById('audioLabel').classList.toggle('has-file', !!this.files[0]);
-    };
-    document.getElementById('audioForm').onsubmit = async (e) => {
-      e.preventDefault();
-      const f = document.getElementById('audioFile').files[0];
-      if (!f) { showToast('Choose an audio file first', true); return; }
-      const fd = new FormData();
-      fd.append('audio', f);
-      try {
-        const r = await fetch(API + '/audio', { method: 'POST', body: fd });
-        const j = await r.json();
-        if (r.ok) { showToast('Audio uploaded'); document.getElementById('audioFile').value = ''; document.getElementById('audioName').textContent = ''; document.getElementById('audioLabel').classList.remove('has-file'); loadHistory(); }
-        else showToast(j.error || 'Failed', true);
-      } catch (e) { showToast('Failed to upload', true); }
-    };
-
     document.getElementById('refreshBtn').onclick = loadHistory;
+
+    document.getElementById('sortOrder').onchange = function() {
+      sortNewestFirst = (this.value === 'newest');
+      renderHistory();
+    };
+
+    async function clearHistory(type) {
+      const labels = { messages: 'messages', images: 'images', audio: 'audio', all: 'all messages, images, and audio' };
+      if (!confirm('Delete ' + labels[type] + '? This cannot be undone.')) return;
+      try {
+        const r = await fetch(API + '/api/history/' + type, { method: 'DELETE', cache: 'no-store' });
+        if (r.ok || r.status === 204) { showToast('Cleared'); await loadHistory(); }
+        else showToast('Failed to clear', true);
+      } catch (e) { showToast('Failed to clear', true); }
+    }
+
+    async function deleteItem(type, id) {
+      if (!id || !confirm('Delete this ' + type.slice(0, -1) + '?')) return;
+      try {
+        const r = await fetch(API + '/api/' + type + '/' + encodeURIComponent(id), { method: 'DELETE', cache: 'no-store' });
+        if (r.ok || r.status === 204) { showToast('Deleted'); await loadHistory(); }
+        else showToast('Failed to delete (' + r.status + ')', true);
+      } catch (e) { showToast('Failed to delete', true); }
+    }
+
+    document.getElementById('clearAllBtn').onclick = () => clearHistory('all');
+    document.getElementById('clearMessagesBtn').onclick = () => clearHistory('messages');
+    document.getElementById('clearImagesBtn').onclick = () => clearHistory('images');
+    document.getElementById('clearAudioBtn').onclick = () => clearHistory('audio');
 
     document.querySelectorAll('.tab-btn').forEach(btn => {
       btn.onclick = () => {
@@ -370,7 +377,7 @@
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         btn.classList.add('active');
         document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
-        if (btn.dataset.tab === 'history') loadHistory();
+        if (btn.dataset.tab === 'history' || btn.dataset.tab === 'devices') loadHistory();
       };
     });
 
@@ -384,6 +391,7 @@
     });
 
     loadHistory();
+    setInterval(loadHistory, 10000);  // auto-refresh every 10s so iOS Shortcut messages appear
   </script>
 </body>
 </html>

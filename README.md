@@ -1,68 +1,12 @@
 # Print-n-Prick
 
-An IoT system that pairs a thermal receipt printer with a hand sanitizer dispenser, controlled remotely through Firebase. Send messages from your phone and they print on thermal paper along with live weather and sensor data. A secondary display module provides a touchscreen GUI, web dashboard, and real-time sensor monitoring.
+An IoT system that pairs a thermal receipt printer with a hand sanitizer dispenser, controlled remotely through an HTTP backend. Send messages from your phone and they print on thermal paper along with live weather and sensor data. A secondary display module provides a touchscreen GUI, web dashboard, and real-time sensor monitoring.
 
-## Firebase: URL and rules
+## HTTP backend
 
-### 1. Use your own Firebase project (change the URL)
+The TZT display polls your web server for commands, audio, and images. You run the included Flask server (or your own) and POST commands to it; the ESP32 polls `/api/commands`, `/api/audio`, and `/api/images`.
 
-The TZT and the test script both need your **Firebase Realtime Database URL**.
-
-**In firmware (TZT):**  
-Edit **`include/config_tzt.h`** and set:
-
-```c
-#define FIREBASE_DATABASE_URL "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com"
-```
-
-Replace `YOUR-PROJECT-ID` with your project ID (e.g. from Firebase Console → Project settings → Your apps → Realtime Database URL).
-
-**In the Python test script:**  
-Edit **`scripts/test_tzt_display.py`** and set:
-
-```python
-DEFAULT_FIREBASE_URL = "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com"
-```
-
-Or pass it when you run:
-
-```bash
-python scripts/test_tzt_display.py --firebase-url "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com"
-```
-
-**Where to get the URL:**  
-Firebase Console → [Realtime Database](https://console.firebase.google.com/) → select your project → the URL is at the top (e.g. `https://myproject-default-rtdb.firebaseio.com`). Use the **default** database (not a named one) unless you changed it.
-
----
-
-### 2. Database rules (TZT only uses `/commands` now)
-
-The TZT now only reads **`/commands`** from Firebase (and deletes each command after use). You can use this minimal rule set:
-
-```json
-{
-  "rules": {
-    "commands": {
-      ".read": true,
-      ".write": true
-    }
-  }
-}
-```
-
-In Firebase Console: **Realtime Database** → **Rules** → paste the above → **Publish**.
-
-If you still have other apps or the web UI reading/writing other paths, keep those rules too; the important part is that **`commands`** has read and write so the TZT can poll and your script/shortcuts can push.
-
----
-
-Publish the rules, then retry the TZT; "Unauthorized" should stop if the URL and network are correct.
-
----
-
-## What Firebase is used for (only this)
-
-Firebase is **only** used to send content to the TZT. All other data (settings, groceries, todos, reminders) is stored on the TZT’s **SD card**, not in Firebase.
+**Configure:** In **`include/config_tzt.h`** set **`BACKEND_URL`** to your server (e.g. `"http://192.168.1.146:5000"`). See [BACKEND_HTTP.md](BACKEND_HTTP.md) for setup and usage.
 
 | What you send | What the TZT does |
 |---------------|-------------------|
@@ -70,34 +14,15 @@ Firebase is **only** used to send content to the TZT. All other data (settings, 
 | **Audio** | Saves it to SD (`/data/audio/`) and plays it on the TZT. You can send a **URL** (TZT downloads and saves) or a **filename** (play a file already on SD). |
 | **Image** | Saves it to SD (`/data/images/`) and shows it on the TZT. You can send a **URL** (TZT downloads and saves) or a **filename** (show a file already on SD). |
 
-**How to send:** Write a command object under Firebase `/commands/<unique_id>.json`. The TZT polls `/commands.json` every ~10–30 s, runs each command, then deletes it.
+**Command types** (POST to your backend; see `server/README.md` for the API):
 
-**Command types:**
+- **`print`** – Text message (`type`, `data`, optional `source`)
+- **`download_audio`** – Download audio from URL, save to SD, and play
+- **`play_audio`** – Play a file already on SD
+- **`download_image`** – Download image from URL, save to SD, and show
+- **`show_image`** – Show a file already on SD
 
-- **`print`** – Text message  
-  - `type`: `"print"`  
-  - `data`: message text (string)  
-  - `source`: optional, e.g. `"shortcut"` for full receipt style  
-
-- **`download_audio`** – Download audio from URL, save to SD, and play  
-  - `type`: `"download_audio"`  
-  - `url`: full URL of the audio file  
-  - `name`: filename to save (e.g. `alarm.mp3`)  
-
-- **`play_audio`** – Play a file already on SD  
-  - `type`: `"play_audio"`  
-  - `data`: filename in `/data/audio/` (e.g. `beep.mp3`)  
-
-- **`download_image`** – Download image from URL, save to SD, and show  
-  - `type`: `"download_image"`  
-  - `url`: full URL of the image  
-  - `name`: filename to save (e.g. `photo.jpg`)  
-
-- **`show_image`** – Show a file already on SD  
-  - `type`: `"show_image"`  
-  - `data`: filename in `/data/images/` (e.g. `logo.jpg`)  
-
-Pump/LED and other hardware control are **not** done via Firebase; use the TZT’s web UI or HTTP API on port 8080.
+Pump/LED and other hardware control use the TZT’s web UI or HTTP API on port 8080.
 
 ---
 
@@ -110,25 +35,25 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 | **Role** | Hardware controller | Brain / UI / cloud |
 | **PlatformIO env** | `esp32-wroom-32` | `tzt-esp32-devkit` |
 | **Serial port** | COM4 | COM3 |
-| **Controls** | Printer, pump, LED, sensors | 2.4" TFT + touch, web server, Firebase, SD card, speaker |
-| **Network** | WiFi (for ESP-NOW channel sync) | WiFi + Firebase + HTTP server (port 8080) |
+| **Controls** | Printer, pump, LED, sensors | 2.4" TFT + touch, web server, HTTP backend, SD card, speaker |
+| **Network** | WiFi (for ESP-NOW channel sync) | WiFi + HTTP backend + HTTP server (port 8080) |
 | **Config file** | `include/config.h` | `include/config_tzt.h` |
 
 ```
                  ┌──────────────────┐
   iOS Shortcut ──┤                  │
-  Python script ─┤  Firebase RTDB   │
-  Web UI (POST) ─┤  /commands.json  │
+  Python script ─┤  HTTP backend    │
+  Web UI (POST) ─┤  /api/commands   │
                  └────────┬─────────┘
                           │ poll (10-30 s)
                           ▼
               ┌──────────────────────────┐
-              │   TZT Display ESP32      │
-              │   (CYD 2.4" ILI9341)     │
+              │   TZT Display ESP32     │
+              │   (CYD 2.4" ILI9341)    │
               │                          │
-              │  ● Web server :8080      │
-              │  ● Firebase client       │
-              │  ● LVGL touchscreen GUI  │
+              │  ● Web server :8080     │
+              │  ● HTTP backend client  │
+              │  ● LVGL touchscreen GUI │
               │  ● Reminder scheduler    │
               │  ● Grocery / Todo lists  │
               │  ● SD card (FAT32)       │
@@ -152,12 +77,12 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 
 ### Message Flow
 
-1. User sends message (iOS Shortcut, Python script, or web UI)
-2. Message is written to Firebase `/commands/{id}.json` with `"processed": false`
-3. TZT polls Firebase, detects unprocessed command
+1. User sends message (iOS Shortcut, Python script, or web UI) to the HTTP backend
+2. Message is POSTed to the backend (e.g. `/api/commands`)
+3. TZT polls the backend every ~10–30 s, fetches new commands
 4. TZT sends print command to Main ESP32 over ESP-NOW (chunked if > 199 bytes)
 5. Main ESP32 assembles message, fetches weather, reads sensors, prints receipt
-6. TZT deletes the command from Firebase
+6. TZT marks the command as processed (backend may delete or mark it)
 
 ### Sensor Data Flow
 
@@ -173,13 +98,9 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 
 - [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
 - USB data cable for each ESP32
-- Firebase Realtime Database (free tier is sufficient)
+- HTTP backend server (see [BACKEND_HTTP.md](BACKEND_HTTP.md); optional for basic testing)
 
-### 1. Configure Firebase
-
-See [Firebase Setup](#firebase-setup) below. You need the database URL in both config files.
-
-### 2. Set MAC Addresses
+### 1. Set MAC Addresses
 
 Each board prints its MAC address on boot over serial. Copy them into the config files:
 
@@ -188,7 +109,7 @@ Each board prints its MAC address on boot over serial. Copy them into the config
 
 Format: `{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}`
 
-### 3. Build and Flash
+### 2. Build and Flash
 
 ```bash
 # Main ESP32 (COM4)
@@ -198,7 +119,7 @@ pio run -e esp32-wroom-32 -t upload -t monitor
 pio run -e tzt-esp32-devkit -t upload -t monitor
 ```
 
-### 4. Connect to WiFi
+### 3. Connect to WiFi
 
 On first boot each board creates a WiFi access point for configuration:
 
@@ -209,7 +130,7 @@ On first boot each board creates a WiFi access point for configuration:
 
 Connect to each AP, open the portal, and enter your home WiFi credentials. The boards save them and reconnect automatically on future boots.
 
-### 5. Access the Web Dashboard
+### 4. Access the Web Dashboard
 
 Once TZT is on your WiFi, find its IP in the serial monitor and open:
 
@@ -218,70 +139,6 @@ http://<TZT-IP>:8080
 ```
 
 Password: `0820`
-
----
-
-## Firebase Setup
-
-### 1. Create a Firebase Project
-
-1. Go to [Firebase Console](https://console.firebase.google.com/)
-2. Click **Add project**, give it a name, and create it
-3. In the sidebar, go to **Build > Realtime Database**
-4. Click **Create Database**, choose a region, and start in **test mode**
-
-### 2. Copy the Database URL
-
-It looks like this:
-
-```
-https://your-project-id-default-rtdb.firebaseio.com
-```
-
-Paste it into both config files:
-
-- `include/config.h` line: `#define FIREBASE_DATABASE_URL "https://..."`
-- `include/config_tzt.h` line: `#define FIREBASE_DATABASE_URL "https://..."`
-
-### 3. Set Security Rules
-
-In **Realtime Database > Rules**, paste and publish:
-
-```json
-{
-  "rules": {
-    ".read": true,
-    ".write": true
-  }
-}
-```
-
-> These rules allow public access. This is fine for personal/home use. For a public deployment, add Firebase Authentication and restrict rules.
-
-### 4. Database Structure
-
-The TZT Display manages all Firebase data. No manual setup is needed beyond creating the database; the firmware creates nodes automatically.
-
-```
-your-project-default-rtdb/
-├── commands/                   # Print and dispense commands (created by clients, deleted after processing)
-│   └── {pushId}.json           #   { type, data, source, processed }
-├── config.json                 # Device settings (LED brightness, pump duration, auto-dispense, etc.)
-├── reminders/                  # Scheduled reminders
-│   └── {id}.json               #   { id, message, scheduledTime, createdTime, printed, active }
-├── groceries.json              # Grocery list (JSON array of strings)
-└── todos.json                  # Todo list (JSON array of strings)
-```
-
-### 5. Firebase Free Tier Limits
-
-| Resource | Limit | Typical Usage |
-|---|---|---|
-| Storage | 1 GB | Well under 1 MB |
-| Downloads | 10 GB/month | Minimal |
-| Simultaneous connections | 100 | 1-2 |
-
-The firmware includes rate limiting (60 requests/minute max) and adaptive polling (30 s idle, 10 s when active) to stay well within limits.
 
 ---
 
@@ -490,7 +347,7 @@ Create a shortcut with these four actions:
 ```
 
 3. **Get Contents of URL**
-   - URL: `https://<YOUR-FIREBASE-URL>/commands.json`
+   - URL: `http://<YOUR-BACKEND-URL>/api/commands` (e.g. `http://192.168.1.146:5000/api/commands`)
    - Method: POST
    - Headers: `Content-Type: application/json`
    - Request Body: **File** (select the Text from step 2)
@@ -502,19 +359,7 @@ Create a shortcut with these four actions:
 ### Python Script
 
 ```bash
-python send_message.py "Your message here"
-```
-
-### Firebase Console (Manual)
-
-In the Realtime Database, add a child under `/commands/` with:
-
-```json
-{
-  "type": "print",
-  "data": "Hello from Firebase!",
-  "processed": false
-}
+python scripts/post_to_backend.py --url http://YOUR_SERVER_IP:5000 --message "Your message here"
 ```
 
 ### Print Formats
@@ -597,13 +442,13 @@ Six-point affine calibration with outlier rejection. Outputs `TOUCH_AX` through 
 Prick_n_Print/
 ├── include/
 │   ├── config.h              # Main ESP32 configuration (pins, timing, WiFi, ESP-NOW)
-│   ├── config_tzt.h          # TZT Display configuration (display, WiFi, Firebase, ESP-NOW)
+│   ├── config_tzt.h          # TZT Display configuration (display, WiFi, HTTP backend, ESP-NOW)
 │   ├── User_Setup.h          # TFT_eSPI pin definitions (copied into library at build time)
 │   ├── lv_conf.h             # LVGL configuration
 │   ├── HardwareAbstraction.h # Hardware abstraction layer
 │   ├── HardwareTest.h        # Test suite header
 │   ├── PrinterService.h      # Thermal printer service
-│   ├── FirebaseService.h     # Firebase HTTP client
+│   ├── HttpBackendService.h  # HTTP backend client
 │   ├── ReminderService.h     # Reminder scheduler
 │   └── Logger.h              # Serial logging
 ├── src/
@@ -613,9 +458,9 @@ Prick_n_Print/
 │   ├── PrinterService.cpp
 │   ├── Logger.cpp
 │   └── tzt-display/
-│       └── main.cpp          # TZT Display entry point (web server, Firebase, LVGL, ESP-NOW)
+│       └── main.cpp          # TZT Display entry point (web server, HTTP backend, LVGL, ESP-NOW)
 ├── data/
-│   └── index.html            # Standalone message-sending page (writes to Firebase directly)
+│   └── index.html            # Standalone message-sending page (posts to backend)
 ├── scripts/
 │   └── copy_tft_user_setup.py  # Pre-build script: copies User_Setup.h into TFT_eSPI library
 ├── test/
@@ -668,7 +513,7 @@ Prick_n_Print/
 | `TZT_AP_SSID` | `"TZT_Display"` | WiFi AP name (first boot) |
 | `TZT_AP_PASSWORD` | `"08202022"` | WiFi AP password |
 | `MAIN_ESP32_MAC_ADDRESS` | -- | Main board's MAC (from serial) |
-| `FIREBASE_DATABASE_URL` | -- | Firebase Realtime Database URL |
+| `BACKEND_URL` | `"http://192.168.1.146:5000"` | HTTP backend server URL (no trailing slash) |
 | `WEB_PASSWORD` | `"0820"` | Web dashboard login password |
 | `ESP_NOW_CHANNEL` | 6 | Fallback ESP-NOW channel |
 | `WEATHER_API_KEY` | -- | OpenWeatherMap API key |
@@ -707,16 +552,10 @@ This means ESP-NOW between TZT and Main is not working:
 
 ### Messages not printing
 
-1. Verify Firebase URL is correct in `config_tzt.h`
-2. Check TZT serial monitor for Firebase polling activity
-3. Ensure Firebase security rules allow read/write
-4. TZT polls every 10-30 seconds; wait at least 30 seconds
-
-### Firebase 401/403 errors
-
-1. Go to Firebase Console > Realtime Database > Rules
-2. Set `.read` and `.write` to `true`
-3. Click Publish
+1. Verify `BACKEND_URL` is correct in `config_tzt.h` and the backend server is running
+2. Check TZT serial monitor for backend polling activity
+3. TZT polls every 10-30 seconds; wait at least 30 seconds
+4. Use `scripts/post_to_backend.py` or the server API to send commands (see BACKEND_HTTP.md)
 
 ---
 

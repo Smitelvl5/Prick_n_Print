@@ -61,7 +61,7 @@ bool HttpBackendService::executeRequest(HTTPClient& http, const String& method, 
     return false;
 }
 
-// Map Firebase-style paths to API paths
+// Map backend paths to API paths
 // GET: /commands.json -> /api/commands, /audio.json -> /api/audio, /images.json -> /api/images, /reminders.json -> /api/reminders, /config.json -> /api/config
 // PUT: /reminders.json -> /api/reminders, /config.json -> /api/config, /audio/X/downloaded.json -> /api/audio/X, /images/X/downloaded.json -> /api/images/X
 // DELETE: /commands/X.json -> /api/commands/X
@@ -135,13 +135,48 @@ bool HttpBackendService::deleteData(const String& path) {
         return false;
     }
     String id = path.substring(9, path.length() - 5);
-    String apiPath = "/api/commands/" + id;
+    String url = baseUrl + "/api/commands/" + id;
     HTTPClient http;
-    http.begin(baseUrl + apiPath);
     http.setTimeout(timeout);
-    bool ok = executeRequest(http, "DELETE");
-    http.end();
-    return ok;
+    for (int redirects = 0; redirects < 3; redirects++) {
+        if (!http.begin(url)) {
+            lastError = "Connection failed";
+            return false;
+        }
+        int httpCode = -1;
+        for (int attempt = 0; attempt < retryCount; attempt++) {
+            if (attempt > 0) delay(retryDelay);
+            httpCode = http.sendRequest("DELETE");
+            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED || httpCode == 204) {
+                lastRequest = millis();
+                http.end();
+                return true;
+            }
+            if (httpCode == 401 || httpCode == 403) {
+                lastError = "HTTP " + String(httpCode);
+                http.end();
+                return false;
+            }
+            if (httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308) {
+                String location = http.getLocation();
+                http.end();
+                if (location.length() > 0) {
+                    url = location;
+                    break;
+                }
+                lastError = "HTTP " + String(httpCode) + " no Location";
+                return false;
+            }
+        }
+        if (httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308) {
+            continue;
+        }
+        lastError = "HTTP " + String(httpCode);
+        http.end();
+        return false;
+    }
+    lastError = "Too many redirects";
+    return false;
 }
 
 bool HttpBackendService::pollCommands(DynamicJsonDocument& commands) {
@@ -179,4 +214,15 @@ bool HttpBackendService::isHealthy() {
     bool ok = (http.GET() == HTTP_CODE_OK);
     http.end();
     return ok;
+}
+
+bool HttpBackendService::sendHeartbeat(const String& deviceId, const String& name) {
+    HTTPClient http;
+    http.begin(baseUrl + "/api/devices/heartbeat");
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(timeout);
+    String body = "{\"device_id\":\"" + deviceId + "\",\"name\":\"" + name + "\"}";
+    int code = http.POST(body);
+    http.end();
+    return (code == HTTP_CODE_OK || code == HTTP_CODE_CREATED);
 }

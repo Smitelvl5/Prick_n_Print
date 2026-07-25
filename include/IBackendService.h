@@ -6,7 +6,7 @@
 
 /**
  * Backend interface for commands, audio, images, reminders.
- * Implemented by FirebaseService (Firebase) or HttpBackendService (HTTP server).
+ * Implemented by HttpBackendService (HTTP server).
  */
 class IBackendService {
 public:
@@ -23,6 +23,8 @@ public:
     virtual bool saveConfig(const DynamicJsonDocument& doc) { (void)doc; return false; }
     virtual bool isHealthy() = 0;
     virtual String getLastError() const = 0;
+    /** Optional: POST to /api/devices/heartbeat. Default no-op returns false. */
+    virtual bool sendHeartbeat(const String& deviceId, const String& name) { (void)deviceId; (void)name; return false; }
 };
 
 #endif // I_BACKEND_SERVICE_H

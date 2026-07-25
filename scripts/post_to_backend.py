@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Send messages, images, or audio to the TZT via the HTTP backend (no Firebase).
+Send messages, images, or audio to the TZT via the HTTP backend.
 
 Usage:
   # Message (print + show on display)

@@ -258,7 +258,6 @@ bool EspNowService::sendSensorData() {
     esp_err_t result = esp_now_send(peerMacAddress, (uint8_t*)&packet, sizeof(SensorDataPacket));
     
     if (result == ESP_OK) {
-        Serial.println("[Main] Sent: sensor");
         sendPendingSince = millis();
         return true;
     } else {

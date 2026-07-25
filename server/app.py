@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TZT Backend: HTTP API for commands, audio, images, and reminders.
-Replace Firebase: app/shortcuts POST here; ESP32 polls via GET.
+App/shortcuts POST here; TZT display polls via GET.
 
 Run: flask --app app run --host 0.0.0.0 --port 5000
 Or: python app.py

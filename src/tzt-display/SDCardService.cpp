@@ -8,9 +8,16 @@ bool SDCardService::begin() {
     if (mounted) return true;
     vspi = new SPIClass(VSPI);
     vspi->begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
-    if (!SD.begin(SD_PIN_CS, *vspi)) {
-        Serial.println("[SD] Mount failed");
-        return false;
+    const uint32_t speeds[] = {4000000, 1000000};
+    for (int i = 0; i < 2; i++) {
+        if (SD.begin(SD_PIN_CS, *vspi, speeds[i])) break;
+        if (i == 0) {
+            Serial.println("[SD] Mount failed at 4MHz, retrying at 1MHz...");
+            SD.end();
+        } else {
+            Serial.println("[SD] Mount failed. Check: card inserted, pins CS=" + String(SD_PIN_CS) + " SCK=" + String(SD_PIN_SCK) + " MISO=" + String(SD_PIN_MISO) + " MOSI=" + String(SD_PIN_MOSI));
+            return false;
+        }
     }
     uint8_t ct = SD.cardType();
     if (ct == CARD_NONE) {
@@ -22,7 +29,7 @@ bool SDCardService::begin() {
     ensureDir(MSG_DIR);         // /data/messages
     ensureDir(AUDIO_DIR);       // /data/audio
     ensureDir(IMAGES_DIR);      // /data/images
-    ensureDir(IMAGES_MEDIA_DIR); // /data/images/media (Firebase/Shortcut uploads)
+    ensureDir(IMAGES_MEDIA_DIR); // /data/images/media (backend/shortcut uploads)
     Serial.println("[SD] OK " + String((unsigned long)((SD.totalBytes() - SD.usedBytes()) / (1024ULL * 1024))) + " MB free");
     return true;
 }

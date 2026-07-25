@@ -1,6 +1,6 @@
 # TZT HTTP Backend
 
-Replaces Firebase: your app or shortcuts POST here; the ESP32 polls via GET.
+Your app or shortcuts POST here; the TZT display polls via GET.
 
 ## Run the server
 

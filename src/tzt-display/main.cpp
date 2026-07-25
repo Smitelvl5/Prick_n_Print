@@ -1,6 +1,6 @@
 /*
- * TZT ESP32 LVGL Display - Web Server + Firebase + ESP-NOW
- * Hosts web UI, Firebase (commands, reminders, groceries), sends commands to Main via ESP-NOW.
+ * TZT ESP32 LVGL Display - Web Server + HTTP Backend + ESP-NOW
+ * Hosts web UI, talks to HTTP backend (commands, reminders, groceries), sends commands to Main via ESP-NOW.
  * Receives sensor data from Main via ESP-NOW.
  */
 
@@ -19,18 +19,16 @@
 
 #include "version.h"
 #include "config_tzt.h"
+#include "secrets.h"
 #include "EspNowProtocol.h"
 #include "IBackendService.h"
-#if USE_HTTP_BACKEND
 #include "HttpBackendService.h"
-#else
-#include "FirebaseService.h"
-#endif
 #include "ReminderService.h"
 #include "SDCardService.h"
 #include <SD.h>
 #include "AudioService.h"
 #include "Logger.h"
+#include "OTAUpdateService.h"
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
@@ -69,15 +67,25 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 static lv_color_t disp_buf1[TZT_DISP_BUF_PIXELS];
 static lv_color_t disp_buf2[TZT_DISP_BUF_PIXELS];
-static lv_obj_t* screen1 = nullptr;  // Home: latest message
+static lv_obj_t* screen1 = nullptr;  // Home: latest message + quick status + History button
 static lv_obj_t* screen2 = nullptr;  // Sensors (read-only)
-static lv_obj_t* screen3 = nullptr;  // Message history (SD card)
-static lv_obj_t* screen4 = nullptr;  // Media hub (Audio / Images)
+static lv_obj_t* screen3 = nullptr;  // Message history (SD card) - reached via button on Home
 static lv_obj_t* audioListScreen = nullptr;   // sub-screen: audio list + now playing
 static lv_obj_t* imageListScreen = nullptr;   // sub-screen: image gallery list
 static int currentScreenIndex = 0;
-#define SCREEN_COUNT 5
-// Screen 1: message
+#define SCREEN_COUNT 4   // Bottom nav tabs: Home, Sensors, Media (Photo/Audio toggle), Settings
+static int mediaSubTab = 0;   // Media tab sub-selection: 0 = Photo, 1 = Audio
+#define DASHBOARD_AUTO_ADVANCE_MS  5000   // rotate to next tab every 5s when not touched
+#define DASHBOARD_TOUCH_PAUSE_MS  120000  // after touch, stay on tab for 2 min then resume auto-rotate
+static unsigned long lastDashboardTouchTime = 0;   // touch or tab tap pauses auto-rotate
+static unsigned long lastDashboardAutoAdvance = 0;
+static lv_obj_t* dashboardPhotoScreen = nullptr;  // Media tab, Photo sub-tab
+static lv_obj_t* dashboardAudioScreen = nullptr;  // Media tab, Audio sub-tab
+static void switchMediaSubTab(int which);  // 0 = Photo, 1 = Audio
+static String lastDashboardImagePath;   // latest received/shown image for Photo tab
+static String lastDashboardAudioName;   // latest received/played audio for Audio tab
+static lv_obj_t* dashboardAudioNameLabel = nullptr;  // label on Audio tab, updated when lastDashboardAudioName changes
+// Screen 1: message (dashboard tab 1)
 static lv_obj_t* labelMessage = nullptr;
 static String lastPrintMessage = "(No messages yet)";
 // Screen 3: message history
@@ -87,6 +95,8 @@ static lv_obj_t* historyDetailLabel = nullptr;
 static void refreshHistoryList();
 static void historyItemCb(lv_event_t* e);
 static void historyBackCb(lv_event_t* e);
+static void historyOpenCb(lv_event_t* e);   // Home -> History
+static void historyCloseCb(lv_event_t* e);  // History -> Home
 // Screen 4: audio player
 static lv_obj_t* audioList = nullptr;
 static lv_obj_t* audioHeaderBar = nullptr;
@@ -121,20 +131,19 @@ static unsigned long lastPanelUpdate = 0;
 static uint32_t lastSensorHash = 0;
 static void createControlPanel();
 static void updateControlPanelStatus();
-// Status bar (persistent top layer: time only; WiFi shown on Settings tab)
+// Status bar (persistent top layer: title + IP + time; WiFi SSID shown on Settings tab)
 static lv_obj_t* statusBar = nullptr;
 static lv_obj_t* statusTimeLabel = nullptr;
+static lv_obj_t* statusIpLabel = nullptr;
 static lv_obj_t* statusWifiLabel = nullptr;  // created on Settings screen, updated by updateStatusBar()
 static void updateStatusBar();
 // Home screen sensor summary strip
 static lv_obj_t* homeSensorStrip = nullptr;
-// Volume: inline on Settings only (no slide-up panel)
+// Volume: inline on Settings tab (Settings is a normal bottom-nav tab, not an overlay)
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* settingsVolumeValueLabel = nullptr;
 static lv_obj_t* settingsScreen = nullptr;
-static bool settingsVisible = false;
 static void volumeSliderCb(lv_event_t* e);
-static void settingsBackCb(lv_event_t* e);
 static void gesture_timer_cb(lv_timer_t* t);
 
 // Layout: status bar, content, bottom nav
@@ -148,8 +157,9 @@ static void gesture_timer_cb(lv_timer_t* t);
 #define TZT_HEADER_BAR_H   48
 #define TZT_BTN_PAD_V      6
 #define TZT_LIST_PAD       8
+#define TZT_NAV_BTN_GAP    4   // Real gap between bottom-nav tabs so adjacent taps don't misfire
 static lv_obj_t* navBarContainer = nullptr;
-static lv_obj_t* navBtns[5] = { nullptr };
+static lv_obj_t* navBtns[SCREEN_COUNT] = { nullptr };
 static void updateNavHighlight(int index);
 static void navBtnCb(lv_event_t* e);
 static void goToScreenIndex(int index);
@@ -181,7 +191,7 @@ uint8_t mainESP32Mac[6] = MAIN_ESP32_MAC_ADDRESS;
 static int lastPumpDurationTenths = -1;   // 0-255 = 0-25.5s, -1 = not set
 static int lastPumpCooldownTenths = -1;    // 0-255 = 0-25.5s, -1 = not set
 
-// Settings persisted to Firebase config (loaded on boot, saved when changed)
+// Settings persisted to backend config (loaded on boot, saved when changed)
 bool settingsNeedSave = false;
 static unsigned long lastSettingsSaveTime = 0;
 #define BOOT_SETTINGS_MAX 5
@@ -210,10 +220,21 @@ static uint8_t pendingChunkTotal = 0;  // 0 = no chunk send in progress
 static unsigned long pendingChunkSendTime = 0;  // Timeout: abort if no CHUNK_ACK for 15s
 static unsigned long nextChunkSendAt = 0;      // When to send next chunk from loop (set by CHUNK_ACK; don't send from callback)
 static unsigned long chunkResendAt = 0;         // When to resend current chunk after send failed (set by onDataSent FAIL)
+static uint8_t chunkResendCount = 0;            // Cap retries to avoid infinite resend loop (Main dedupes late arrivals)
 #define PRINT_CHUNK_SIZE 199  // For CHUNK_ACK handler and sendPrintChunked
 #define CHUNK_ACK_TIMEOUT_MS 15000
 #define CHUNK_RESEND_INTERVAL_MS 2000  // Resend current chunk every 2s until ACK or timeout
+#define CHUNK_MAX_RESENDS 8                     // Give up after 8 resends (~16s); Main will dedupe if late copy arrives
 bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1 = 0, uint8_t param2 = 0, const char* message = "", bool isRetry = false, bool fromSettingsQueue = false);
+
+// Reject filenames from untrusted sources (backend JSON, HTTP request bodies) that could escape the
+// intended SD directory via path traversal (e.g. "../data/config.json") - basenames only, no separators.
+static bool isSafeFilename(const String& name) {
+    if (name.length() == 0 || name.length() > 128) return false;
+    if (name.indexOf("..") >= 0) return false;
+    if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) return false;
+    return true;
+}
 
 // Reliable settings: handshake like printer (send → wait for ACK → done; resend on timeout)
 static uint8_t pendingSettingCommandType = 0;
@@ -226,7 +247,10 @@ static unsigned long pendingSettingNextSendAt = 0;
 void enqueueSettingCommand(uint8_t commandType, uint8_t param1, uint8_t param2, const char* message = "");
 static bool sendingFromSettingsQueue = false;  // So onDataSentStatic doesn't set retryPending for queue sends
 
-// Backend (Firebase or HTTP server) + Reminders
+// OTA updates
+OTAUpdateService* otaService = nullptr;
+
+// Backend (HTTP server) + Reminders
 IBackendService* backend = nullptr;
 ReminderService* reminderService = nullptr;
 bool remindersNeedSave = false;  // Flag to save reminders in background
@@ -240,7 +264,7 @@ static String pendingTestImagePath;
 // Audio
 AudioService audioSvc;
 
-// Groceries (Firebase)
+// Groceries (backend)
 #define MAX_GROCERY_ITEMS 50
 String groceryItems[MAX_GROCERY_ITEMS];
 int groceryCount = 0;
@@ -248,14 +272,14 @@ bool groceriesNeedSave = false;  // Flag to save groceries in background
 static unsigned long lastGrocerySaveTime = 0;
 static const unsigned long SAVE_DEBOUNCE_MS = 5000;  // Max one save per 5s
 
-// Todo list (Firebase)
+// Todo list (backend)
 #define MAX_TODO_ITEMS 50
 String todoItems[MAX_TODO_ITEMS];
 int todoCount = 0;
 bool todosNeedSave = false;  // Flag to save todos in background
 
 String deviceIP = "";
-String webPassword = MAIN_MODULE_API_PASSWORD;
+String webPassword = WEB_PASSWORD;
 String authToken = "";
 unsigned long authTokenExpiry = 0;
 const unsigned long AUTH_TOKEN_DURATION = 3600000;  // 1 hour
@@ -269,7 +293,7 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
         consecutiveFailures++;
         // Chunked print: resend current chunk from loop (don't use generic retry to avoid duplicates)
         if (pendingChunkTotal > 0 && (lastSentCommandType == CMD_PRINT_CHUNK || lastSentCommandType == CMD_PRINT_CHUNK_START)) {
-            chunkResendAt = millis() + 600;
+            chunkResendAt = millis() + 900;  // Longer backoff to avoid collision with Main's RX
             if (millis() - lastFailLog > 20000) {
                 Serial.println("[ESP-NOW] send failed, resending chunk");
                 lastFailLog = millis();
@@ -280,7 +304,7 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
             int maxRetries = isPumpCmd ? 2 : 1;  // Pump: up to 2 retries (3 attempts total)
             if (retryCount < maxRetries) {
                 retryPending = true;
-                retryAt = millis() + 600;
+                retryAt = millis() + 800;  // Backoff before retry
                 retryCount++;
                 if (millis() - lastFailLog > 20000) {
                     Serial.println("[ESP-NOW] send failed, retrying");
@@ -350,7 +374,7 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
                 // Setting handshake: Main got it, stop resending
                 if (pendingSettingRemainingSends > 0) {
                     pendingSettingRemainingSends = 0;
-                    // If we're applying boot settings from Firebase, enqueue next
+                    // If we're applying boot settings from backend, enqueue next
                     applyNextBootSetting();
                 }
             }
@@ -358,9 +382,10 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
     } else if (len >= (int)sizeof(ChunkAckPacket) && data[0] == ESP_NOW_MSG_CHUNK_ACK) {
         ChunkAckPacket* cap = (ChunkAckPacket*)data;
         if (verifyChecksum((uint8_t*)cap, sizeof(ChunkAckPacket)) && pendingChunkTotal > 0 && cap->chunkIndex == pendingChunkIndex) {
+            chunkResendCount = 0;  // Reset on success
             pendingChunkIndex++;
             if (pendingChunkIndex < pendingChunkTotal) {
-                nextChunkSendAt = millis() + 80;  // Send next chunk from loop (not here) so we never block callback
+                nextChunkSendAt = millis() + 120;  // Give Main time to process before next chunk
                 pendingChunkSendTime = millis();
             } else {
                 pendingChunkTotal = 0;
@@ -408,6 +433,7 @@ bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
     pendingChunkMessage = fullMessage;
     pendingChunkIndex = 0;
     pendingChunkTotal = (uint8_t)totalChunks;
+    chunkResendCount = 0;
     // param1: 0 = full receipt, 1 = message only (no title/date/weather)
     if (!sendCommandViaESPNow(CMD_PRINT_CHUNK_START, messageOnly ? 1 : 0, (uint8_t)totalChunks, "")) return false;
     delay(150);
@@ -656,6 +682,7 @@ static void touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
     if (pressed != touchLastState) {
         touchDebounceCount++;
         if (touchDebounceCount >= TOUCH_DEBOUNCE) {
+            lastDashboardTouchTime = millis();  // any touch pauses auto-rotate 2 min
             if (pressed) {
                 touchLastX = sx;
                 touchLastY = sy;
@@ -692,31 +719,15 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     lv_disp_flush_ready(drv);
 }
 
-// Nav: change screen by index (used by gesture and Back from settings)
+// Nav: change screen by index (bottom nav: 0=Home, 1=Sensors, 2=Media, 3=Settings)
 static lv_obj_t* screenByIndex(int idx) {
     switch (idx) {
-        case 0: return screen1;
-        case 1: return screen2;
-        case 2: return screen3;
-        case 3: return screen4;
-        case 4: return settingsScreen;
+        case 0: return screen1;   // Home
+        case 1: return screen2;   // Sensors
+        case 2: return mediaSubTab == 0 ? dashboardPhotoScreen : dashboardAudioScreen;  // Media
+        case 3: return settingsScreen;
         default: return screen1;
     }
-}
-
-// True if we're on one of the 4 main nav screens (swipe between these only)
-static bool isOnMainScreen() {
-    lv_obj_t* act = lv_scr_act();
-    return (act == screen1 || act == screen2 || act == screen3 || act == screen4);
-}
-static void goToScreen(int dir) {
-    currentScreenIndex = (currentScreenIndex + dir + SCREEN_COUNT) % SCREEN_COUNT;
-    if (currentScreenIndex == 2) refreshHistoryList();
-    lv_obj_t* scr = screenByIndex(currentScreenIndex);
-    lv_scr_load_anim(scr,
-        dir > 0 ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
-        180, 0, false);
-    updateNavHighlight(currentScreenIndex);
 }
 
 static void goToScreenIndex(int index) {
@@ -724,8 +735,6 @@ static void goToScreenIndex(int index) {
     if (index == currentScreenIndex) return;
     int dir = (index > currentScreenIndex) ? 1 : -1;
     currentScreenIndex = index;
-    if (currentScreenIndex == 3) lastMediaScreenOpenTime = (uint32_t)millis();
-    if (currentScreenIndex == 2) refreshHistoryList();
     lv_obj_t* scr = screenByIndex(currentScreenIndex);
     lv_scr_load_anim(scr,
         dir > 0 ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
@@ -736,6 +745,7 @@ static void goToScreenIndex(int index) {
 static void navBtnCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    lastDashboardTouchTime = millis();  // tab tap pauses auto-rotate 2 min
     goToScreenIndex(idx);
 }
 
@@ -778,6 +788,15 @@ static void updateStatusBar() {
             lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0xaaaaaa), 0);
         }
     }
+    if (statusIpLabel) {
+        if (WiFi.status() == WL_CONNECTED) {
+            String ip = WiFi.localIP().toString();
+            if (ip != deviceIP) deviceIP = ip;  // keep cached deviceIP in sync (e.g. after DHCP renewal)
+            lv_label_set_text(statusIpLabel, ip.c_str());
+        } else {
+            lv_label_set_text(statusIpLabel, "no wifi");
+        }
+    }
 }
 
 static void setScreenStyle(lv_obj_t* scr) {
@@ -804,20 +823,8 @@ static void applyBtnPressStyle(lv_obj_t* btn) {
 
 static void gesture_timer_cb(lv_timer_t* t) {
     (void)t;
-    if (!gesturePending) return;
+    // Navigation is tab-only (bottom nav bar); swipe gestures are intentionally not used for nav.
     gesturePending = false;
-    int32_t dx = gestureEndX - gestureStartX;
-    int32_t dy = gestureEndY - gestureStartY;
-    int32_t adx = dx < 0 ? -dx : dx;
-    int32_t ady = dy < 0 ? -dy : dy;
-    if (adx < SWIPE_THRESHOLD && ady < SWIPE_THRESHOLD) return;
-    if (settingsVisible) {
-        if (ady > adx && dy > 0) return;
-        if (ady > adx && dy < 0) { settingsVisible = false; showNavBar(); lv_scr_load(screenByIndex(currentScreenIndex)); updateNavHighlight(currentScreenIndex); return; }
-        if (adx >= ady) { settingsVisible = false; showNavBar(); lv_scr_load(screenByIndex(currentScreenIndex)); updateNavHighlight(currentScreenIndex); return; }
-        return;
-    }
-    // Navigation only via tab buttons; no horizontal swipe; Settings via Settings tab
 }
 
 static void volumeSliderCb(lv_event_t* e) {
@@ -829,15 +836,6 @@ static void volumeSliderCb(lv_event_t* e) {
     if (v > 100) v = 100;
     audioSvc.setVolume((float)v / 100.0f);
     if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", (int)v);
-}
-
-static void settingsBackCb(lv_event_t* e) {
-    (void)e;
-    settingsVisible = false;
-    currentScreenIndex = 0;
-    showNavBar();
-    lv_scr_load(screen1);
-    updateNavHighlight(0);
 }
 
 static void mediaOpenAudioCb(lv_event_t* e) {
@@ -858,31 +856,99 @@ static void mediaOpenImagesCb(lv_event_t* e) {
 
 static void audioBackToMediaCb(lv_event_t* e) {
     (void)e;
-    currentScreenIndex = 3;
+    mediaSubTab = 1;  // Audio
+    currentScreenIndex = 2;  // Media tab
     lastMediaScreenOpenTime = (uint32_t)millis();
-    lv_scr_load_anim(screen4, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    lv_scr_load_anim(dashboardAudioScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
     showNavBar();
-    updateNavHighlight(3);
+    updateNavHighlight(2);
 }
 
 static void imageListBackCb(lv_event_t* e) {
     (void)e;
-    currentScreenIndex = 3;
+    mediaSubTab = 0;  // Photo
+    currentScreenIndex = 2;  // Media tab
     lastMediaScreenOpenTime = (uint32_t)millis();
-    lv_scr_load_anim(screen4, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    lv_scr_load_anim(dashboardPhotoScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
     showNavBar();
-    updateNavHighlight(3);
+    updateNavHighlight(2);
+}
+
+// Switch which sub-screen the Media tab shows (Photo/Audio); no-op if Media tab isn't active
+static void switchMediaSubTab(int which) {
+    if (mediaSubTab == which) return;
+    mediaSubTab = which;
+    if (currentScreenIndex == 2) {
+        lv_scr_load(screenByIndex(2));
+    }
+}
+
+static void mediaTogglePhotoCb(lv_event_t* e) {
+    (void)e;
+    lastDashboardTouchTime = millis();
+    switchMediaSubTab(0);
+}
+
+static void mediaToggleAudioCb(lv_event_t* e) {
+    (void)e;
+    lastDashboardTouchTime = millis();
+    switchMediaSubTab(1);
+}
+
+static void historyOpenCb(lv_event_t* e) {
+    (void)e;
+    refreshHistoryList();
+    hideNavBar();
+    lv_scr_load_anim(screen3, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+}
+
+static void historyCloseCb(lv_event_t* e) {
+    (void)e;
+    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);  // reset to list view for next visit
+    currentScreenIndex = 0;  // Home
+    showNavBar();
+    lv_scr_load_anim(screen1, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
+    updateNavHighlight(0);
 }
 
 static void createControlPanel() {
-    // ---- Screen 1: Home (latest message + sensor summary) ----
+    // ---- Screen 1: Home (latest message + sensor summary + History button) ----
     screen1 = lv_obj_create(NULL);
     setScreenStyle(screen1);
     #define HOME_STRIP_H 22
-    int msgBoxH = TZT_CONTENT_H - HOME_STRIP_H - 2;
+    #define HOME_HEADER_H 36
+    lv_obj_t* homeHeader = lv_obj_create(screen1);
+    lv_obj_set_size(homeHeader, TZT_SCREEN_WIDTH - 8, HOME_HEADER_H);
+    lv_obj_set_pos(homeHeader, 4, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_opa(homeHeader, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(homeHeader, 0, 0);
+    lv_obj_set_style_pad_all(homeHeader, 0, 0);
+    lv_obj_clear_flag(homeHeader, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* homeTitle = lv_label_create(homeHeader);
+    lv_label_set_text(homeTitle, LV_SYMBOL_ENVELOPE " Latest Message");
+    lv_obj_set_style_text_color(homeTitle, lv_color_hex(0x99bb88), 0);
+    lv_obj_set_style_text_font(homeTitle, &lv_font_montserrat_14, 0);
+    lv_obj_align(homeTitle, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t* historyBtn = lv_btn_create(homeHeader);
+    applyBtnPressStyle(historyBtn);
+    lv_obj_set_size(historyBtn, 92, HOME_HEADER_H - 4);
+    lv_obj_align(historyBtn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(historyBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_border_color(historyBtn, lv_color_hex(0x3a6820), 0);
+    lv_obj_set_style_border_width(historyBtn, 1, 0);
+    lv_obj_set_style_radius(historyBtn, 6, 0);
+    lv_obj_t* historyLbl = lv_label_create(historyBtn);
+    lv_label_set_text(historyLbl, LV_SYMBOL_LIST " History");
+    lv_obj_set_style_text_font(historyLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(historyLbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_center(historyLbl);
+    lv_obj_add_event_cb(historyBtn, historyOpenCb, LV_EVENT_CLICKED, nullptr);
+
+    int msgBoxTop = TZT_CONTENT_TOP + HOME_HEADER_H + 2;
+    int msgBoxH = TZT_CONTENT_H - HOME_HEADER_H - HOME_STRIP_H - 6;
     lv_obj_t* msgBox = lv_obj_create(screen1);
     lv_obj_set_size(msgBox, TZT_SCREEN_WIDTH - 8, msgBoxH);
-    lv_obj_set_pos(msgBox, 4, TZT_CONTENT_TOP);
+    lv_obj_set_pos(msgBox, 4, msgBoxTop);
     lv_obj_set_style_bg_color(msgBox, lv_color_hex(0x142e0a), 0);
     lv_obj_set_style_bg_opa(msgBox, LV_OPA_90, 0);
     lv_obj_set_style_border_color(msgBox, lv_color_hex(0x3a6820), 0);
@@ -903,7 +969,7 @@ static void createControlPanel() {
     lv_obj_set_style_text_color(homeSensorStrip, lv_color_hex(0x99cc77), 0);
     lv_obj_set_style_text_font(homeSensorStrip, &lv_font_montserrat_14, 0);
     lv_label_set_text(homeSensorStrip, LV_SYMBOL_CHARGE " --   San --   LED --   Pump --");
-    lv_obj_set_pos(homeSensorStrip, 8, TZT_CONTENT_TOP + msgBoxH + 4);
+    lv_obj_set_pos(homeSensorStrip, 8, msgBoxTop + msgBoxH + 4);
 
     // ---- Screen 2: Sensor Data with progress bars ----
     screen2 = lv_obj_create(NULL);
@@ -959,12 +1025,40 @@ static void createControlPanel() {
         addSensorCard(1, 1, LV_SYMBOL_POWER, "Pump", labelPump, noBar);
     }
 
-    // ---- Screen 3: History (messages from SD) ----
+    // ---- Screen 3: History (messages from SD) - reached via History button on Home ----
     screen3 = lv_obj_create(NULL);
     setScreenStyle(screen3);
+    lv_obj_t* historyHeaderBar = lv_obj_create(screen3);
+    lv_obj_set_size(historyHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
+    lv_obj_set_pos(historyHeaderBar, 0, 0);
+    lv_obj_set_style_bg_color(historyHeaderBar, lv_color_hex(0x0d1f07), 0);
+    lv_obj_set_style_border_color(historyHeaderBar, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_border_width(historyHeaderBar, 1, 0);
+    lv_obj_set_style_border_side(historyHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_radius(historyHeaderBar, 0, 0);
+    lv_obj_set_style_pad_all(historyHeaderBar, 0, 0);
+    lv_obj_clear_flag(historyHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* historyHomeBtn = lv_btn_create(historyHeaderBar);
+    applyBtnPressStyle(historyHomeBtn);
+    lv_obj_set_size(historyHomeBtn, 100, TZT_MIN_TOUCH_H);
+    lv_obj_align(historyHomeBtn, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_set_style_bg_color(historyHomeBtn, lv_color_hex(0x2d5016), 0);
+    lv_obj_set_style_radius(historyHomeBtn, 8, 0);
+    lv_obj_t* historyHomeLbl = lv_label_create(historyHomeBtn);
+    lv_label_set_text(historyHomeLbl, LV_SYMBOL_LEFT " Home");
+    lv_obj_set_style_text_font(historyHomeLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(historyHomeLbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_center(historyHomeLbl);
+    lv_obj_add_event_cb(historyHomeBtn, historyCloseCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* historyTitleLbl = lv_label_create(historyHeaderBar);
+    lv_label_set_text(historyTitleLbl, LV_SYMBOL_LIST " History");
+    lv_obj_set_style_text_color(historyTitleLbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(historyTitleLbl, &lv_font_montserrat_18, 0);
+    lv_obj_align(historyTitleLbl, LV_ALIGN_CENTER, 0, 0);
+
     historyList = lv_list_create(screen3);
-    lv_obj_set_size(historyList, TZT_SCREEN_WIDTH - 4, TZT_CONTENT_H);
-    lv_obj_set_pos(historyList, 2, TZT_CONTENT_TOP);
+    lv_obj_set_size(historyList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
+    lv_obj_set_pos(historyList, 4, TZT_HEADER_BAR_H + 4);
     lv_obj_set_style_bg_color(historyList, lv_color_hex(0x142e0a), 0);
     lv_obj_set_style_bg_opa(historyList, LV_OPA_90, 0);
     lv_obj_set_style_border_color(historyList, lv_color_hex(0x3a6820), 0);
@@ -977,8 +1071,8 @@ static void createControlPanel() {
     refreshHistoryList();
 
     historyDetail = lv_obj_create(screen3);
-    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH - 8, TZT_CONTENT_H);
-    lv_obj_set_pos(historyDetail, 4, TZT_CONTENT_TOP);
+    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
+    lv_obj_set_pos(historyDetail, 4, TZT_HEADER_BAR_H + 4);
     lv_obj_set_style_bg_color(historyDetail, lv_color_hex(0x0d1f07), 0);
     lv_obj_set_style_bg_opa(historyDetail, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(historyDetail, lv_color_hex(0x4a7c2a), 0);
@@ -1006,61 +1100,6 @@ static void createControlPanel() {
     lv_obj_set_style_text_font(backLbl, &lv_font_montserrat_16, 0);
     lv_obj_center(backLbl);
     lv_obj_add_event_cb(backBtn, historyBackCb, LV_EVENT_CLICKED, nullptr);
-
-    // ---- Screen 4: Media hub (Audio + Images) ----
-    screen4 = lv_obj_create(NULL);
-    setScreenStyle(screen4);
-    {
-        int mediaBtnW = TZT_SCREEN_WIDTH - TZT_LIST_PAD * 2;
-        int mediaGap = 6;
-        int mediaBtnH = (TZT_CONTENT_H - TZT_LIST_PAD * 2 - mediaGap) / 2;
-        int mediaY = TZT_CONTENT_TOP + TZT_LIST_PAD;
-        lv_obj_t* audioHubBtn = lv_btn_create(screen4);
-        applyBtnPressStyle(audioHubBtn);
-        lv_obj_set_size(audioHubBtn, mediaBtnW, mediaBtnH);
-        lv_obj_set_pos(audioHubBtn, TZT_LIST_PAD, mediaY);
-        lv_obj_set_style_bg_color(audioHubBtn, lv_color_hex(0x1e4210), 0);
-        lv_obj_set_style_border_color(audioHubBtn, lv_color_hex(0x3a6820), 0);
-        lv_obj_set_style_border_width(audioHubBtn, 1, 0);
-        lv_obj_set_style_radius(audioHubBtn, 8, 0);
-        lv_obj_t* audioIcon = lv_label_create(audioHubBtn);
-        lv_label_set_text(audioIcon, LV_SYMBOL_AUDIO);
-        lv_obj_set_style_text_font(audioIcon, &lv_font_montserrat_18, 0);
-        lv_obj_align(audioIcon, LV_ALIGN_LEFT_MID, 4, -6);
-        lv_obj_t* audioTitle = lv_label_create(audioHubBtn);
-        lv_label_set_text(audioTitle, "Play Audio");
-        lv_obj_set_style_text_font(audioTitle, &lv_font_montserrat_16, 0);
-        lv_obj_align(audioTitle, LV_ALIGN_LEFT_MID, 30, -6);
-        lv_obj_t* audioHint = lv_label_create(audioHubBtn);
-        lv_label_set_text(audioHint, "Browse and play sound files from SD");
-        lv_obj_set_style_text_font(audioHint, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(audioHint, lv_color_hex(0x88aa77), 0);
-        lv_obj_align(audioHint, LV_ALIGN_LEFT_MID, 4, 12);
-        lv_obj_add_event_cb(audioHubBtn, mediaOpenAudioCb, LV_EVENT_CLICKED, nullptr);
-
-        lv_obj_t* imagesHubBtn = lv_btn_create(screen4);
-        applyBtnPressStyle(imagesHubBtn);
-        lv_obj_set_size(imagesHubBtn, mediaBtnW, mediaBtnH);
-        lv_obj_set_pos(imagesHubBtn, TZT_LIST_PAD, mediaY + mediaBtnH + mediaGap);
-        lv_obj_set_style_bg_color(imagesHubBtn, lv_color_hex(0x1e4210), 0);
-        lv_obj_set_style_border_color(imagesHubBtn, lv_color_hex(0x3a6820), 0);
-        lv_obj_set_style_border_width(imagesHubBtn, 1, 0);
-        lv_obj_set_style_radius(imagesHubBtn, 8, 0);
-        lv_obj_t* imgIcon = lv_label_create(imagesHubBtn);
-        lv_label_set_text(imgIcon, LV_SYMBOL_IMAGE);
-        lv_obj_set_style_text_font(imgIcon, &lv_font_montserrat_18, 0);
-        lv_obj_align(imgIcon, LV_ALIGN_LEFT_MID, 4, -6);
-        lv_obj_t* imgTitle = lv_label_create(imagesHubBtn);
-        lv_label_set_text(imgTitle, "View Images");
-        lv_obj_set_style_text_font(imgTitle, &lv_font_montserrat_16, 0);
-        lv_obj_align(imgTitle, LV_ALIGN_LEFT_MID, 30, -6);
-        lv_obj_t* imgHint = lv_label_create(imagesHubBtn);
-        lv_label_set_text(imgHint, "Browse photos and images from SD");
-        lv_obj_set_style_text_font(imgHint, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(imgHint, lv_color_hex(0x88aa77), 0);
-        lv_obj_align(imgHint, LV_ALIGN_LEFT_MID, 4, 12);
-        lv_obj_add_event_cb(imagesHubBtn, mediaOpenImagesCb, LV_EVENT_CLICKED, nullptr);
-    }
 
     // ---- Audio list sub-screen (from Media) ----
     audioListScreen = lv_obj_create(NULL);
@@ -1169,8 +1208,125 @@ static void createControlPanel() {
     lv_obj_add_flag(imageViewerScreen, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(imageViewerScreen, imageBackCb, LV_EVENT_CLICKED, nullptr);
 
+    #define MEDIA_TOGGLE_H 32
+    #define MEDIA_TOGGLE_GAP 6
+    #define MEDIA_CONTENT_TOP (TZT_CONTENT_TOP + MEDIA_TOGGLE_H + MEDIA_TOGGLE_GAP)
+    int mediaToggleBtnW = (TZT_SCREEN_WIDTH - 16 - 4) / 2;
+
+    // ---- Media tab, Photo sub-tab (full-area image when active; drawn in loop) ----
+    dashboardPhotoScreen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(dashboardPhotoScreen, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(dashboardPhotoScreen, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(dashboardPhotoScreen, 0, 0);
+    lv_obj_set_size(dashboardPhotoScreen, TZT_SCREEN_WIDTH, TZT_SCREEN_HEIGHT);
+    {
+        lv_obj_t* toggleRow = lv_obj_create(dashboardPhotoScreen);
+        lv_obj_set_size(toggleRow, TZT_SCREEN_WIDTH - 16, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleRow, 8, TZT_CONTENT_TOP);
+        lv_obj_set_style_bg_opa(toggleRow, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(toggleRow, 0, 0);
+        lv_obj_set_style_pad_all(toggleRow, 0, 0);
+        lv_obj_clear_flag(toggleRow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* toggleBtnPhoto = lv_btn_create(toggleRow);
+        lv_obj_set_size(toggleBtnPhoto, mediaToggleBtnW, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleBtnPhoto, 0, 0);
+        lv_obj_set_style_bg_color(toggleBtnPhoto, lv_color_hex(0x2a5514), 0);  // active
+        lv_obj_set_style_radius(toggleBtnPhoto, 6, 0);
+        lv_obj_t* toggleLblPhoto = lv_label_create(toggleBtnPhoto);
+        lv_label_set_text(toggleLblPhoto, LV_SYMBOL_IMAGE " Photo");
+        lv_obj_set_style_text_font(toggleLblPhoto, &lv_font_montserrat_14, 0);
+        lv_obj_center(toggleLblPhoto);
+        lv_obj_add_event_cb(toggleBtnPhoto, mediaTogglePhotoCb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* toggleBtnAudio = lv_btn_create(toggleRow);
+        lv_obj_set_size(toggleBtnAudio, mediaToggleBtnW, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleBtnAudio, mediaToggleBtnW + 4, 0);
+        lv_obj_set_style_bg_color(toggleBtnAudio, lv_color_hex(0x0a1806), 0);  // inactive
+        lv_obj_set_style_radius(toggleBtnAudio, 6, 0);
+        lv_obj_t* toggleLblAudio = lv_label_create(toggleBtnAudio);
+        lv_label_set_text(toggleLblAudio, LV_SYMBOL_AUDIO " Audio");
+        lv_obj_set_style_text_font(toggleLblAudio, &lv_font_montserrat_14, 0);
+        lv_obj_center(toggleLblAudio);
+        lv_obj_add_event_cb(toggleBtnAudio, mediaToggleAudioCb, LV_EVENT_CLICKED, nullptr);
+    }
+    lv_obj_t* photoTitle = lv_label_create(dashboardPhotoScreen);
+    lv_label_set_text(photoTitle, LV_SYMBOL_IMAGE " Latest photo");
+    lv_obj_set_style_text_color(photoTitle, lv_color_hex(0x99bb88), 0);
+    lv_obj_set_style_text_font(photoTitle, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(photoTitle, 8, MEDIA_CONTENT_TOP);
+    lv_obj_t* photoPlaceholder = lv_label_create(dashboardPhotoScreen);
+    lv_label_set_text(photoPlaceholder, "No photo yet");
+    lv_obj_set_style_text_color(photoPlaceholder, lv_color_hex(0x668866), 0);
+    lv_obj_set_style_text_font(photoPlaceholder, &lv_font_montserrat_14, 0);
+    lv_obj_center(photoPlaceholder);
+    lv_obj_t* galleryBtn = lv_btn_create(dashboardPhotoScreen);
+    applyBtnPressStyle(galleryBtn);
+    lv_obj_set_size(galleryBtn, 90, TZT_MIN_TOUCH_H);
+    lv_obj_align(galleryBtn, LV_ALIGN_TOP_RIGHT, -8, MEDIA_CONTENT_TOP);
+    lv_obj_set_style_radius(galleryBtn, 6, 0);
+    lv_obj_t* galleryLbl = lv_label_create(galleryBtn);
+    lv_label_set_text(galleryLbl, "Gallery");
+    lv_obj_center(galleryLbl);
+    lv_obj_add_event_cb(galleryBtn, mediaOpenImagesCb, LV_EVENT_CLICKED, nullptr);
+
+    // ---- Media tab, Audio sub-tab ----
+    dashboardAudioScreen = lv_obj_create(NULL);
+    setScreenStyle(dashboardAudioScreen);
+    {
+        lv_obj_t* toggleRow = lv_obj_create(dashboardAudioScreen);
+        lv_obj_set_size(toggleRow, TZT_SCREEN_WIDTH - 16, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleRow, 8, TZT_CONTENT_TOP);
+        lv_obj_set_style_bg_opa(toggleRow, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(toggleRow, 0, 0);
+        lv_obj_set_style_pad_all(toggleRow, 0, 0);
+        lv_obj_clear_flag(toggleRow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* toggleBtnPhoto = lv_btn_create(toggleRow);
+        lv_obj_set_size(toggleBtnPhoto, mediaToggleBtnW, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleBtnPhoto, 0, 0);
+        lv_obj_set_style_bg_color(toggleBtnPhoto, lv_color_hex(0x0a1806), 0);  // inactive
+        lv_obj_set_style_radius(toggleBtnPhoto, 6, 0);
+        lv_obj_t* toggleLblPhoto = lv_label_create(toggleBtnPhoto);
+        lv_label_set_text(toggleLblPhoto, LV_SYMBOL_IMAGE " Photo");
+        lv_obj_set_style_text_font(toggleLblPhoto, &lv_font_montserrat_14, 0);
+        lv_obj_center(toggleLblPhoto);
+        lv_obj_add_event_cb(toggleBtnPhoto, mediaTogglePhotoCb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* toggleBtnAudio = lv_btn_create(toggleRow);
+        lv_obj_set_size(toggleBtnAudio, mediaToggleBtnW, MEDIA_TOGGLE_H);
+        lv_obj_set_pos(toggleBtnAudio, mediaToggleBtnW + 4, 0);
+        lv_obj_set_style_bg_color(toggleBtnAudio, lv_color_hex(0x2a5514), 0);  // active
+        lv_obj_set_style_radius(toggleBtnAudio, 6, 0);
+        lv_obj_t* toggleLblAudio = lv_label_create(toggleBtnAudio);
+        lv_label_set_text(toggleLblAudio, LV_SYMBOL_AUDIO " Audio");
+        lv_obj_set_style_text_font(toggleLblAudio, &lv_font_montserrat_14, 0);
+        lv_obj_center(toggleLblAudio);
+        lv_obj_add_event_cb(toggleBtnAudio, mediaToggleAudioCb, LV_EVENT_CLICKED, nullptr);
+    }
+    lv_obj_t* audioTitle = lv_label_create(dashboardAudioScreen);
+    lv_label_set_text(audioTitle, LV_SYMBOL_AUDIO " Latest audio");
+    lv_obj_set_style_text_color(audioTitle, lv_color_hex(0x99bb88), 0);
+    lv_obj_set_style_text_font(audioTitle, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(audioTitle, 8, MEDIA_CONTENT_TOP);
+    dashboardAudioNameLabel = lv_label_create(dashboardAudioScreen);
+    lv_label_set_text(dashboardAudioNameLabel, "No audio yet");
+    lv_obj_set_style_text_color(dashboardAudioNameLabel, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_set_style_text_font(dashboardAudioNameLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(dashboardAudioNameLabel, 8, MEDIA_CONTENT_TOP + TZT_MIN_TOUCH_H + 4);
+    lv_obj_set_width(dashboardAudioNameLabel, TZT_SCREEN_WIDTH - 16);
+    lv_label_set_long_mode(dashboardAudioNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_t* playlistBtn = lv_btn_create(dashboardAudioScreen);
+    applyBtnPressStyle(playlistBtn);
+    lv_obj_set_size(playlistBtn, 90, TZT_MIN_TOUCH_H);
+    lv_obj_align(playlistBtn, LV_ALIGN_TOP_RIGHT, -8, MEDIA_CONTENT_TOP);
+    lv_obj_set_style_radius(playlistBtn, 6, 0);
+    lv_obj_t* playlistLbl = lv_label_create(playlistBtn);
+    lv_label_set_text(playlistLbl, "Playlist");
+    lv_obj_center(playlistLbl);
+    lv_obj_add_event_cb(playlistBtn, mediaOpenAudioCb, LV_EVENT_CLICKED, nullptr);
+
     currentScreenIndex = 0;
-    lv_scr_load(screen1);
+    mediaSubTab = 0;
+    lastDashboardTouchTime = millis();
+    lastDashboardAutoAdvance = millis();
+    lv_scr_load(screen1);  // start on Home tab
 
     // ---- Bottom navigation bar (icons + labels) ----
     {
@@ -1185,15 +1341,16 @@ static void createControlPanel() {
         lv_obj_set_style_radius(navBarContainer, 0, 0);
         lv_obj_set_style_pad_all(navBarContainer, 0, 0);
         lv_obj_clear_flag(navBarContainer, LV_OBJ_FLAG_SCROLLABLE);
-        const char* navIcons[]  = { LV_SYMBOL_ENVELOPE, LV_SYMBOL_EYE_OPEN, LV_SYMBOL_LIST, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
-        const char* navLabels[] = { "Home", "Status", "Log", "Media", "Settings" };
-        int btnW = TZT_SCREEN_WIDTH / SCREEN_COUNT;
+        const char* navIcons[]  = { LV_SYMBOL_HOME, LV_SYMBOL_EYE_OPEN, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
+        const char* navLabels[] = { "Home", "Sensors", "Media", "Settings" };
+        // Real gaps between tabs so adjacent taps don't misfire (see TZT_NAV_BTN_GAP)
+        int btnW = (TZT_SCREEN_WIDTH - TZT_NAV_BTN_GAP * (SCREEN_COUNT + 1)) / SCREEN_COUNT;
         for (int i = 0; i < SCREEN_COUNT; i++) {
             lv_obj_t* btn = lv_btn_create(navBarContainer);
             applyBtnPressStyle(btn);
-            lv_obj_set_size(btn, btnW - 1, TZT_NAV_BAR_H - 2);
-            lv_obj_set_pos(btn, i * btnW, 1);
-            lv_obj_set_style_radius(btn, 0, 0);
+            lv_obj_set_size(btn, btnW, TZT_NAV_BAR_H - 2);
+            lv_obj_set_pos(btn, TZT_NAV_BTN_GAP + i * (btnW + TZT_NAV_BTN_GAP), 1);
+            lv_obj_set_style_radius(btn, 6, 0);
             lv_obj_set_style_bg_color(btn, i == 0 ? lv_color_hex(0x2a5514) : lv_color_hex(0x0a1806), 0);
             lv_obj_set_style_border_width(btn, 0, 0);
             lv_obj_set_style_shadow_width(btn, 0, 0);
@@ -1235,6 +1392,13 @@ static void createControlPanel() {
         lv_obj_set_style_text_color(appName, lv_color_hex(0x88aa77), 0);
         lv_obj_align(appName, LV_ALIGN_LEFT_MID, 0, 0);
 
+        statusIpLabel = lv_label_create(statusBar);
+        lv_label_set_text(statusIpLabel, "");
+        lv_obj_set_style_text_font(statusIpLabel, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(statusIpLabel, lv_color_hex(0x668866), 0);
+        lv_obj_align_to(statusIpLabel, appName, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+
+        // Settings is reached via the bottom nav tab now (was a tiny 28x14 corner button - too small to tap reliably)
         statusTimeLabel = lv_label_create(statusBar);
         lv_label_set_text(statusTimeLabel, "--:--");
         lv_obj_set_style_text_font(statusTimeLabel, &lv_font_montserrat_14, 0);
@@ -1309,21 +1473,7 @@ static void createControlPanel() {
     lv_obj_set_style_text_color(settingsVolumeValueLabel, lv_color_hex(0xe8e8e8), 0);
     lv_obj_set_pos(settingsVolumeValueLabel, setCardW - 42, 26);
 
-    // Back to Home button (same style as other nav buttons)
-    lv_obj_t* setBackBtn = lv_btn_create(settingsScreen);
-    applyBtnPressStyle(setBackBtn);
-    lv_obj_set_size(setBackBtn, 100, TZT_MIN_TOUCH_H);
-    lv_obj_align(setBackBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(setBackBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_border_color(setBackBtn, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(setBackBtn, 1, 0);
-    lv_obj_set_style_radius(setBackBtn, 8, 0);
-    lv_obj_t* setBackLbl = lv_label_create(setBackBtn);
-    lv_label_set_text(setBackLbl, LV_SYMBOL_HOME " Home");
-    lv_obj_set_style_text_font(setBackLbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(setBackLbl, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_center(setBackLbl);
-    lv_obj_add_event_cb(setBackBtn, settingsBackCb, LV_EVENT_CLICKED, nullptr);
+    // No "Back to Home" button needed - Settings is a normal bottom-nav tab, just tap Home to leave.
 
     updateStatusBar();  // set WiFi label on Settings screen
     updateNavHighlight(0);
@@ -1598,6 +1748,7 @@ static void imageFileCb(lv_event_t* e) {
     String lower = imageFileNames[idx];
     lower.toLowerCase();
 #if !defined(TZT_HEADLESS)
+    lastDashboardImagePath = path;
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
         currentImagePath = path;
         hideNavBar();
@@ -2418,6 +2569,7 @@ void handleTestPlayAudio() {
     }
     if (file.length() == 0 && n > 0) file = names[0];
     if (file.length() == 0) { server.send(404, "application/json", "{\"error\":\"No audio files on SD. Put files in " AUDIO_DIR "\"}"); return; }
+    if (!isSafeFilename(file)) { server.send(400, "application/json", "{\"error\":\"Invalid filename\"}"); return; }
     String path = String(AUDIO_DIR) + "/" + file;
     bool ok = audioSvc.playFile(path);
     server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Playback failed\"}");
@@ -2441,7 +2593,9 @@ void handleTestShowImage() {
     }
     if (file.length() == 0 && n > 0) file = names[0];
     if (file.length() == 0) { server.send(404, "application/json", "{\"error\":\"No images on SD. Put files in " IMAGES_DIR "\"}"); return; }
+    if (!isSafeFilename(file)) { server.send(400, "application/json", "{\"error\":\"Invalid filename\"}"); return; }
     pendingTestImagePath = String(IMAGES_DIR) + "/" + file;
+    lastDashboardImagePath = pendingTestImagePath;
     server.send(200, "application/json", JSON_SUCCESS);
 #endif
 }
@@ -2972,7 +3126,7 @@ void handleRoot() {
             <div style="display:flex;gap:8px;margin-top:8px;">
                 <button type="button" class="btn-success" onclick="loadImages()" style="flex:1;">Refresh</button>
             </div>
-            <div style="margin-top:8px;font-size:12px;color:#888;">Add in Firebase: /images → url, name; TZT downloads to SD.</div>
+            <div style="margin-top:8px;font-size:12px;color:#888;">Add via backend /api/images → url, name; TZT downloads to SD.</div>
         </div>
         </details>
     </div>
@@ -3487,6 +3641,7 @@ void setupWebServer() {
         }
         String file = doc["file"] | "";
         if (file.length() == 0) { server.send(400, "application/json", "{\"error\":\"Missing file\"}"); return; }
+        if (!isSafeFilename(file)) { server.send(400, "application/json", "{\"error\":\"Invalid filename\"}"); return; }
         String path = String(AUDIO_DIR) + "/" + file;
         bool ok = audioSvc.playFile(path);
         server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Playback failed\"}");
@@ -3543,6 +3698,10 @@ void setupWebServer() {
             server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
             return;
         }
+        if (!isSafeFilename(name)) {
+            server.send(400, "application/json", "{\"error\":\"Invalid filename\"}");
+            return;
+        }
         String path = String(IMAGES_MEDIA_DIR) + "/" + name;
         if (SD.exists(path)) { server.send(200, "application/json", JSON_SUCCESS); return; }
         HTTPClient http;
@@ -3568,23 +3727,18 @@ void setupWebServer() {
     });
 
     server.begin();
-    
-    Serial.println("🌐 TZT Display Web Server started on http://" + deviceIP + ":8080");
-    Serial.println("   • Firebase + ESP-NOW to Main ESP32 (no HTTP proxy)");
-    Serial.println("   💡 Try: http://" + deviceIP + ":8080/login");
 }
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    esp_task_wdt_init(60, true);   // 60s so setup (WiFi portal + Firebase + display) doesn't trigger
+    esp_task_wdt_init(60, true);   // 60s so setup (WiFi portal + backend + display) doesn't trigger
     esp_task_wdt_add(NULL);        // Current task (loop) is watched
     
-    Serial.println("TZT Display v" + String(FIRMWARE_VERSION));
-
     // Initialize WiFi
     WiFiManager wifiManager;
+    wifiManager.setDebugOutput(false);  // Suppress *wm: verbose logs
     wifiManager.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), 
                                      IPAddress(192, 168, 4, 1), 
                                      IPAddress(255, 255, 255, 0));
@@ -3601,10 +3755,8 @@ void setup() {
     
     if (WiFi.status() == WL_CONNECTED) {
         deviceIP = WiFi.localIP().toString();
-        Serial.println("WiFi: " + deviceIP + " | " + WiFi.macAddress());
     } else {
         deviceIP = "192.168.4.1";
-        Serial.println("WiFi: AP mode 192.168.4.1");
     }
 
 #if (BOARD_LED_PIN >= 0)
@@ -3612,15 +3764,19 @@ void setup() {
     digitalWrite(BOARD_LED_PIN, BOARD_LED_ACTIVE_LOW ? HIGH : LOW);  // Off until WiFi connected
 #endif
 
+    // Initialize OTA service
+    otaService = new OTAUpdateService();
+    #ifdef OTA_PASSWORD
+    otaService->initialize("TZT-Display", OTA_PASSWORD);
+    #else
+    otaService->initialize("TZT-Display");
+    #endif
+
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
     esp_task_wdt_reset();  // Feed WDT before backend init
     Logger::setLevel(LOG_LEVEL_WARN);
-#if USE_HTTP_BACKEND
     backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT);
-#else
-    backend = new FirebaseService(FIREBASE_DATABASE_URL, FIREBASE_TIMEOUT);
-#endif
     backend->setRetryPolicy(3, 1000);
     backend->setRateLimit(60);
     reminderService = new ReminderService(backend);
@@ -3633,12 +3789,13 @@ void setup() {
     loadGroceries();
     loadTodos();
     loadSettingsFromSD();  // Restore LED, autoDispense, autoBrightness, pump duration/cooldown; send to Main
-    Serial.println("Backend + SD + settings OK");
 
     // Initialize SD card (VSPI — independent of display HSPI)
     if (sdCard.begin()) {
         sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
         audioSvc.begin();
+    } else {
+        Serial.println("[SD] Skipped: message history & media will use backend only");
     }
 
     esp_task_wdt_reset();  // Feed WDT before display init
@@ -3720,11 +3877,6 @@ void setup() {
                 delay(100);  // Small delay for peer to be fully registered
                 if (esp_now_is_peer_exist(mainESP32Mac)) {
                     espNowInitialized = true;
-                    char macBuf[18];
-                    snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
-                        mainESP32Mac[0], mainESP32Mac[1], mainESP32Mac[2],
-                        mainESP32Mac[3], mainESP32Mac[4], mainESP32Mac[5]);
-                    Serial.println("ESP-NOW OK → Main " + String(macBuf) + " ch=" + String(peerInfo.channel));
                     if (bootSettingsCount > 0 && bootSettingsIndex < bootSettingsCount)
                         applyNextBootSetting();
                 } else {
@@ -3751,12 +3903,12 @@ void setup() {
     }
     
     setupWebServer();
-    Serial.println("Web http://" + deviceIP + ":8080");
-    Serial.println("Ready.");
+    Serial.println("TZT Display ready | http://" + deviceIP + ":8080");
 }
 
 void loop() {
     esp_task_wdt_reset();
+    if (otaService) otaService->handle();
     server.handleClient();
 
 #if !defined(TZT_HEADLESS)
@@ -3837,6 +3989,14 @@ void loop() {
         pendingChunkSendTime = 0;
         nextChunkSendAt = 0;
         chunkResendAt = 0;
+        chunkResendCount = 0;
+    }
+    // Cap chunk resends to stop infinite retry loop; Main dedupes if late copy arrives
+    if (pendingChunkTotal > 0 && chunkResendCount >= CHUNK_MAX_RESENDS) {
+        pendingChunkTotal = 0;
+        nextChunkSendAt = 0;
+        chunkResendAt = 0;
+        chunkResendCount = 0;
     }
     // Send next chunk from loop (after CHUNK_ACK received) — never send from callback
     if (espNowInitialized && pendingChunkTotal > 0 && nextChunkSendAt > 0 && millis() >= nextChunkSendAt) {
@@ -3846,14 +4006,16 @@ void loop() {
         sendCommandViaESPNow(CMD_PRINT_CHUNK, (uint8_t)pendingChunkIndex, pendingChunkTotal, chunk.c_str());
     }
     // Resend current chunk after send failed (chunk-level retry so prints never fail)
-    if (espNowInitialized && pendingChunkTotal > 0 && chunkResendAt > 0 && millis() >= chunkResendAt) {
+    if (espNowInitialized && pendingChunkTotal > 0 && chunkResendCount < CHUNK_MAX_RESENDS && chunkResendAt > 0 && millis() >= chunkResendAt) {
         chunkResendAt = 0;
+        chunkResendCount++;
         pendingChunkSendTime = millis();
         String chunk = pendingChunkMessage.substring(pendingChunkIndex * PRINT_CHUNK_SIZE, (pendingChunkIndex + 1) * PRINT_CHUNK_SIZE);
         sendCommandViaESPNow(CMD_PRINT_CHUNK, (uint8_t)pendingChunkIndex, pendingChunkTotal, chunk.c_str(), true);
     }
     // Periodic resend: if no CHUNK_ACK for 2s, resend current chunk (handshake never stalls)
-    if (espNowInitialized && pendingChunkTotal > 0 && pendingChunkSendTime > 0 && (millis() - pendingChunkSendTime) > CHUNK_RESEND_INTERVAL_MS) {
+    if (espNowInitialized && pendingChunkTotal > 0 && chunkResendCount < CHUNK_MAX_RESENDS && pendingChunkSendTime > 0 && (millis() - pendingChunkSendTime) > CHUNK_RESEND_INTERVAL_MS) {
+        chunkResendCount++;
         pendingChunkSendTime = millis();
         String chunk = pendingChunkMessage.substring(pendingChunkIndex * PRINT_CHUNK_SIZE, (pendingChunkIndex + 1) * PRINT_CHUNK_SIZE);
         sendCommandViaESPNow(CMD_PRINT_CHUNK, (uint8_t)pendingChunkIndex, pendingChunkTotal, chunk.c_str(), true);
@@ -3863,7 +4025,10 @@ void loop() {
         sendingFromSettingsQueue = true;
         sendCommandViaESPNow(pendingSettingCommandType, pendingSettingParam1, pendingSettingParam2, pendingSettingMessage, false, true);
         sendingFromSettingsQueue = false;
-        pendingSettingRemainingSends--;
+        // Guard against underflow: the ACK can arrive (on the ESP-NOW task) while the blocking send
+        // above was still running, already zeroing this out - an unconditional decrement would wrap
+        // a uint8_t 0 to 255, causing ~100s of unnecessary resends of an already-applied setting.
+        if (pendingSettingRemainingSends > 0) pendingSettingRemainingSends--;
         pendingSettingNextSendAt = millis() + SETTINGS_ACK_TIMEOUT_MS;  // Next attempt only if no ACK
     }
     // Retry TZT→Main command once if previous send callback reported FAIL (skip for chunked print — chunk resend handles it)
@@ -3963,13 +4128,13 @@ void loop() {
         saveTodos();
     }
     
-    // Save reminders to SD (no Firebase)
+    // Save reminders to SD
     if (remindersNeedSave && reminderService && sdCard.isReady()) {
         remindersNeedSave = false;
         sdCard.writeFile(DATA_DIR "/reminders.json", reminderService->toJSON());
     }
 
-    // Poll backend /commands with adaptive interval (Firebase or HTTP server)
+    // Poll backend /commands with adaptive interval (HTTP server)
     static unsigned long lastCmd = 0;
     static unsigned long backendPollInterval = 30000;
     static unsigned long lastCommandFound = 0;
@@ -3982,7 +4147,18 @@ void loop() {
     if (backend && (millis() - lastCmd >= backendPollInterval)) {
         lastCmd = millis() + (unsigned long)random(0, 2000);
         DynamicJsonDocument cmds(2048);
-        if (backend->pollCommands(cmds) && cmds.size() > 0) {
+        bool pollOk = backend->pollCommands(cmds);
+        if (!pollOk) Serial.println("[Backend] Poll failed (check Pi URL/WiFi)");
+        if (pollOk) {
+            static unsigned long lastHeartbeat = 0;
+            if (millis() - lastHeartbeat > 120000) {  // Every 2 min
+                if (backend->sendHeartbeat("tzt-display", "TZT Display")) {
+                    lastHeartbeat = millis();
+                }
+            }
+        }
+        if (pollOk && cmds.size() > 0) {
+            Serial.println("[Backend] Commands: " + String(cmds.size()));
             lastCommandFound = millis();
             for (JsonPair kv : cmds.as<JsonObject>()) {
                 JsonObject c = kv.value();
@@ -3990,6 +4166,7 @@ void loop() {
                 String typ = c["type"].as<String>(), data = c["data"].as<String>();
                 // Commands: text → print + save to SD + display; audio → send/save + play; image → send/save + show
                 if (typ == "print") {
+                    Serial.println("[Backend] Print: \"" + data.substring(0, data.length() > 40 ? 40 : data.length()) + (data.length() > 40 ? "..." : "") + "\"");
                     String source = c["source"].as<String>();
                     bool messageOnly = !source.equalsIgnoreCase("shortcut");
                     sendPrintChunked(data, messageOnly);
@@ -4004,21 +4181,25 @@ void loop() {
                 else if (typ == "download_audio") {
                     String url = c["url"] | "";
                     String name = c["name"] | "";
-                    if (url.length() > 0 && name.length() > 0 && sdCard.isReady()) {
+                    if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         if (audioSvc.downloadToSD(url, name)) {
+                            lastDashboardAudioName = name;
+                            if (dashboardAudioNameLabel) lv_label_set_text(dashboardAudioNameLabel, name.c_str());
                             String path = String(AUDIO_DIR) + "/" + name;
                             audioSvc.playFile(path);
                         }
                     }
                 }
-                else if (typ == "play_audio" && data.length() > 0) {
+                else if (typ == "play_audio" && data.length() > 0 && isSafeFilename(data)) {
+                    lastDashboardAudioName = data;
+                    if (dashboardAudioNameLabel) lv_label_set_text(dashboardAudioNameLabel, data.c_str());
                     String path = String(AUDIO_DIR) + "/" + data;
                     audioSvc.playFile(path);
                 }
                 else if (typ == "download_image") {
                     String url = c["url"] | "";
                     String name = c["name"] | "";
-                    if (url.length() > 0 && name.length() > 0 && sdCard.isReady()) {
+                    if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         String path = String(IMAGES_MEDIA_DIR) + "/" + name;
                         HTTPClient http;
                         http.begin(url);
@@ -4040,18 +4221,26 @@ void loop() {
                         }
                         http.end();
 #if !defined(TZT_HEADLESS)
-                        if (ok) pendingTestImagePath = path;
+                        if (ok) {
+                            pendingTestImagePath = path;
+                            lastDashboardImagePath = path;
+                        }
 #endif
                     }
                 }
-                else if (typ == "show_image" && data.length() > 0) {
+                else if (typ == "show_image" && data.length() > 0 && isSafeFilename(data)) {
 #if !defined(TZT_HEADLESS)
                     String showPath = String(IMAGES_MEDIA_DIR) + "/" + data;
                     if (!SD.exists(showPath)) showPath = String(IMAGES_DIR) + "/" + data;
                     pendingTestImagePath = showPath;
+                    lastDashboardImagePath = showPath;
 #endif
                 }
-                backend->deleteData("/commands/" + String(kv.key().c_str()) + ".json");
+                String cmdPath = "/commands/" + String(kv.key().c_str()) + ".json";
+                if (!backend->deleteData(cmdPath)) {
+                    Serial.println("[Backend] DELETE failed for " + String(kv.key().c_str()) + ": " + backend->getLastError());
+                }
+                delay(300);  // brief pause between DELETEs so server/connection can handle
             }
         }
     }
@@ -4083,7 +4272,7 @@ void loop() {
                     String url = entry["url"] | "";
                     String name = entry["name"] | "";
                     bool downloaded = entry["downloaded"] | false;
-                    if (url.length() > 0 && name.length() > 0 && !downloaded) {
+                    if (url.length() > 0 && name.length() > 0 && !downloaded && isSafeFilename(name)) {
                         if (audioSvc.downloadToSD(url, name)) {
                             backend->put("/audio/" + String(kv.key().c_str()) + "/downloaded.json", "true");
                         }
@@ -4106,7 +4295,7 @@ void loop() {
                     String url = entry["url"] | "";
                     String name = entry["name"] | "";
                     bool downloaded = entry["downloaded"] | false;
-                    if (url.length() > 0 && name.length() > 0 && !downloaded) {
+                    if (url.length() > 0 && name.length() > 0 && !downloaded && isSafeFilename(name)) {
                         String path = String(IMAGES_MEDIA_DIR) + "/" + name;
                         if (SD.exists(path)) {
                             backend->put("/images/" + String(kv.key().c_str()) + "/downloaded.json", "true");
@@ -4152,6 +4341,25 @@ void loop() {
             drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
             displayFlushing = false;
         }
+    }
+    // Dashboard Photo tab: draw latest image when that tab is active
+    static unsigned long lastDashboardPhotoRedraw = 0;
+    if (dashboardPhotoScreen && lv_scr_act() == dashboardPhotoScreen && lastDashboardImagePath.length() > 0) {
+        unsigned long now = millis();
+        if (now - lastDashboardPhotoRedraw >= 500) {
+            lastDashboardPhotoRedraw = now;
+            displayFlushing = true;
+            drawSdJpegToTft(lastDashboardImagePath.c_str(), TZT_SCREEN_HEIGHT);
+            displayFlushing = false;
+        }
+    }
+    // Dashboard: auto-rotate Home/Sensors/Media every 5s when untouched for 2 min.
+    // Never auto-advance into or out of Settings (tab index 3) - only cycle 0..2.
+    if (dashboardPhotoScreen && currentScreenIndex >= 0 && currentScreenIndex < 3 &&
+        (unsigned long)(millis() - lastDashboardTouchTime) > DASHBOARD_TOUCH_PAUSE_MS &&
+        (unsigned long)(millis() - lastDashboardAutoAdvance) >= DASHBOARD_AUTO_ADVANCE_MS) {
+        lastDashboardAutoAdvance = millis();
+        goToScreenIndex((currentScreenIndex + 1) % 3);
     }
     // Keep audio header/Stop button in sync when playback ends naturally
     if (audioListScreen && lv_scr_act() == audioListScreen) updateAudioHeaderState();

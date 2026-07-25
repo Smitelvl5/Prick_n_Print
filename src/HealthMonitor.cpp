@@ -8,7 +8,7 @@ const char* HealthMonitor::TAG = "Health";
 HealthMonitor::HealthMonitor() 
     : lastHealthCheck(0), healthCheckInterval(60000) {
     health.wifiConnected = false;
-    health.firebaseHealthy = false;
+    health.backendHealthy = false;
     health.printerReady = false;
     health.uptime = 0;
     health.freeHeap = 0;
@@ -80,7 +80,7 @@ String HealthMonitor::getHealthReport() const {
     report += "WiFi: " + String(health.wifiConnected ? "CONNECTED" : "DISCONNECTED") + "\n";
     report += "  IP: " + health.ipAddress + "\n";
     report += "  RSSI: " + String(health.wifiRSSI) + " dBm\n";
-    report += "Firebase: " + String(health.firebaseHealthy ? "HEALTHY" : "UNHEALTHY") + "\n";
+    report += "Backend: " + String(health.backendHealthy ? "HEALTHY" : "UNHEALTHY") + "\n";
     report += "Printer: " + String(health.printerReady ? "READY" : "NOT READY") + "\n";
     report += "Memory:\n";
     report += "  Free Heap: " + String(health.freeHeap) + " bytes\n";
@@ -101,7 +101,7 @@ String HealthMonitor::getHealthJSON() const {
     doc["wifi"]["connected"] = health.wifiConnected;
     doc["wifi"]["ip"] = health.ipAddress;
     doc["wifi"]["rssi"] = health.wifiRSSI;
-    doc["firebase"]["healthy"] = health.firebaseHealthy;
+    doc["backend"]["healthy"] = health.backendHealthy;
     doc["printer"]["ready"] = health.printerReady;
     doc["memory"]["freeHeap"] = health.freeHeap;
     doc["memory"]["minFreeHeap"] = health.minFreeHeap;

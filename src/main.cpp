@@ -1,7 +1,7 @@
 /*
  * ESP32 Print-n-Prick - Hardware Controller (Main ESP32)
  * Receives commands from TZT via ESP-NOW; controls printer, pump, sensors, LED.
- * TZT runs web server, Firebase, and sends all commands here.
+ * TZT runs web server and HTTP backend, and sends all commands here.
  */
 
 #include <Arduino.h>
@@ -13,6 +13,7 @@
 
 #include "version.h"
 #include "config.h"
+#include "secrets.h"
 #include "Logger.h"
 #include "HardwareAbstraction.h"
 #include "PrinterService.h"
@@ -50,6 +51,28 @@ static unsigned long lastChunkTime = 0;     // Timeout: abort chunked print if n
 static bool pendingChunkPrintReady = false; // All chunks received; do print from loop after ACK queue drains
 static unsigned long lastChunkPrintDone = 0; // When we last completed a chunked print (ignore duplicate chunks for 3s)
 #define CHUNK_PRINT_COOLDOWN_MS 3000       // Ignore PRINT_CHUNK_START / PRINT_CHUNK(idx==0) within this window after print
+static String lastPrintedChunkMessage;     // Dedupe: skip if TZT retries send same message (ESP-NOW retries)
+static unsigned long lastPrintedChunkTime = 0;
+#define CHUNK_DEDUPE_MS 45000              // Ignore duplicate message content within 45s (TZT resends on ESP-NOW fail)
+
+// Deferred simple (non-chunked) print / printer test: CMD_PRINT and CMD_TEST_PRINTER arrive on the
+// ESP-NOW receive callback (WiFi task). Printing + the weather HTTP fetch can block for seconds, so - like
+// chunked printing already does - the actual work is deferred to loop() and only a flag/message is set here.
+static String pendingSimplePrintMessage;
+static bool pendingSimplePrintReady = false;
+static bool pendingSimpleTestPrintReady = false;
+
+// Bounded String construction from CommandPacket::message: the 200-byte buffer isn't guaranteed to be
+// null-terminated, so String(cmd->message) alone can read past the packet (strlen scans until it finds
+// a zero byte, which may be beyond the received data). This copies at most `cap` bytes and terminates.
+static String boundedMessageString(const char* buf, size_t cap) {
+    size_t len = strnlen(buf, cap);
+    char tmp[201];
+    if (len > sizeof(tmp) - 1) len = sizeof(tmp) - 1;
+    memcpy(tmp, buf, len);
+    tmp[len] = '\0';
+    return String(tmp);
+}
 
 // Function declarations
 void setupWiFi();
@@ -113,7 +136,7 @@ void setup() {
     // (printer, sensors, etc.) fails or is disconnected. lets you use WiFi Manager
     // to connect to your network before any peripheral init.
     setupWiFi();
-    Serial.println("MAC: " + WiFi.macAddress());
+    Serial.println("Print-n-Prick ready | MAC: " + WiFi.macAddress() + " | IP: " + deviceIP);
     delay(500);
     
     // Initialize hardware abstraction layer
@@ -131,7 +154,6 @@ void setup() {
     // Initialize hardware test suite
     hardwareTest = new HardwareTest(hardware, printerService);
     Logger::info("Main", "Hardware test suite initialized");
-    Serial.println("\n>>> Type 'test' to enter hardware test mode");
     
     // Setup time
     setupTime();
@@ -282,7 +304,14 @@ void loop() {
             lastChunkTime = 0;
             lastChunkPrintDone = millis();  // Cooldown: ignore duplicate chunks for CHUNK_PRINT_COOLDOWN_MS
             sensorPauseUntil = millis() + 500;
-            if (full.length() > 0 && hardware && printerService) {
+            // Dedupe: TZT retries on ESP-NOW fail can arrive late; skip same message within 45s
+            bool isDuplicate = (full.length() > 0 && full == lastPrintedChunkMessage
+                               && (millis() - lastPrintedChunkTime) < CHUNK_DEDUPE_MS);
+            if (isDuplicate) {
+                // Reset state, don't print again
+            } else if (full.length() > 0 && hardware && printerService) {
+                lastPrintedChunkMessage = full;
+                lastPrintedChunkTime = millis();
                 if (messageOnly) {
                     printerService->printMessageOnly(full);
                 } else if (isPreformattedPrint(full)) {
@@ -291,7 +320,7 @@ void loop() {
                     printerService->setWeather(getWeatherOneLine());
                     printerService->printReceipt(full, true, time(nullptr));
                 }
-                Serial.println("✅ Executed: PRINT_CHUNK (assembled " + String(nChunks) + " chunks)");
+                Serial.println("✅ Printed (" + String(nChunks) + " chunks)");
             }
         }
         // Drain CHUNK_ACK queue (never send from callback = no NO_MEM). One ACK per 40ms so prints never stall.
@@ -336,6 +365,29 @@ void loop() {
         }
     }
     
+    // Deferred simple print / printer test (see CMD_PRINT / CMD_TEST_PRINTER in handleEspNowCommand):
+    // runs here in loop() instead of the ESP-NOW recv callback, which must never block for seconds.
+    if (pendingSimplePrintReady && hardware && printerService) {
+        pendingSimplePrintReady = false;
+        String full = pendingSimplePrintMessage;
+        pendingSimplePrintMessage = "";
+        if (full.length() > 0) {
+            if (isPreformattedPrint(full)) {
+                printerService->printPreformatted(full, getWeatherOneLine());
+            } else {
+                // Raw message (e.g. from index.html or iOS Shortcut): full receipt with MESSAGE title, date, weather
+                printerService->setWeather(getWeatherOneLine());
+                printerService->printReceipt(full, true, time(nullptr));
+            }
+            Serial.println("✅ Executed: PRINT");
+        }
+    }
+    if (pendingSimpleTestPrintReady && printerService) {
+        pendingSimpleTestPrintReady = false;
+        printerService->printTest();
+        Serial.println("✅ Executed: TEST_PRINTER");
+    }
+
     delay(1);  // Short delay for sensor→actuator responsiveness (IR→pump, light→LED). HTTP latency not a priority.
 }
 
@@ -349,6 +401,7 @@ void setupWiFi() {
     Logger::info("WiFi", "Initial WiFi status: " + String(initialStatus));
     
     WiFiManager wm;
+    wm.setDebugOutput(false);  // Suppress *wm: verbose logs
     WiFi.mode(WIFI_STA);
     Logger::info("WiFi", "WiFi mode set to STA (Station)");
     
@@ -517,10 +570,6 @@ static bool isSettingCommandType(uint8_t type) {
 
 void handleEspNowCommand(CommandPacket* cmd) {
     if (!cmd || !hardware || !printerService) return;
-    if (cmd->commandType == CMD_PRINT_CHUNK)
-        Serial.println("[Main] Rcvd: PRINT_CHUNK " + String((int)(cmd->param1 + 1)) + "/" + String((int)cmd->param2));
-    else
-        Serial.println("[Main] Rcvd: " + String(espNowCommandName(cmd->commandType)));
     // Skip duplicate setting command within 1s (TZT sends 4x for reliability)
     if (isSettingCommandType(cmd->commandType)) {
         uint32_t key = (uint32_t)(cmd->commandType << 16) | (cmd->param1 << 8) | cmd->param2;
@@ -530,15 +579,9 @@ void handleEspNowCommand(CommandPacket* cmd) {
     switch (cmd->commandType) {
         case CMD_PRINT: {
             if (!cmd->message[0]) break;
-            String full = String(cmd->message);
-            if (isPreformattedPrint(full)) {
-                printerService->printPreformatted(full, getWeatherOneLine());
-            } else {
-                // Raw message (e.g. from index.html or iOS Shortcut): full receipt with MESSAGE title, date, weather
-                printerService->setWeather(getWeatherOneLine());
-                printerService->printReceipt(full, true, time(nullptr));
-            }
-            Serial.println("✅ Executed: PRINT");
+            // Defer actual printing (+ weather HTTP fetch) to loop() - never block the ESP-NOW recv callback.
+            pendingSimplePrintMessage = boundedMessageString(cmd->message, sizeof(cmd->message));
+            pendingSimplePrintReady = true;
             break;
         }
         case CMD_PRINT_CHUNK_START: {
@@ -568,8 +611,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
                 printChunkTotal = total;
             }
             lastChunkTime = millis();
-            size_t addLen = strnlen(cmd->message, sizeof(cmd->message));
-            printChunkParts[idx] = String(cmd->message).substring(0, addLen);
+            printChunkParts[idx] = boundedMessageString(cmd->message, sizeof(cmd->message));
             printChunkReceived[idx] = true;
             bool haveAll = true;
             for (uint8_t i = 0; i < printChunkTotal; i++) {
@@ -625,8 +667,8 @@ void handleEspNowCommand(CommandPacket* cmd) {
             break;
         }
         case CMD_TEST_PRINTER:
-            printerService->printTest();
-            Serial.println("✅ Executed: TEST_PRINTER");
+            // Defer to loop() - printTest() blocks with many delay() calls; never block the ESP-NOW recv callback.
+            pendingSimpleTestPrintReady = true;
             break;
         case CMD_TEST_PUMP:
             espNowTestType = 1;

@@ -46,11 +46,6 @@ systemctl enable --now tailscaled
 # --- Python Flask app ---
 echo ">>> Setting up Flask app..."
 cd "$SCRIPT_DIR"
-mkdir -p samples
-# Ensure sample files exist for ESP32 (copy from root if present)
-for f in sample.jpg sample.mp3; do
-  [ -f "$f" ] && [ ! -f "samples/$f" ] && cp "$f" "samples/$f"
-done
 chown -R "$APP_USER:$APP_USER" .
 sudo -u "$APP_USER" python3 -m venv venv
 sudo -u "$APP_USER" ./venv/bin/pip install -q -r requirements.txt

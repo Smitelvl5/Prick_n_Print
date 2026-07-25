@@ -1,6 +1,6 @@
-# Using the HTTP backend instead of Firebase
+# Using the HTTP backend
 
-You can use your own web server instead of Firebase. The ESP32 polls the server for commands, audio, and images; you POST to the same server from your app or shortcuts.
+The TZT display talks to your web server for commands, audio, and images. You POST to the same server from your app or shortcuts; the ESP32 polls the server.
 
 ## 1. Run the server
 
@@ -16,12 +16,9 @@ Use the IP of the machine running the server (e.g. `192.168.1.100`). The ESP32 a
 
 ## 2. Configure the ESP32
 
-In **`include/config_tzt.h`**:
+In **`include/config_tzt.h`** set **`BACKEND_URL`** to your server, e.g. `"http://192.168.1.100:5000"` (no trailing slash).
 
-- Set **`USE_HTTP_BACKEND`** to **`1`** (it’s the default now).
-- Set **`BACKEND_URL`** to your server, e.g. `"http://192.168.1.100:5000"` (no trailing slash).
-
-Rebuild and flash the TZT firmware. It will poll `/api/commands`, `/api/audio`, and `/api/images` instead of Firebase.
+Rebuild and flash the TZT firmware. It will poll `/api/commands`, `/api/audio`, and `/api/images`.
 
 ## 3. Send messages, images, and audio
 
@@ -39,7 +36,3 @@ python scripts/post_to_backend.py --url http://YOUR_SERVER_IP:5000 --audio path/
 ```
 
 Or use any HTTP client to POST to the server (see **`server/README.md`** for the API).
-
-## 4. Switching back to Firebase
-
-In **`include/config_tzt.h`** set **`USE_HTTP_BACKEND`** to **`0`**. The ESP32 will use **`FIREBASE_DATABASE_URL`** again.

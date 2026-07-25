@@ -19,7 +19,7 @@
 // Audio and images: put files in these folders on the SD card
 #define AUDIO_DIR        "/data/audio"
 #define IMAGES_DIR       "/data/images"
-#define IMAGES_MEDIA_DIR "/data/images/media"   // Firebase/Shortcut uploads (shown in Media > View Images)
+#define IMAGES_MEDIA_DIR "/data/images/media"   // Backend/Shortcut uploads (shown in Media > View Images)
 #define MAX_CACHED_MESSAGES 20
 #define MSG_PREVIEW_LEN     60
 
@@ -48,7 +48,7 @@ public:
     // Image file helpers
     int  listImageFiles(String* outNames, int maxFiles);
 
-    // Data persistence (config, groceries, todos, reminders - replaces Firebase for these)
+    // Data persistence (config, groceries, todos, reminders)
     bool readFile(const char* path, String& out);
     bool writeFile(const char* path, const String& content);
 

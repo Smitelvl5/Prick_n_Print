@@ -5,10 +5,10 @@
 #include "Logger.h"
 
 enum RequestType {
-    REQUEST_FIREBASE_GET,
-    REQUEST_FIREBASE_PUT,
-    REQUEST_FIREBASE_POST,
-    REQUEST_FIREBASE_DELETE,
+    REQUEST_BACKEND_GET,
+    REQUEST_BACKEND_PUT,
+    REQUEST_BACKEND_POST,
+    REQUEST_BACKEND_DELETE,
     REQUEST_WEATHER,
     REQUEST_PRINT,
     REQUEST_DISPENSE_START,
@@ -23,7 +23,7 @@ struct QueuedRequest {
     int retryCount;
     bool processed;
     
-    QueuedRequest() : type(REQUEST_FIREBASE_GET), timestamp(0), retryCount(0), processed(false) {}
+    QueuedRequest() : type(REQUEST_BACKEND_GET), timestamp(0), retryCount(0), processed(false) {}
 };
 
 class RequestQueue {

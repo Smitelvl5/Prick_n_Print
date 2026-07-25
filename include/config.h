@@ -49,16 +49,11 @@
 // ============================================================================
 
 // WiFi Settings
-#define AP_SSID "Print-n-Prick"
-#define AP_PASSWORD "08202022"
+// AP_SSID / AP_PASSWORD (config-portal credentials) now come from secrets.h
 // 0 = use saved WiFi; config portal only when no credentials (ask once, then never). 1 = erase and open portal every boot (for re-config only).
 #ifndef FORCE_WIFI_CONFIG_PORTAL
 #define FORCE_WIFI_CONFIG_PORTAL 0
 #endif
-
-// Firebase Settings
-#define FIREBASE_DATABASE_URL "https://printerpot-d96f8-default-rtdb.firebaseio.com"
-#define FIREBASE_TIMEOUT 10000          // 10 seconds timeout for Firebase operations
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"
@@ -66,7 +61,7 @@
 #define DAYLIGHT_OFFSET_SEC 3600     // +1 hour during Daylight Saving Time
 
 // Weather API Settings (using coordinates)
-#define WEATHER_API_KEY "bc3d9c1e4453f3e2b887c817006021ea"
+// WEATHER_API_KEY now comes from secrets.h
 #define WEATHER_LATITUDE 35.074824
 #define WEATHER_LONGITUDE -89.796545
 
@@ -80,7 +75,7 @@
 #define MAX_DISPENSE_DURATION_MS 2000   // Maximum dispense duration: 2 seconds (prevents continuous dumping)
 
 // Web Server Authentication
-#define WEB_PASSWORD "0820"              // Password to access web interface (change in secrets.h if needed)
+// WEB_PASSWORD now comes from secrets.h
 
 // ============================================================================
 // ESP-NOW CONFIGURATION (Main ESP32)

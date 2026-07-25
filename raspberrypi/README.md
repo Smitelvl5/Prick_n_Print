@@ -2,7 +2,6 @@
 
 Flask server with **web UI** + **ESP32-compatible API**. Everything sent to the ESP32 (commands, images, audio) is stored here; the ESP32 can request anything to listen or view at any time.
 
-- **sample.jpg** and **sample.mp3** are seeded on first run (place in `samples/` or project root)
 
 ### Where data is stored on the Pi
 
@@ -42,6 +41,23 @@ sudo tailscale up
 ```
 
 Then get your Tailscale IP: `tailscale ip -4`. Access the web UI at `http://<pi-ip>` or `http://<tailscale-ip>`.
+
+### iOS Shortcuts
+
+See **[IOS_SHORTCUTS.md](IOS_SHORTCUTS.md)** for step-by-step instructions to send messages, images, and voice memos from your iPhone or iPad.
+
+### Web UI features
+
+- **Send** – Message, image, and audio upload
+- **History** – Messages (pending commands), images, and audio with **individual delete** per item
+- **Devices** – TZT Display appears when it polls (heartbeat every 2 min). Main ESP32 connects via TZT over ESP-NOW and does not appear here.
+
+### TZT Display connectivity
+
+The TZT polls the Pi for commands. Set `BACKEND_URL` in `include/config_tzt.h`:
+
+- **Same LAN**: Use the Pi's local IP, e.g. `http://192.168.1.100:5000` (Flask) or `http://192.168.1.100` (nginx on 80)
+- **Public IP**: Use `http://your-public-ip` only if nginx is proxying port 80 → 5000; otherwise add `:5000`
 
 ## Manual setup
 

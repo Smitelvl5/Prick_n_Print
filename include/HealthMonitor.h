@@ -6,7 +6,7 @@
 
 struct SystemHealth {
     bool wifiConnected;
-    bool firebaseHealthy;
+    bool backendHealthy;
     bool printerReady;
     unsigned long uptime;
     uint32_t freeHeap;

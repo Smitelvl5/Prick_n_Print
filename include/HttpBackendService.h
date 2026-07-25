@@ -8,7 +8,7 @@
 #include "IBackendService.h"
 
 /**
- * HTTP backend: same interface as FirebaseService but talks to a web server.
+ * HTTP backend: implements IBackendService and talks to the web server.
  * Use BACKEND_URL in config (e.g. http://192.168.1.100:5000) and set USE_HTTP_BACKEND.
  */
 class HttpBackendService : public IBackendService {
@@ -41,6 +41,7 @@ public:
     bool loadConfig(DynamicJsonDocument& doc) override;
     bool saveConfig(const DynamicJsonDocument& doc) override;
     bool isHealthy() override;
+    bool sendHeartbeat(const String& deviceId, const String& name) override;
     String getLastError() const override { return lastError; }
 
 private:
