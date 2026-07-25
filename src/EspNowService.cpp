@@ -119,7 +119,7 @@ bool EspNowService::initialize(const uint8_t* peerMac) {
     }
     
     initialized = true;
-    Serial.println("ESP-NOW init OK. SSID: " + WiFi.SSID() + " WiFi.ch=" + String(WiFi.channel()) + " peer.ch=" + String(peerInfo.channel) + " (TZT must match)");
+    Logger::info("ESP-NOW", "init OK. SSID: " + WiFi.SSID() + " WiFi.ch=" + String(WiFi.channel()) + " peer.ch=" + String(peerInfo.channel) + " (TZT must match)");
     Logger::info("ESP-NOW", "ESP-NOW initialized successfully");
     Logger::info("ESP-NOW", "Peer MAC: " + EspNowService::macToString(peerMac));
     uint8_t thisMac[6];
@@ -161,7 +161,7 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
                 peerInfo.encrypt = false;
                 
                 if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-                    Serial.println("⚠️ ESP-NOW: Failed to add command sender to peer list");
+                    Logger::warn("ESP-NOW", "Failed to add command sender to peer list");
                 }
             }
             
@@ -190,10 +190,9 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
                     }
                 } else {
                     Logger::warn("ESP-NOW", "Invalid checksum in command packet");
-                    Serial.println("⚠️ ESP-NOW: Command packet checksum failed");
                 }
             } else {
-                Serial.println("⚠️ ESP-NOW: Command packet too short: " + String(len) + " bytes (expected " + String(sizeof(CommandPacket)) + ")");
+                Logger::warn("ESP-NOW", "Command packet too short: " + String(len) + " bytes (expected " + String(sizeof(CommandPacket)) + ")");
             }
             break;
         }

@@ -124,8 +124,8 @@ void setup() {
     // Short delay for Serial and power to stabilize
     delay(1500);
     
-    // Set up logging - Reduced to WARN to save flash memory (INFO logs use more string storage)
-    Logger::setLevel(LOG_LEVEL_WARN);
+    // Set up logging - INFO so both Serial and the network log broadcast show normal operation, not just warnings/errors
+    Logger::setLevel(LOG_LEVEL_INFO);
     Logger::info("Main", "========================================");
     Logger::info("Main", "ESP32 Print-n-Prick v" + String(FIRMWARE_VERSION));
     Logger::info("Main", "Build: " + String(BUILD_DATE) + " " + String(BUILD_TIME));
@@ -379,13 +379,17 @@ void loop() {
                 printerService->setWeather(getWeatherOneLine());
                 printerService->printReceipt(full, true, time(nullptr));
             }
-            Serial.println("✅ Executed: PRINT");
+            Logger::info("Main", "Executed: PRINT");
         }
     }
-    if (pendingSimpleTestPrintReady && printerService) {
+    if (pendingSimpleTestPrintReady) {
         pendingSimpleTestPrintReady = false;
-        printerService->printTest();
-        Serial.println("✅ Executed: TEST_PRINTER");
+        if (printerService) {
+            printerService->printTest();
+            Logger::info("Main", "Executed: TEST_PRINTER");
+        } else {
+            Logger::error("Main", "TEST_PRINTER requested but printerService is null");
+        }
     }
 
     delay(1);  // Short delay for sensor→actuator responsiveness (IR→pump, light→LED). HTTP latency not a priority.
@@ -446,6 +450,8 @@ void setupWiFi() {
         Logger::info("WiFi", "RSSI: " + String(WiFi.RSSI()) + " dBm");
         Logger::info("WiFi", "SSID: " + String(WiFi.SSID()));
         Logger::info("WiFi", "MAC Address: " + String(WiFi.macAddress()));
+        Logger::enableNetworkLog("Print-n-Prick");
+        Logger::info("Logger", "Network log broadcast enabled on UDP port 47269");
     }
 }
 
@@ -569,7 +575,13 @@ static bool isSettingCommandType(uint8_t type) {
 }
 
 void handleEspNowCommand(CommandPacket* cmd) {
-    if (!cmd || !hardware || !printerService) return;
+    if (!cmd) { Logger::error("ESP-NOW", "handleEspNowCommand: null command packet"); return; }
+    Logger::info("ESP-NOW", "Received command: " + String(espNowCommandName(cmd->commandType)));
+    if (!hardware || !printerService) {
+        Logger::error("ESP-NOW", "Dropped command " + String(espNowCommandName(cmd->commandType)) +
+                       " - hardware or printerService not initialized");
+        return;
+    }
     // Skip duplicate setting command within 1s (TZT sends 4x for reliability)
     if (isSettingCommandType(cmd->commandType)) {
         uint32_t key = (uint32_t)(cmd->commandType << 16) | (cmd->param1 << 8) | cmd->param2;

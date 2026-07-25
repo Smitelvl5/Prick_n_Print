@@ -295,7 +295,7 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
         if (pendingChunkTotal > 0 && (lastSentCommandType == CMD_PRINT_CHUNK || lastSentCommandType == CMD_PRINT_CHUNK_START)) {
             chunkResendAt = millis() + 900;  // Longer backoff to avoid collision with Main's RX
             if (millis() - lastFailLog > 20000) {
-                Serial.println("[ESP-NOW] send failed, resending chunk");
+                Logger::warn("ESP-NOW", "send failed, resending chunk");
                 lastFailLog = millis();
             }
         } else if (pendingSettingRemainingSends == 0) {
@@ -307,16 +307,16 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
                 retryAt = millis() + 800;  // Backoff before retry
                 retryCount++;
                 if (millis() - lastFailLog > 20000) {
-                    Serial.println("[ESP-NOW] send failed, retrying");
+                    Logger::warn("ESP-NOW", "send failed, retrying");
                     lastFailLog = millis();
                 }
             }
         }
         if (millis() - lastFailLog > 15000) {
             lastFailLog = millis();
-            Serial.println("[ESP-NOW] send failed status=" + String((int)status));
+            Logger::warn("ESP-NOW", "send failed status=" + String((int)status));
             if (!esp_now_is_peer_exist(mac_addr)) {
-                Serial.println("   Re-adding peer...");
+                Logger::info("ESP-NOW", "Re-adding peer...");
                 // Try to re-add peer immediately
                 esp_now_peer_info_t peerInfo;
                 memset(&peerInfo, 0, sizeof(peerInfo));
@@ -325,9 +325,9 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
                 uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
                 peerInfo.channel = wifiChannel;
                 peerInfo.encrypt = false;
-                
+
                 esp_err_t addResult = esp_now_add_peer(&peerInfo);
-                if (addResult != ESP_OK) Serial.println("   [ESP-NOW] Re-add peer failed: " + String((int)addResult));
+                if (addResult != ESP_OK) Logger::error("ESP-NOW", "Re-add peer failed: " + String((int)addResult));
             } else {
                 esp_now_peer_info_t peerInfo;
                 if (esp_now_get_peer(mac_addr, &peerInfo) == ESP_OK) {
@@ -364,7 +364,7 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
             lastSensorDataReceiveTime = millis();
             sensorDataNeedsPanelUpdate = true;  // Refresh GUI on next loop (don't call LVGL from callback)
         } else {
-            Serial.println("⚠️ ESP-NOW: Invalid checksum in sensor data");
+            Logger::warn("ESP-NOW", "Invalid checksum in sensor data");
         }
     } else if (len >= (int)sizeof(AckPacket) && data[0] == ESP_NOW_MSG_ACK) {
         AckPacket* ack = (AckPacket*)data;
@@ -394,7 +394,7 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
             }
         }
     } else if (len > 0) {
-        Serial.println("⚠️ ESP-NOW: Received unexpected packet type: " + String(data[0]));
+        Logger::warn("ESP-NOW", "Received unexpected packet type: " + String(data[0]));
     }
 }
 
@@ -468,7 +468,7 @@ static bool sendPumpCommandRepeated(uint8_t commandType) {
 // fromSettingsQueue: true when sending from the settings queue (skip long delay; printer has priority)
 bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, const char* message, bool isRetry, bool fromSettingsQueue) {
     if (!espNowInitialized) {
-        Serial.println("❌ ESP-NOW not initialized");
+        Logger::error("ESP-NOW", "not initialized");
         return false;
     }
     if (!isRetry) retryCount = 0;  // New user-initiated send; allow one retry on FAIL
@@ -535,7 +535,7 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
     
     // Re-add peer if missing or misconfigured
     if (needsReconfig) {
-        Serial.println("🔄 ESP-NOW: Re-configuring peer - " + reconfigReason);
+        Logger::info("ESP-NOW", "Re-configuring peer - " + reconfigReason);
         
         // Remove existing peer first
         if (peerExists) {
@@ -562,23 +562,23 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
                 case ESP_ERR_ESPNOW_EXIST: errStr = "EXIST"; break;
                 default: errStr = "UNKNOWN(" + String((int)addResult) + ")"; break;
             }
-            Serial.println("❌ Failed to re-add ESP-NOW peer: " + errStr);
+            Logger::error("ESP-NOW", "Failed to re-add peer: " + errStr);
             return false;
         }
         delay(100);  // Wait for peer to be fully registered
-        
+
         // Verify it was added correctly
         if (!esp_now_is_peer_exist(mainESP32Mac)) {
-            Serial.println("❌ Peer re-added but verification failed");
+            Logger::error("ESP-NOW", "Peer re-added but verification failed");
             return false;
         }
-        
+
         // Double-check the configuration
         if (esp_now_get_peer(mainESP32Mac, &peerInfo) == ESP_OK) {
             if (peerInfo.channel == currentChannel && peerInfo.ifidx == WIFI_IF_STA) {
-                Serial.println("✅ ESP-NOW peer re-configured successfully (ch=" + String(currentChannel) + " ifidx=" + String(WIFI_IF_STA) + ")");
+                Logger::info("ESP-NOW", "peer re-configured successfully (ch=" + String(currentChannel) + " ifidx=" + String(WIFI_IF_STA) + ")");
             } else {
-                Serial.println("⚠️ ESP-NOW peer re-added but config mismatch (ch=" + String(peerInfo.channel) + "/" + String(currentChannel) + " ifidx=" + String(peerInfo.ifidx) + "/" + String(WIFI_IF_STA) + ")");
+                Logger::warn("ESP-NOW", "peer re-added but config mismatch (ch=" + String(peerInfo.channel) + "/" + String(currentChannel) + " ifidx=" + String(peerInfo.ifidx) + "/" + String(WIFI_IF_STA) + ")");
             }
         }
     }
@@ -629,7 +629,7 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
                 case ESP_ERR_ESPNOW_IF: errStr = "IF (interface mismatch)"; break;
                 default: errStr = "UNKNOWN(" + String((int)result) + ")"; break;
             }
-            Serial.println("[ESP-NOW] send failed: " + errStr);
+            Logger::warn("ESP-NOW", "send failed: " + errStr);
             return false;
         }
     }
@@ -1664,7 +1664,7 @@ static void drawSdJpegToTft(const char* path, int maxY) {
     if (!path || path[0] == '\0' || !SD.exists(path)) {
         static uint32_t lastOpenFailLog = 0;
         if ((uint32_t)millis() - lastOpenFailLog > 2000) {
-            Serial.println("[Image] open failed: " + String(path ? path : ""));
+            Logger::warn("Image", "open failed: " + String(path ? path : ""));
             lastOpenFailLog = (uint32_t)millis();
         }
         return;
@@ -1678,7 +1678,7 @@ static void drawSdJpegToTft(const char* path, int maxY) {
         if (lastDecodeFailPath != path) { lastDecodeFailPath = path; decodeFailCount = 0; }
         decodeFailCount++;
         if ((uint32_t)millis() - lastDecodeFailLog > 2000) {
-            Serial.println("[Image] decode failed: " + String(path));
+            Logger::warn("Image", "decode failed: " + String(path));
             lastDecodeFailLog = (uint32_t)millis();
         }
         if (decodeFailCount >= 10) {
@@ -1754,7 +1754,7 @@ static void imageFileCb(lv_event_t* e) {
         hideNavBar();
         lv_scr_load(imageViewerScreen);
     } else {
-        Serial.println("[Image] Only JPEG is displayed; file is not .jpg/.jpeg: " + path);
+        Logger::warn("Image", "Only JPEG is displayed; file is not .jpg/.jpeg: " + path);
         currentImagePath = "";
         hideNavBar();
         lv_scr_load(imageViewerScreen);
@@ -2138,6 +2138,8 @@ void handleApiLogin() {
 void handleGetStatus() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
     DynamicJsonDocument doc(384);
+    doc["firmware"] = FIRMWARE_VERSION;
+    doc["sensorsValid"] = lastSensorDataValid;
     if (lastSensorDataValid) {
         doc["moisture"] = lastSensorData.moisturePercent;
         doc["sanitizer"] = lastSensorData.sanitizerLevel;
@@ -2147,10 +2149,12 @@ void handleGetStatus() {
         doc["dispensing"] = lastSensorData.isDispensing;
         doc["autoDispense"] = lastSensorData.autoDispense;
         doc["autoBrightness"] = lastSensorData.autoBrightness;
+        doc["pumpRunning"] = lastSensorData.pumpRunning;
     } else {
         doc["moisture"] = 0; doc["sanitizer"] = 0; doc["irSensor"] = false;
         doc["light"] = 0; doc["ledBrightness"] = 0; doc["dispensing"] = false;
         doc["autoDispense"] = false; doc["autoBrightness"] = false;
+        doc["pumpRunning"] = false;
     }
     if (lastPumpDurationTenths >= 0) doc["pumpDurationTenths"] = lastPumpDurationTenths;
     if (lastPumpCooldownTenths >= 0) doc["pumpCooldownTenths"] = lastPumpCooldownTenths;
@@ -2336,25 +2340,6 @@ void handlePrintTodos() {
     server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
 }
 
-void handleHealth() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(512);
-    doc["healthy"] = true;
-    doc["firmware"] = FIRMWARE_VERSION;
-    doc["sensorsValid"] = lastSensorDataValid;
-    if (lastSensorDataValid) {
-        doc["moisture"] = lastSensorData.moisturePercent;
-        doc["sanitizer"] = lastSensorData.sanitizerLevel;
-    }
-    String s; serializeJson(doc, s);
-    server.send(200, "application/json", s);
-}
-
-void handleQueueStatus() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    server.send(200, "application/json", "{\"size\":0,\"isEmpty\":true}");
-}
-
 void handleTestPump() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
     bool ok = sendCommandViaESPNow(CMD_TEST_PUMP);
@@ -2393,7 +2378,7 @@ void handlePumpControl() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid action. Use 'start' or 'stop'\"}");
         return;
     }
-    if (!ok) Serial.println("❌ Pump control: send failed");
+    if (!ok) Logger::error("Pump", "control: send failed");
     server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW send failed or not available\"}");
 }
 
@@ -2507,30 +2492,6 @@ void handleTestPrinter() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
     bool ok = sendCommandViaESPNow(CMD_TEST_PRINTER);
     server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
-}
-
-void handleTestSensors() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(384);
-    if (lastSensorDataValid) {
-        doc["moisture"] = lastSensorData.moisturePercent;
-        doc["sanitizer"] = lastSensorData.sanitizerLevel;
-        doc["irDetected"] = lastSensorData.irDetected;
-        doc["light"] = lastSensorData.lightPercent;
-        doc["ledBrightness"] = lastSensorData.ledBrightness;
-        doc["pumpRunning"] = lastSensorData.pumpRunning;
-        doc["isDispensing"] = lastSensorData.isDispensing;
-    } else { 
-        doc["moisture"] = 0; 
-        doc["sanitizer"] = 0; 
-        doc["irDetected"] = false; 
-        doc["light"] = 0; 
-        doc["ledBrightness"] = 0;
-        doc["pumpRunning"] = false;
-        doc["isDispensing"] = false;
-    }
-    String s; serializeJson(doc, s);
-    server.send(200, "application/json", s);
 }
 
 void handleTestSendMessage() {
@@ -3095,6 +3056,25 @@ void handleRoot() {
         </details>
 
         <details class="collapsible">
+        <summary class="section-title">🔧 Hardware Diagnostics</summary>
+        <div class="section">
+            <div style="font-size:12px;color:#777;margin-bottom:10px;">
+                These send a test command over ESP-NOW to the main board. "Sent" means the command was delivered — check the printer/pump/LED in person to confirm it actually worked.
+            </div>
+            <div class="input-group" style="flex-wrap: wrap;">
+                <button type="button" onclick="testPrinter()" style="min-width:45%;">🖨️ Test Printer</button>
+                <button type="button" onclick="testPump()" style="min-width:45%;">💧 Test Pump</button>
+            </div>
+            <div class="input-group" style="flex-wrap: wrap;">
+                <button type="button" onclick="testSensors()" style="min-width:45%;">📡 Read Sensors</button>
+                <button type="button" onclick="testMessage()" style="min-width:45%;">✉️ Test Message</button>
+            </div>
+            <div id="diagResult" style="margin-top:6px;font-size:14px;min-height:22px;font-weight:600;"></div>
+            <div id="diagSensorDump" style="margin-top:6px;font-size:12px;color:#555;white-space:pre-wrap;"></div>
+        </div>
+        </details>
+
+        <details class="collapsible">
         <summary class="section-title">📜 Message History</summary>
         <div class="section">
             <div class="list-container" id="msgHist" style="max-height:200px;overflow-y:auto;">
@@ -3452,6 +3432,47 @@ void handleRoot() {
             });
         }
         
+        function showDiagResult(ok, text) {
+            var el = document.getElementById('diagResult');
+            el.style.color = ok ? '#2d5016' : '#8b4513';
+            el.textContent = (ok ? '✅ ' : '❌ ') + text;
+        }
+        function runDiag(btn, url, body, sentText, failText) {
+            var prevLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Testing...';
+            document.getElementById('diagResult').textContent = '';
+            var req = body === undefined ? po(url) : po(url, body);
+            req.then(d => {
+                if (d.success) showDiagResult(true, sentText);
+                else showDiagResult(false, (d.error || failText));
+            }).catch(() => showDiagResult(false, failText))
+              .finally(() => { btn.disabled = false; btn.textContent = prevLabel; });
+        }
+        function testPrinter() { runDiag(event.target, '/api/test/printer', undefined, 'Test print sent — check the printer for output', 'Could not reach printer (ESP-NOW offline?)'); }
+        function testPump() { runDiag(event.target, '/api/test/pump', undefined, 'Pump test sent — watch for water flow', 'Could not reach pump (ESP-NOW offline?)'); }
+        function testMessage() { runDiag(event.target, '/api/test/send-message', {}, 'Test message sent to printer', 'Could not send test message'); }
+        function testSensors() {
+            var btn = event.target;
+            var prevLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Reading...';
+            document.getElementById('diagSensorDump').textContent = '';
+            q('/api/status').then(d => {
+                showDiagResult(d.sensorsValid, d.sensorsValid ? 'Sensor snapshot read' : 'No sensor data yet (main board offline?)');
+                document.getElementById('diagSensorDump').textContent =
+                    'Firmware: ' + d.firmware + '\n' +
+                    'Moisture: ' + d.moisture + '%\n' +
+                    'Sanitizer: ' + d.sanitizer + '%\n' +
+                    'Light: ' + d.light + '%\n' +
+                    'IR detected: ' + d.irSensor + '\n' +
+                    'LED brightness: ' + d.ledBrightness + '\n' +
+                    'Pump running: ' + d.pumpRunning + '\n' +
+                    'Dispensing: ' + d.dispensing;
+            }).catch(() => showDiagResult(false, 'Could not read sensors'))
+              .finally(() => { btn.disabled = false; btn.textContent = prevLabel; });
+        }
+
         function loadMessages() {
             q('/api/messages').then(d => {
                 var c = document.getElementById('msgHist');
@@ -3523,8 +3544,6 @@ void setupWebServer() {
     // API endpoints - proxy to main ESP32
     server.on("/api/login", HTTP_GET, handleApiLogin);  // Shortcut-friendly login endpoint
     server.on("/api/status", HTTP_GET, handleGetStatus);
-    server.on("/api/health", HTTP_GET, handleHealth);
-    server.on("/api/queue", HTTP_GET, handleQueueStatus);
     server.on("/api/reset-sanitizer", HTTP_POST, handleResetSanitizer);
     
     // Hardware test API (sensors, pump, LED, etc. used by main dashboard)
@@ -3538,7 +3557,6 @@ void setupWebServer() {
     server.on("/api/test/automation", HTTP_GET, handleGetAutomation);
     server.on("/api/test/automation", HTTP_POST, handleSetAutomation);
     server.on("/api/test/printer", HTTP_POST, handleTestPrinter);
-    server.on("/api/test/sensors", HTTP_GET, handleTestSensors);
     server.on("/api/test/send-message", HTTP_POST, handleTestSendMessage);
     server.on("/api/test/play-audio", HTTP_POST, handleTestPlayAudio);
     server.on("/api/test/show-image", HTTP_POST, handleTestShowImage);
@@ -3743,18 +3761,20 @@ void setup() {
                                      IPAddress(192, 168, 4, 1), 
                                      IPAddress(255, 255, 255, 0));
 #if FORCE_WIFI_CONFIG_PORTAL
-    Serial.println("FORCE_WIFI_CONFIG_PORTAL: erasing WiFi, opening config portal (AP: " TZT_AP_SSID ")");
+    Logger::info("WiFi", "FORCE_WIFI_CONFIG_PORTAL: erasing WiFi, opening config portal (AP: " TZT_AP_SSID ")");
     wifiManager.resetSettings();
     wifiManager.startConfigPortal(TZT_AP_SSID, TZT_AP_PASSWORD);
 #else
     esp_task_wdt_reset();  // Feed WDT before blocking autoConnect (portal can take 30s+)
     if (!wifiManager.autoConnect(TZT_AP_SSID, TZT_AP_PASSWORD)) {
-        Serial.println("WiFi config portal timed out or failed.");
+        Logger::warn("WiFi", "config portal timed out or failed.");
     }
 #endif
     
     if (WiFi.status() == WL_CONNECTED) {
         deviceIP = WiFi.localIP().toString();
+        Logger::enableNetworkLog("TZT-Display");
+        Logger::info("Logger", "Network log broadcast enabled on UDP port 47269");
     } else {
         deviceIP = "192.168.4.1";
     }
@@ -3775,7 +3795,7 @@ void setup() {
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
     esp_task_wdt_reset();  // Feed WDT before backend init
-    Logger::setLevel(LOG_LEVEL_WARN);
+    Logger::setLevel(LOG_LEVEL_INFO);
     backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT);
     backend->setRetryPolicy(3, 1000);
     backend->setRateLimit(60);
@@ -3795,7 +3815,7 @@ void setup() {
         sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
         audioSvc.begin();
     } else {
-        Serial.println("[SD] Skipped: message history & media will use backend only");
+        Logger::warn("SD", "Skipped: message history & media will use backend only");
     }
 
     esp_task_wdt_reset();  // Feed WDT before display init
@@ -3829,7 +3849,7 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
     // createControlPanel() deferred to first loop when splash ends (smooth transition to UI)
 #else
-    Serial.println("TZT_HEADLESS (no display)");
+    Logger::info("Display", "TZT_HEADLESS (no display)");
 #endif
 
     esp_task_wdt_reset();  // Feed WDT before ESP-NOW and web server
@@ -3880,7 +3900,7 @@ void setup() {
                     if (bootSettingsCount > 0 && bootSettingsIndex < bootSettingsCount)
                         applyNextBootSetting();
                 } else {
-                    Serial.println("⚠️ ESP-NOW: peer verify failed");
+                    Logger::warn("ESP-NOW", "peer verify failed");
                 }
             } else {
                 String errStr = "";
@@ -3892,18 +3912,18 @@ void setup() {
                     case ESP_ERR_ESPNOW_EXIST: errStr = "EXIST"; break;
                     default: errStr = "UNKNOWN(" + String((int)addPeerResult) + ")"; break;
                 }
-                Serial.println("⚠️ ESP-NOW failed to add peer: " + errStr);
+                Logger::warn("ESP-NOW", "failed to add peer: " + errStr);
             }
         } else {
-            Serial.println("⚠️ ESP-NOW initialization failed: " + String((int)initResult));
+            Logger::warn("ESP-NOW", "initialization failed: " + String((int)initResult));
         }
     } else {
-        Serial.println("⚠️ Main ESP32 MAC address not configured in config_tzt.h");
-        Serial.println("   To enable ESP-NOW, set MAIN_ESP32_MAC_ADDRESS in config_tzt.h");
+        Logger::warn("ESP-NOW", "Main ESP32 MAC address not configured in config_tzt.h");
+        Logger::warn("ESP-NOW", "To enable ESP-NOW, set MAIN_ESP32_MAC_ADDRESS in config_tzt.h");
     }
-    
+
     setupWebServer();
-    Serial.println("TZT Display ready | http://" + deviceIP + ":8080");
+    Logger::info("Boot", "TZT Display ready | http://" + deviceIP + ":8080");
 }
 
 void loop() {
@@ -4039,7 +4059,7 @@ void loop() {
         } else {
             static unsigned long lastRetryLog = 0;
             if (millis() - lastRetryLog > 15000) {
-                Serial.println("[ESP-NOW] retrying...");
+                Logger::info("ESP-NOW", "retrying...");
                 lastRetryLog = millis();
             }
             sendCommandViaESPNow(lastSentCommandType, lastSentParam1, lastSentParam2, lastSentMessage, true);
@@ -4148,7 +4168,7 @@ void loop() {
         lastCmd = millis() + (unsigned long)random(0, 2000);
         DynamicJsonDocument cmds(2048);
         bool pollOk = backend->pollCommands(cmds);
-        if (!pollOk) Serial.println("[Backend] Poll failed (check Pi URL/WiFi)");
+        if (!pollOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi)");
         if (pollOk) {
             static unsigned long lastHeartbeat = 0;
             if (millis() - lastHeartbeat > 120000) {  // Every 2 min
@@ -4158,7 +4178,7 @@ void loop() {
             }
         }
         if (pollOk && cmds.size() > 0) {
-            Serial.println("[Backend] Commands: " + String(cmds.size()));
+            Logger::info("Backend", "Commands: " + String(cmds.size()));
             lastCommandFound = millis();
             for (JsonPair kv : cmds.as<JsonObject>()) {
                 JsonObject c = kv.value();
@@ -4166,7 +4186,7 @@ void loop() {
                 String typ = c["type"].as<String>(), data = c["data"].as<String>();
                 // Commands: text → print + save to SD + display; audio → send/save + play; image → send/save + show
                 if (typ == "print") {
-                    Serial.println("[Backend] Print: \"" + data.substring(0, data.length() > 40 ? 40 : data.length()) + (data.length() > 40 ? "..." : "") + "\"");
+                    Logger::info("Backend", "Print: \"" + data.substring(0, data.length() > 40 ? 40 : data.length()) + (data.length() > 40 ? "..." : "") + "\"");
                     String source = c["source"].as<String>();
                     bool messageOnly = !source.equalsIgnoreCase("shortcut");
                     sendPrintChunked(data, messageOnly);
@@ -4238,7 +4258,7 @@ void loop() {
                 }
                 String cmdPath = "/commands/" + String(kv.key().c_str()) + ".json";
                 if (!backend->deleteData(cmdPath)) {
-                    Serial.println("[Backend] DELETE failed for " + String(kv.key().c_str()) + ": " + backend->getLastError());
+                    Logger::warn("Backend", "DELETE failed for " + String(kv.key().c_str()) + ": " + backend->getLastError());
                 }
                 delay(300);  // brief pause between DELETEs so server/connection can handle
             }
