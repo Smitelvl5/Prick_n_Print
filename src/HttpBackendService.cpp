@@ -2,8 +2,8 @@
 
 const char* HttpBackendService::TAG = "HttpBackend";
 
-HttpBackendService::HttpBackendService(const String& url, int timeoutMs)
-    : baseUrl(url), timeout(timeoutMs), retryCount(3), retryDelay(1000),
+HttpBackendService::HttpBackendService(const String& url, int timeoutMs, const String& key)
+    : baseUrl(url), apiKey(key), timeout(timeoutMs), retryCount(1), retryDelay(500),
       lastRequest(0), rateLimitWindow(2000), initialRequestsAllowed(5) {
     // Ensure baseUrl has no trailing slash
     while (baseUrl.length() > 0 && baseUrl.endsWith("/"))
@@ -29,10 +29,9 @@ bool HttpBackendService::isRateLimited() {
         return false;
     }
     unsigned long now = millis();
-    if (now - lastRequest < rateLimitWindow) {
-        delay(rateLimitWindow - (now - lastRequest));
-    }
-    return false;
+    // Caller skips this cycle and retries on its own next poll tick rather than
+    // blocking here, since blocking stalls the TZT's LVGL/touch loop.
+    return (now - lastRequest < rateLimitWindow);
 }
 
 bool HttpBackendService::executeRequest(HTTPClient& http, const String& method, const String& payload) {
@@ -96,6 +95,7 @@ bool HttpBackendService::get(const String& path, String& response) {
     HTTPClient http;
     String url = baseUrl + apiPath;
     http.begin(url);
+    http.addHeader("X-API-Key", apiKey);
     http.setTimeout(timeout);
     if (executeRequest(http, "GET")) {
         response = http.getString();
@@ -122,6 +122,7 @@ bool HttpBackendService::put(const String& path, const String& data) {
     String url = baseUrl + apiPath;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", apiKey);
     http.setTimeout(timeout);
     bool ok = executeRequest(http, "PUT", payload);
     http.end();
@@ -143,6 +144,7 @@ bool HttpBackendService::deleteData(const String& path) {
             lastError = "Connection failed";
             return false;
         }
+        http.addHeader("X-API-Key", apiKey);
         int httpCode = -1;
         for (int attempt = 0; attempt < retryCount; attempt++) {
             if (attempt > 0) delay(retryDelay);
@@ -220,6 +222,7 @@ bool HttpBackendService::sendHeartbeat(const String& deviceId, const String& nam
     HTTPClient http;
     http.begin(baseUrl + "/api/devices/heartbeat");
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", apiKey);
     http.setTimeout(timeout);
     String body = "{\"device_id\":\"" + deviceId + "\",\"name\":\"" + name + "\"}";
     int code = http.POST(body);

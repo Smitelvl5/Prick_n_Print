@@ -95,14 +95,12 @@ bool HardwareAbstraction::initializePrinter() {
     Logger::debug(TAG, "  Baud Rate: " + String(THERMAL_PRINTER_BAUD));
     
     // Ensure UART pins are in safe state before initializing serial
-    // Using GPIO 4 (TX) and GPIO 33 (RX) - safe pins that don't interfere with boot
-    // Previous GPIO 16/17 caused boot issues due to flash memory interface
+    // Using GPIO 17 (TX) and GPIO 16 (RX)
     pinMode(THERMAL_RX_PIN, INPUT_PULLUP);  // Set RX as input with pull-up
     pinMode(THERMAL_TX_PIN, INPUT_PULLUP);  // Set TX as input with pull-up
     delay(200);  // Allow pins to stabilize
     
     printerSerial = new HardwareSerial(2);
-    // Try inverted serial logic - common issue with thermal printers
     printerSerial->begin(THERMAL_PRINTER_BAUD, SERIAL_8N1, THERMAL_RX_PIN, THERMAL_TX_PIN, true);
     // Extended delay for external power stabilization
     delay(300);  // Increased delay for external power
@@ -135,22 +133,32 @@ bool HardwareAbstraction::startPump() {
     Logger::debug(TAG, "Setting GPIO " + String(SANITIZER_PUMP_PIN) + " to HIGH");
     digitalWrite(SANITIZER_PUMP_PIN, HIGH);
     delay(2);  // Minimal settle for GPIO/MOSFET (sensor→actuator priority)
-    
-    // Verify the pin state (quick double-read)
+
+    // Verify the pin state (quick double-read); retry once before giving up
     int pinState1 = digitalRead(SANITIZER_PUMP_PIN);
     delay(1);
     int pinState2 = digitalRead(SANITIZER_PUMP_PIN);
-    
+
+    if (pinState1 != HIGH || pinState2 != HIGH) {
+        Logger::warn(TAG, "GPIO " + String(SANITIZER_PUMP_PIN) + " not HIGH after write, retrying");
+        digitalWrite(SANITIZER_PUMP_PIN, HIGH);
+        delay(2);
+        pinState1 = digitalRead(SANITIZER_PUMP_PIN);
+        delay(1);
+        pinState2 = digitalRead(SANITIZER_PUMP_PIN);
+    }
+
     if (pinState1 == HIGH && pinState2 == HIGH) {
         Logger::info(TAG, "✅ GPIO " + String(SANITIZER_PUMP_PIN) + " confirmed HIGH (MOSFET should be switching)");
     } else {
-        Logger::error(TAG, "❌ GPIO " + String(SANITIZER_PUMP_PIN) + " state inconsistent! Read: " + String(pinState1) + ", " + String(pinState2));
+        Logger::error(TAG, "❌ GPIO " + String(SANITIZER_PUMP_PIN) + " state inconsistent after retry! Read: " + String(pinState1) + ", " + String(pinState2) + " - pump not started");
+        return false;
     }
-    
+
     pumpState = true;
     dispensing = true;
     dispenseStartTime = millis();
-    
+
     Logger::info(TAG, "✅ Pump started - GPIO " + String(SANITIZER_PUMP_PIN) + " = HIGH");
     return true;
 }
@@ -169,27 +177,44 @@ bool HardwareAbstraction::stopPump() {
     Logger::debug(TAG, "Setting GPIO " + String(SANITIZER_PUMP_PIN) + " to LOW");
     digitalWrite(SANITIZER_PUMP_PIN, LOW);
     delay(2);  // Minimal settle for GPIO/MOSFET (sensor→actuator priority)
-    
-    // Verify the pin state (quick double-read)
+
+    // Verify the pin state (quick double-read); retry once before giving up.
+    // A pump that fails to turn off is a safety issue, so we keep retrying the
+    // write rather than optimistically reporting success.
     int pinState1 = digitalRead(SANITIZER_PUMP_PIN);
     delay(1);
     int pinState2 = digitalRead(SANITIZER_PUMP_PIN);
-    
-    if (pinState1 == LOW && pinState2 == LOW) {
+
+    if (pinState1 != LOW || pinState2 != LOW) {
+        Logger::warn(TAG, "GPIO " + String(SANITIZER_PUMP_PIN) + " not LOW after write, retrying");
+        digitalWrite(SANITIZER_PUMP_PIN, LOW);
+        delay(2);
+        pinState1 = digitalRead(SANITIZER_PUMP_PIN);
+        delay(1);
+        pinState2 = digitalRead(SANITIZER_PUMP_PIN);
+    }
+
+    bool verifiedOff = (pinState1 == LOW && pinState2 == LOW);
+    if (verifiedOff) {
         Logger::info(TAG, "✅ GPIO " + String(SANITIZER_PUMP_PIN) + " confirmed LOW (MOSFET should be off)");
     } else {
-        Logger::error(TAG, "❌ GPIO " + String(SANITIZER_PUMP_PIN) + " state inconsistent! Read: " + String(pinState1) + ", " + String(pinState2));
+        Logger::error(TAG, "❌ GPIO " + String(SANITIZER_PUMP_PIN) + " state inconsistent after retry! Read: " + String(pinState1) + ", " + String(pinState2) + " - pump may still be running");
     }
-    
-    pumpState = false;
-    dispensing = false;
+
+    // Reflect the verified pin state, not just intent: if the pin is still
+    // HIGH, dispensing must stay true so checkDispenseTimeout() keeps retrying
+    // and callers don't believe a stuck-on pump has stopped.
+    pumpState = verifiedOff ? false : (pinState2 == HIGH);
+    dispensing = !verifiedOff;
     lastDispenseTime = millis();
-    totalDispenses++;
-    
-    unsigned long duration = lastDispenseTime - dispenseStartTime;
-    Logger::info(TAG, "✅ Pump stopped (duration: " + String(duration) + "ms, total dispenses: " + String(totalDispenses) + ")");
-    
-    return true;
+
+    if (verifiedOff) {
+        totalDispenses++;
+        unsigned long duration = lastDispenseTime - dispenseStartTime;
+        Logger::info(TAG, "✅ Pump stopped (duration: " + String(duration) + "ms, total dispenses: " + String(totalDispenses) + ")");
+    }
+
+    return verifiedOff;
 }
 
 unsigned long HardwareAbstraction::getDispenseDuration() const {
@@ -379,11 +404,11 @@ void HardwareAbstraction::updateLEDRamp() {
         }
         
         // Convert voltage to PWM
-        uint8_t currentPWM = (uint8_t)((currentVoltage / LED_MAX_VOLTAGE) * 255.0);
-        if (currentPWM > 255) currentPWM = 255;
-        
-        ledcWrite(LED_PWM_CHANNEL, currentPWM);
-        this->currentPWM = currentPWM;  // Update tracked value
+        uint8_t newPWM = (uint8_t)((currentVoltage / LED_MAX_VOLTAGE) * 255.0);
+        if (newPWM > 255) newPWM = 255;
+
+        ledcWrite(LED_PWM_CHANNEL, newPWM);
+        currentPWM = newPWM;  // Update tracked value
     } else {
         // Ramping down
         float currentVoltage = startVoltage - voltageChange;
@@ -392,13 +417,13 @@ void HardwareAbstraction::updateLEDRamp() {
             currentVoltage = targetVoltage;
             rampActive = false;
         }
-        
+
         // Convert voltage to PWM
-        uint8_t currentPWM = (uint8_t)((currentVoltage / LED_MAX_VOLTAGE) * 255.0);
-        if (currentPWM > 255) currentPWM = 255;
-        
-        ledcWrite(LED_PWM_CHANNEL, currentPWM);
-        this->currentPWM = currentPWM;  // Update tracked value
+        uint8_t newPWM = (uint8_t)((currentVoltage / LED_MAX_VOLTAGE) * 255.0);
+        if (newPWM > 255) newPWM = 255;
+
+        ledcWrite(LED_PWM_CHANNEL, newPWM);
+        currentPWM = newPWM;  // Update tracked value
     }
 }
 
@@ -444,6 +469,14 @@ bool HardwareAbstraction::printerPrintln(const String& str) {
 
 bool HardwareAbstraction::printerAvailable() const {
     return printerSerial != nullptr;
+}
+
+bool HardwareAbstraction::printerFeed(uint8_t lines) {
+    if (!printerSerial) return false;
+    printerSerial->write(27);      // ESC
+    printerSerial->write('d');     // ESC d n - print buffer and feed n lines
+    printerSerial->write(lines);
+    return true;
 }
 
 void HardwareAbstraction::printDiagnostics() const {

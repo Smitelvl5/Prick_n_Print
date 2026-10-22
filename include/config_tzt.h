@@ -104,9 +104,7 @@
 #define DAYLIGHT_OFFSET_SEC 3600     // +1 hour during Daylight Saving Time
 
 // Weather API Settings (using coordinates)
-// WEATHER_API_KEY now comes from secrets.h
-#define WEATHER_LATITUDE 35.074824
-#define WEATHER_LONGITUDE -89.796545
+// WEATHER_API_KEY, WEATHER_LATITUDE, WEATHER_LONGITUDE now come from secrets.h
 
 // Web Server Authentication
 // WEB_PASSWORD now comes from secrets.h

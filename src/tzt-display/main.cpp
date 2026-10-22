@@ -33,6 +33,7 @@
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <string.h>
 #include <cmath>
 
@@ -187,20 +188,6 @@ static uint32_t calculateSensorHash() {
 bool espNowInitialized = false;
 uint8_t mainESP32Mac[6] = MAIN_ESP32_MAC_ADDRESS;
 
-// Optimistic cache for settings not in sensor packet (for HTTP GET /api/status)
-static int lastPumpDurationTenths = -1;   // 0-255 = 0-25.5s, -1 = not set
-static int lastPumpCooldownTenths = -1;    // 0-255 = 0-25.5s, -1 = not set
-
-// Settings persisted to backend config (loaded on boot, saved when changed)
-bool settingsNeedSave = false;
-static unsigned long lastSettingsSaveTime = 0;
-#define BOOT_SETTINGS_MAX 5
-struct BootSetting { uint8_t type; uint8_t p1; uint8_t p2; };
-static BootSetting bootSettingsToSend[BOOT_SETTINGS_MAX];
-static uint8_t bootSettingsCount = 0;
-static uint8_t bootSettingsIndex = 0;
-static void applyNextBootSetting();  // Enqueue next boot setting to Main (called after ACK)
-
 // Retry when TZT→Main command send fails (collision with Main's transmit window)
 static uint8_t lastSentCommandType = 0;
 static uint8_t lastSentParam1 = 0, lastSentParam2 = 0;
@@ -283,6 +270,28 @@ String webPassword = WEB_PASSWORD;
 String authToken = "";
 unsigned long authTokenExpiry = 0;
 const unsigned long AUTH_TOKEN_DURATION = 3600000;  // 1 hour
+
+// Failed-login backoff: doubles each consecutive failure (capped), resets on success.
+// Beats a flat 1s delay against repeated/scripted password guesses.
+unsigned long loginFailCount = 0;
+const unsigned long LOGIN_BACKOFF_MAX_MS = 8000;
+
+unsigned long loginBackoffMs() {
+    unsigned long ms = 250UL << (loginFailCount < 6 ? loginFailCount : 6);  // 250,500,1000,...,8000
+    return ms > LOGIN_BACKOFF_MAX_MS ? LOGIN_BACKOFF_MAX_MS : ms;
+}
+
+// Unguessable session token: 16 bytes from the hardware RNG, hex-encoded (32 chars).
+// Replaces the old millis()+random(1000,9999) scheme, which was low-entropy and
+// predictable from boot time.
+String generateAuthToken() {
+    uint8_t buf[16];
+    for (int i = 0; i < 16; i++) buf[i] = (uint8_t)(esp_random() & 0xFF);
+    char hex[33];
+    for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", buf[i]);
+    hex[32] = '\0';
+    return String(hex);
+}
 
 void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
     static unsigned long lastFailLog = 0;
@@ -374,8 +383,6 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
                 // Setting handshake: Main got it, stop resending
                 if (pendingSettingRemainingSends > 0) {
                     pendingSettingRemainingSends = 0;
-                    // If we're applying boot settings from backend, enqueue next
-                    applyNextBootSetting();
                 }
             }
         }
@@ -399,28 +406,6 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
 }
 
 // Human-readable name for command type (for serial logs)
-static const char* espNowCommandName(uint8_t cmd) {
-    switch (cmd) {
-        case CMD_PRINT: return "PRINT";
-        case CMD_PRINT_CHUNK: return "PRINT_CHUNK";
-        case CMD_PRINT_CHUNK_START: return "PRINT_CHUNK_START";
-        case CMD_DISPENSE_START: return "DISPENSE_START";
-        case CMD_DISPENSE_STOP: return "DISPENSE_STOP";
-        case CMD_RESET_SANITIZER: return "RESET_SANITIZER";
-        case CMD_SET_LED_BRIGHTNESS: return "SET_LED_BRIGHTNESS";
-        case CMD_SET_LED_STATE: return "SET_LED_STATE";
-        case CMD_SET_AUTO_BRIGHTNESS: return "SET_AUTO_BRIGHTNESS";
-        case CMD_TEST_PRINTER: return "TEST_PRINTER";
-        case CMD_TEST_PUMP: return "TEST_PUMP";
-        case CMD_TEST_LED: return "TEST_LED";
-        case CMD_SET_PUMP_DURATION: return "SET_PUMP_DURATION";
-        case CMD_SET_PUMP_COOLDOWN: return "SET_PUMP_COOLDOWN";
-        case CMD_SET_AUTO_DISPENSE: return "SET_AUTO_DISPENSE";
-        case CMD_SET_LIGHT_CALIBRATION: return "SET_LIGHT_CALIBRATION";
-        default: return "CMD_?";
-    }
-}
-
 // Send a long print message in chunks; handshake: send 1 → recv ACK 1 → send 2 → recv ACK 2 → ...
 // messageOnly: true = just the text (e.g. from index.html); false = full receipt with title, date, weather (e.g. from Shortcut)
 #define PRINT_CHUNK_DELAY_MS 300
@@ -1794,93 +1779,6 @@ void saveGroceries() {
     sdCard.writeFile(DATA_DIR "/groceries.json", json);
 }
 
-void loadSettingsFromSD() {
-    if (!sdCard.isReady()) return;
-    String response;
-    if (!sdCard.readFile(DATA_DIR "/config.json", response) || response.length() == 0) return;
-    DynamicJsonDocument doc(512);
-    if (deserializeJson(doc, response) != DeserializationError::Ok) return;
-    if (doc["ledBrightness"].is<uint8_t>()) {
-        lastSensorData.ledBrightness = doc["ledBrightness"].as<uint8_t>();
-        lastSensorDataValid = true;
-    }
-    if (doc["ledBrightness"].is<int>()) {
-        int v = doc["ledBrightness"].as<int>();
-        if (v >= 0 && v <= 255) { lastSensorData.ledBrightness = (uint8_t)v; lastSensorDataValid = true; }
-    }
-    if (doc["autoDispense"].is<bool>()) lastSensorData.autoDispense = doc["autoDispense"].as<bool>();
-    if (doc["autoBrightness"].is<bool>()) lastSensorData.autoBrightness = doc["autoBrightness"].as<bool>();
-    if (doc["pumpDurationTenths"].is<int>()) { int v = doc["pumpDurationTenths"].as<int>(); if (v >= 0 && v <= 255) lastPumpDurationTenths = v; }
-    if (doc["pumpCooldownTenths"].is<int>()) { int v = doc["pumpCooldownTenths"].as<int>(); if (v >= 0 && v <= 255) lastPumpCooldownTenths = v; }
-    // Queue settings to send to Main so it remembers after restart
-    bootSettingsCount = 0;
-    if (bootSettingsCount < BOOT_SETTINGS_MAX && (doc["ledBrightness"].is<int>() || doc["ledBrightness"].is<uint8_t>())) {
-        int b = doc["ledBrightness"].is<int>() ? doc["ledBrightness"].as<int>() : (int)doc["ledBrightness"].as<uint8_t>();
-        if (b >= 0 && b <= 255) {
-            bootSettingsToSend[bootSettingsCount].type = CMD_SET_LED_BRIGHTNESS;
-            bootSettingsToSend[bootSettingsCount].p1 = (uint8_t)b;
-            bootSettingsToSend[bootSettingsCount].p2 = b > 0 ? 1 : 0;
-            bootSettingsCount++;
-        }
-    }
-    if (bootSettingsCount < BOOT_SETTINGS_MAX && doc["autoDispense"].is<bool>()) {
-        bootSettingsToSend[bootSettingsCount].type = CMD_SET_AUTO_DISPENSE;
-        bootSettingsToSend[bootSettingsCount].p1 = doc["autoDispense"].as<bool>() ? 1 : 0;
-        bootSettingsToSend[bootSettingsCount].p2 = 0;
-        bootSettingsCount++;
-    }
-    if (bootSettingsCount < BOOT_SETTINGS_MAX && doc["autoBrightness"].is<bool>()) {
-        bootSettingsToSend[bootSettingsCount].type = CMD_SET_AUTO_BRIGHTNESS;
-        bootSettingsToSend[bootSettingsCount].p1 = doc["autoBrightness"].as<bool>() ? 1 : 0;
-        bootSettingsToSend[bootSettingsCount].p2 = 0;
-        bootSettingsCount++;
-    }
-    if (bootSettingsCount < BOOT_SETTINGS_MAX && doc["pumpDurationTenths"].is<int>()) {
-        int v = doc["pumpDurationTenths"].as<int>();
-        if (v >= 0 && v <= 255) {
-            bootSettingsToSend[bootSettingsCount].type = CMD_SET_PUMP_DURATION;
-            bootSettingsToSend[bootSettingsCount].p1 = (uint8_t)v;
-            bootSettingsToSend[bootSettingsCount].p2 = 0;
-            bootSettingsCount++;
-        }
-    }
-    if (bootSettingsCount < BOOT_SETTINGS_MAX && doc["pumpCooldownTenths"].is<int>()) {
-        int v = doc["pumpCooldownTenths"].as<int>();
-        if (v >= 0 && v <= 255) {
-            bootSettingsToSend[bootSettingsCount].type = CMD_SET_PUMP_COOLDOWN;
-            bootSettingsToSend[bootSettingsCount].p1 = (uint8_t)v;
-            bootSettingsToSend[bootSettingsCount].p2 = 0;
-            bootSettingsCount++;
-        }
-    }
-    bootSettingsIndex = 0;
-    if (bootSettingsCount > 0 && espNowInitialized)
-        applyNextBootSetting();
-}
-
-static void applyNextBootSetting() {
-    if (bootSettingsIndex >= bootSettingsCount) return;
-    pendingSettingCommandType = bootSettingsToSend[bootSettingsIndex].type;
-    pendingSettingParam1 = bootSettingsToSend[bootSettingsIndex].p1;
-    pendingSettingParam2 = bootSettingsToSend[bootSettingsIndex].p2;
-    pendingSettingMessage[0] = '\0';
-    pendingSettingRemainingSends = SETTINGS_MAX_ATTEMPTS;
-    pendingSettingNextSendAt = millis();
-    bootSettingsIndex++;
-}
-
-void saveSettingsToSD() {
-    if (!sdCard.isReady()) return;
-    DynamicJsonDocument doc(512);
-    doc["ledBrightness"] = lastSensorDataValid ? (int)lastSensorData.ledBrightness : 0;
-    doc["autoDispense"] = lastSensorDataValid ? lastSensorData.autoDispense : false;
-    doc["autoBrightness"] = lastSensorDataValid ? lastSensorData.autoBrightness : false;
-    if (lastPumpDurationTenths >= 0) doc["pumpDurationTenths"] = lastPumpDurationTenths;
-    if (lastPumpCooldownTenths >= 0) doc["pumpCooldownTenths"] = lastPumpCooldownTenths;
-    String json; serializeJson(doc, json);
-    sdCard.writeFile(DATA_DIR "/config.json", json);
-}
-
 void loadTodos() {
     todoCount = 0;
     String response;
@@ -1942,21 +1840,23 @@ void handleLogin() {
         password.trim();
         
         if (password == webPassword) {
-            authToken = String(millis()) + String(random(1000, 9999));
+            loginFailCount = 0;
+            authToken = generateAuthToken();
             authTokenExpiry = millis() + AUTH_TOKEN_DURATION;
-            
+
             String cookieHeader = "auth=" + authToken + "; Path=/; Max-Age=3600; SameSite=Lax";
             server.sendHeader("Set-Cookie", cookieHeader);
-            
+
             String redirectUrl = "/?token=" + authToken;
             String redirectPage = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><script>"
                                  "document.cookie=\"auth=" + authToken + "; Path=/; Max-Age=3600; SameSite=Lax\";"
                                  "setTimeout(function(){window.location.href=\"" + redirectUrl + "\";},50);"
                                  "</script></head><body><p>Login successful! Redirecting...</p></body></html>";
-            
+
             server.send(200, "text/html", redirectPage);
         } else {
-            delay(1000);
+            delay(loginBackoffMs());
+            if (loginFailCount < 100) loginFailCount++;  // cap: avoid unbounded growth over uptime
             server.sendHeader("Location", "/login?error=1");
             server.send(302, "text/plain", "");
         }
@@ -2112,12 +2012,13 @@ void handleApiLogin() {
     password.trim();
     
     if (password == webPassword) {
-        authToken = String(millis()) + String(random(1000, 9999));
+        loginFailCount = 0;
+        authToken = generateAuthToken();
         authTokenExpiry = millis() + AUTH_TOKEN_DURATION;
-        
+
         String cookieHeader = "auth=" + authToken + "; Path=/; Max-Age=3600; SameSite=Lax";
         server.sendHeader("Set-Cookie", cookieHeader);
-        
+
         DynamicJsonDocument doc(256);
         doc["success"] = true;
         doc["message"] = "Login successful";
@@ -2126,6 +2027,8 @@ void handleApiLogin() {
         serializeJson(doc, response);
         server.send(200, "application/json", response);
     } else {
+        delay(loginBackoffMs());
+        if (loginFailCount < 100) loginFailCount++;
         DynamicJsonDocument doc(128);
         doc["success"] = false;
         doc["error"] = "Invalid password";
@@ -2156,8 +2059,6 @@ void handleGetStatus() {
         doc["autoDispense"] = false; doc["autoBrightness"] = false;
         doc["pumpRunning"] = false;
     }
-    if (lastPumpDurationTenths >= 0) doc["pumpDurationTenths"] = lastPumpDurationTenths;
-    if (lastPumpCooldownTenths >= 0) doc["pumpCooldownTenths"] = lastPumpCooldownTenths;
     String s; serializeJson(doc, s);
     server.send(200, "application/json", s);
 }
@@ -2337,160 +2238,6 @@ void handlePrintTodos() {
     msg += "Date: ";
     msg += dateBuf;
     bool ok = sendPrintChunked(msg);
-    server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
-}
-
-void handleTestPump() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    bool ok = sendCommandViaESPNow(CMD_TEST_PUMP);
-    server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
-}
-
-void handlePumpControl() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    String body = server.arg("plain");
-    DynamicJsonDocument doc(128);
-    if (body.length() == 0 || deserializeJson(doc, body)) {
-        // Invalid body (no log to reduce clutter)
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid JSON\"}");
-        return;
-    }
-    String action = doc["action"].as<String>();
-    action.trim();
-    action.toLowerCase();
-    bool ok = false;
-    if (action == "start") {
-        lastSensorData.isDispensing = true;
-        lastSensorDataValid = true;
-#if !defined(TZT_HEADLESS)
-        updateControlPanelStatus();
-#endif
-        ok = sendPumpCommandRepeated(CMD_DISPENSE_START);
-    } else if (action == "stop") {
-        lastSensorData.isDispensing = false;
-        lastSensorDataValid = true;
-#if !defined(TZT_HEADLESS)
-        updateControlPanelStatus();
-#endif
-        ok = sendPumpCommandRepeated(CMD_DISPENSE_STOP);
-    } else {
-        // Invalid action (no log)
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid action. Use 'start' or 'stop'\"}");
-        return;
-    }
-    if (!ok) Logger::error("Pump", "control: send failed");
-    server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW send failed or not available\"}");
-}
-
-void handleTestLED12V() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    String body = server.arg("plain");
-    uint8_t b = 0; bool st = false;
-    if (body.length() > 0) { 
-        DynamicJsonDocument d(128); 
-        if (!deserializeJson(d, body)) {
-            if (d["brightness"].is<uint8_t>()) b = d["brightness"].as<uint8_t>();
-            else if (d["brightness"].is<int>()) b = (uint8_t)d["brightness"].as<int>();
-            if (d["state"].is<bool>()) st = d["state"].as<bool>();
-            else if (b > 0) st = true;  // If brightness > 0, assume state is true
-        }
-    }
-    lastSensorData.ledBrightness = b;
-    lastSensorDataValid = true;
-    settingsNeedSave = true;
-#if !defined(TZT_HEADLESS)
-    updateControlPanelStatus();
-#endif
-    enqueueSettingCommand(CMD_SET_LED_BRIGHTNESS, b, st ? 1 : 0, "");
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleSetPumpDuration() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument d(128);
-    if (deserializeJson(d, server.arg("plain")) || !d["duration"].is<int>()) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid body, need duration 0-255\"}"); return;
-    }
-    int v = d["duration"].as<int>();
-    if (v < 0) v = 0; if (v > 255) v = 255;
-    lastPumpDurationTenths = v;
-    settingsNeedSave = true;
-    enqueueSettingCommand(CMD_SET_PUMP_DURATION, (uint8_t)v, 0, "");
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleSetPumpCooldown() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument d(128);
-    if (deserializeJson(d, server.arg("plain")) || !d["cooldown"].is<int>()) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid body, need cooldown 0-255\"}"); return;
-    }
-    int v = d["cooldown"].as<int>();
-    if (v < 0) v = 0; if (v > 255) v = 255;
-    lastPumpCooldownTenths = v;
-    settingsNeedSave = true;
-    enqueueSettingCommand(CMD_SET_PUMP_COOLDOWN, (uint8_t)v, 0, "");
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleSetLightCalibration() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument d(128);
-    if (deserializeJson(d, server.arg("plain")) || !d["on"].is<bool>()) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid body, need on: true|false\"}"); return;
-    }
-    bool on = d["on"].as<bool>();
-    enqueueSettingCommand(CMD_SET_LIGHT_CALIBRATION, on ? 1 : 0, 0, "");
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleSetAutoDispense() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument d(128);
-    if (deserializeJson(d, server.arg("plain")) || !d["enabled"].is<bool>()) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid body, need enabled: true|false\"}"); return;
-    }
-    bool en = d["enabled"].as<bool>();
-    lastSensorData.autoDispense = en;
-    lastSensorDataValid = true;
-    settingsNeedSave = true;
-#if !defined(TZT_HEADLESS)
-    updateControlPanelStatus();
-#endif
-    enqueueSettingCommand(CMD_SET_AUTO_DISPENSE, en ? 1 : 0, 0, "");
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleGetAutomation() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(128);
-    doc["autoBrightness"] = lastSensorDataValid ? lastSensorData.autoBrightness : false;
-    doc["autoDispense"] = lastSensorDataValid ? lastSensorData.autoDispense : false;
-    if (lastPumpDurationTenths >= 0) doc["pumpDurationTenths"] = lastPumpDurationTenths;
-    if (lastPumpCooldownTenths >= 0) doc["pumpCooldownTenths"] = lastPumpCooldownTenths;
-    String s; serializeJson(doc, s);
-    server.send(200, "application/json", s);
-}
-
-void handleSetAutomation() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument d(128);
-    if (!deserializeJson(d, server.arg("plain")) && d["autoBrightness"].is<bool>()) {
-        bool on = d["autoBrightness"].as<bool>();
-        lastSensorData.autoBrightness = on;
-        lastSensorDataValid = true;
-        settingsNeedSave = true;
-#if !defined(TZT_HEADLESS)
-        updateControlPanelStatus();
-#endif
-        enqueueSettingCommand(CMD_SET_AUTO_BRIGHTNESS, on ? 1 : 0, 0, "");
-    }
-    server.send(200, "application/json", JSON_SUCCESS);
-}
-
-void handleTestPrinter() {
-    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    bool ok = sendCommandViaESPNow(CMD_TEST_PRINTER);
     server.send(200, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
 }
 
@@ -2786,118 +2533,6 @@ void handleRoot() {
             border-radius: 10px;
         }
         .empty-state { text-align: center; color: #777; font-style: italic; padding: 16px; font-size: 14px; }
-        .control-grid {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 14px;
-            margin: 14px 0;
-        }
-        .control-half {
-            background: #fff;
-            border: 2px solid #4a7c2a;
-            border-left: 4px solid #8b4513;
-            border-radius: 12px;
-            padding: 14px;
-            display: flex;
-            flex-direction: column;
-        }
-        .control-half .ctrl-title {
-            font-size: 16px;
-            font-weight: 700;
-            color: #2d5016;
-            margin-bottom: 10px;
-        }
-        .slider-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 6px;
-            font-size: 15px;
-            color: #5d4037;
-            font-weight: 600;
-            min-height: 28px;
-        }
-        .slider-row .val { color: #2d5016; min-width: 40px; text-align: right; }
-        .ctrl-slider {
-            width: 100%;
-            height: 12px;
-            border-radius: 6px;
-            margin-bottom: 12px;
-            -webkit-appearance: none;
-            background: #c5d4b8;
-            box-sizing: border-box;
-        }
-        .ctrl-slider:disabled { opacity: 0.5; pointer-events: none; }
-        .ctrl-slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            background: #4a7c2a;
-            border: 2px solid #2d5016;
-            cursor: pointer;
-            margin-top: -8px;
-        }
-        .ctrl-slider::-moz-range-thumb {
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            background: #4a7c2a;
-            border: 2px solid #2d5016;
-            cursor: pointer;
-        }
-        .cal-btns, .pump-btns { display: flex; gap: 10px; margin-top: 12px; }
-        .cal-btns button, .pump-btns button {
-            flex: 1;
-            min-height: 44px;
-            padding: 12px;
-            font-size: 16px;
-            border-radius: 10px;
-        }
-        .cal-btns button:disabled, .pump-btns button:disabled { opacity: 0.5; }
-        .cal-btns .cal-off { background: #3e2723; color: #e8ecd8; }
-        .cal-btns .cal-on { background: #4a7c2a; color: #fff; }
-        .sensor-toggle-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px solid #c5d4b8;
-        }
-        .sensor-toggle-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 15px;
-            color: #5d4037;
-            font-weight: 600;
-            min-height: 44px;
-        }
-        .tog {
-            width: 52px;
-            height: 30px;
-            border-radius: 15px;
-            background: #3e2723;
-            cursor: pointer;
-            position: relative;
-            flex-shrink: 0;
-            transition: background 0.2s;
-        }
-        .tog.on { background: #4a7c2a; }
-        .tog::after {
-            content: '';
-            position: absolute;
-            width: 26px;
-            height: 26px;
-            border-radius: 50%;
-            background: #fff;
-            top: 2px;
-            left: 2px;
-            transition: left 0.2s;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        .tog.on::after { left: 24px; }
         textarea.reminder-msg, textarea.todo-msg {
             width: 100%;
             min-height: 100px;
@@ -3023,47 +2658,11 @@ void handleRoot() {
         </div>
         </details>
         
-        <details class="collapsible" open>
-        <summary class="section-title">💧 Pump & LED</summary>
-        <div class="section">
-            <div class="control-grid">
-                <div class="control-half">
-                    <div class="ctrl-title">Pump</div>
-                    <div class="slider-row"><span>Duration</span><span class="val" id="durVal">2.0s</span></div>
-                    <input type="range" class="ctrl-slider" id="durSl" min="5" max="255" value="20">
-                    <div class="slider-row"><span>Cooldown</span><span class="val" id="coVal">3.0s</span></div>
-                    <input type="range" class="ctrl-slider" id="coSl" min="10" max="255" value="30">
-                    <div class="pump-btns">
-                        <button type="button" id="pumpStartBtn" class="btn-success" onclick="pumpStart()">Start</button>
-                        <button type="button" id="pumpStopBtn" class="btn-danger" onclick="pumpStop()">Stop</button>
-                    </div>
-                </div>
-                <div class="control-half">
-                    <div class="ctrl-title">LED</div>
-                    <div class="slider-row"><span>Level</span><span class="val" id="ledVal">0%</span></div>
-                    <input type="range" class="ctrl-slider" id="ledSl" min="0" max="100" value="0">
-                    <div class="cal-btns">
-                        <button type="button" class="cal-off" onclick="setCalibrate(false)">Min</button>
-                        <button type="button" class="cal-on" onclick="setCalibrate(true)">Max</button>
-                    </div>
-                </div>
-            </div>
-            <div class="sensor-toggle-row">
-                <div class="sensor-toggle-item"><span>Pump sensor</span><div class="tog" id="togPump" onclick="togglePumpSensor(this)" title="Auto dispense"></div></div>
-                <div class="sensor-toggle-item"><span>LED sensor</span><div class="tog" id="togLed" onclick="toggleLedSensor(this)" title="Auto brightness"></div></div>
-            </div>
-        </div>
-        </details>
-
         <details class="collapsible">
         <summary class="section-title">🔧 Hardware Diagnostics</summary>
         <div class="section">
             <div style="font-size:12px;color:#777;margin-bottom:10px;">
-                These send a test command over ESP-NOW to the main board. "Sent" means the command was delivered — check the printer/pump/LED in person to confirm it actually worked.
-            </div>
-            <div class="input-group" style="flex-wrap: wrap;">
-                <button type="button" onclick="testPrinter()" style="min-width:45%;">🖨️ Test Printer</button>
-                <button type="button" onclick="testPump()" style="min-width:45%;">💧 Test Pump</button>
+                Pump/LED testing and hardware settings (duration, cooldown, calibration, auto-dispense, auto-brightness) now live on the Main ESP32's own test server — see its status IP:8081. Keeping control in one place avoids conflicting settings.
             </div>
             <div class="input-group" style="flex-wrap: wrap;">
                 <button type="button" onclick="testSensors()" style="min-width:45%;">📡 Read Sensors</button>
@@ -3130,56 +2729,6 @@ void handleRoot() {
                 .then(d => { if (d.success) ref(); });
         }
         
-        function pumpStart() {
-            var pumpEl = document.getElementById('pump');
-            var prev = pumpEl ? pumpEl.textContent : 'OFF';
-            if (pumpEl) pumpEl.textContent = 'ON';
-            po('/api/test/pump-control', {action: 'start'}).then(d => {
-                if (!d.success) { if (pumpEl) pumpEl.textContent = prev; }
-                else setTimeout(ref, 400);
-            });
-        }
-        function pumpStop() {
-            var pumpEl = document.getElementById('pump');
-            var prev = pumpEl ? pumpEl.textContent : 'ON';
-            if (pumpEl) pumpEl.textContent = 'OFF';
-            po('/api/test/pump-control', {action: 'stop'}).then(d => {
-                if (!d.success) { if (pumpEl) pumpEl.textContent = prev; }
-                else setTimeout(ref, 400);
-            });
-        }
-        function setCalibrate(on) { po('/api/led/calibrate', {on: on}).then(d => { if (d.success) ref(); }); }
-        function applyPumpSensorUI(autoDispenseOn) {
-            var togPump = document.getElementById('togPump');
-            var durSl = document.getElementById('durSl'), coSl = document.getElementById('coSl');
-            var pumpStartBtn = document.getElementById('pumpStartBtn'), pumpStopBtn = document.getElementById('pumpStopBtn');
-            if (togPump) { if (autoDispenseOn) togPump.classList.add('on'); else togPump.classList.remove('on'); }
-            if (durSl) durSl.disabled = !autoDispenseOn;
-            if (coSl) coSl.disabled = !autoDispenseOn;
-            if (pumpStartBtn) pumpStartBtn.disabled = autoDispenseOn;
-            if (pumpStopBtn) pumpStopBtn.disabled = autoDispenseOn;
-        }
-        function applyLedSensorUI(autoBrightnessOn) {
-            var togLed = document.getElementById('togLed');
-            var ledSl = document.getElementById('ledSl');
-            var calBtns = document.querySelectorAll('.cal-btns button');
-            if (togLed) { if (autoBrightnessOn) togLed.classList.add('on'); else togLed.classList.remove('on'); }
-            if (ledSl) ledSl.disabled = autoBrightnessOn;
-            if (calBtns) calBtns.forEach(function(btn){ btn.disabled = !autoBrightnessOn; });
-        }
-        function togglePumpSensor(el) {
-            el.classList.toggle('on');
-            var on = el.classList.contains('on');
-            applyPumpSensorUI(on);
-            po('/api/pump/auto-dispense', {enabled: on}).then(d => { if (!d.success) { applyPumpSensorUI(!on); } });
-        }
-        function toggleLedSensor(el) {
-            el.classList.toggle('on');
-            var on = el.classList.contains('on');
-            applyLedSensorUI(on);
-            po('/api/test/automation', {autoBrightness: on}).then(d => { if (!d.success) { applyLedSensorUI(!on); } });
-        }
-        
         function ref() {
             q('/api/status').then(d => {
                 document.getElementById('mo').textContent = typeof d.moisture === 'number' ? d.moisture.toFixed(1) + '%' : (d.moisture || '—');
@@ -3192,27 +2741,12 @@ void handleRoot() {
                 if (ledLevelEl) { var p = (typeof d.ledBrightness === 'number') ? Math.round((d.ledBrightness / 255) * 100) : 0; ledLevelEl.textContent = p + '%'; }
                 var pumpEl = document.getElementById('pump');
                 if (pumpEl) pumpEl.textContent = d.dispensing ? 'ON' : 'OFF';
-                var ledSl = document.getElementById('ledSl');
-                if (ledSl && typeof d.ledBrightness === 'number') { var p = Math.round((d.ledBrightness / 255) * 100); ledSl.value = p; document.getElementById('ledVal').textContent = p + '%'; }
-                // Sync sensor toggles and dependent controls (uses same helpers as optimistic toggle)
-                if (d.autoDispense !== undefined) applyPumpSensorUI(d.autoDispense);
-                if (d.autoBrightness !== undefined) applyLedSensorUI(d.autoBrightness);
             });
         }
         ref();
         setInterval(ref, 3000);
         setInterval(loadReminders, 30000);
-        
-        (function() {
-            var durSl = document.getElementById('durSl'), coSl = document.getElementById('coSl'), ledSl = document.getElementById('ledSl');
-            function updateDur() { var v = parseInt(durSl.value, 10); document.getElementById('durVal').textContent = (v/10).toFixed(1) + 's'; po('/api/pump/duration', {duration: v}); }
-            function updateCo() { var v = parseInt(coSl.value, 10); document.getElementById('coVal').textContent = (v/10).toFixed(1) + 's'; po('/api/pump/cooldown', {cooldown: v}); }
-            function updateLed() { var v = parseInt(ledSl.value, 10); document.getElementById('ledVal').textContent = v + '%'; var b = Math.round((v/100)*255); po('/api/test/led12v', {brightness: b, state: v > 0}); }
-            if (durSl) { durSl.addEventListener('input', function() { document.getElementById('durVal').textContent = (parseInt(durSl.value,10)/10).toFixed(1) + 's'; }); durSl.addEventListener('change', updateDur); }
-            if (coSl) { coSl.addEventListener('input', function() { document.getElementById('coVal').textContent = (parseInt(coSl.value,10)/10).toFixed(1) + 's'; }); coSl.addEventListener('change', updateCo); }
-            if (ledSl) { ledSl.addEventListener('input', function() { var v = parseInt(ledSl.value,10); document.getElementById('ledVal').textContent = v + '%'; }); ledSl.addEventListener('change', function() { var v = parseInt(ledSl.value,10); var b = Math.round((v/100)*255); po('/api/test/led12v', {brightness: b, state: v > 0}); }); }
-        })();
-        
+
         function updateReminderListUI(reminders) {
             let h = '';
             if (!reminders || Object.keys(reminders).length === 0) {
@@ -3449,8 +2983,6 @@ void handleRoot() {
             }).catch(() => showDiagResult(false, failText))
               .finally(() => { btn.disabled = false; btn.textContent = prevLabel; });
         }
-        function testPrinter() { runDiag(event.target, '/api/test/printer', undefined, 'Test print sent — check the printer for output', 'Could not reach printer (ESP-NOW offline?)'); }
-        function testPump() { runDiag(event.target, '/api/test/pump', undefined, 'Pump test sent — watch for water flow', 'Could not reach pump (ESP-NOW offline?)'); }
         function testMessage() { runDiag(event.target, '/api/test/send-message', {}, 'Test message sent to printer', 'Could not send test message'); }
         function testSensors() {
             var btn = event.target;
@@ -3546,17 +3078,9 @@ void setupWebServer() {
     server.on("/api/status", HTTP_GET, handleGetStatus);
     server.on("/api/reset-sanitizer", HTTP_POST, handleResetSanitizer);
     
-    // Hardware test API (sensors, pump, LED, etc. used by main dashboard)
-    server.on("/api/test/pump", HTTP_POST, handleTestPump);
-    server.on("/api/test/pump-control", HTTP_POST, handlePumpControl);
-    server.on("/api/test/led12v", HTTP_POST, handleTestLED12V);
-    server.on("/api/pump/duration", HTTP_POST, handleSetPumpDuration);
-    server.on("/api/pump/cooldown", HTTP_POST, handleSetPumpCooldown);
-    server.on("/api/pump/auto-dispense", HTTP_POST, handleSetAutoDispense);
-    server.on("/api/led/calibrate", HTTP_POST, handleSetLightCalibration);
-    server.on("/api/test/automation", HTTP_GET, handleGetAutomation);
-    server.on("/api/test/automation", HTTP_POST, handleSetAutomation);
-    server.on("/api/test/printer", HTTP_POST, handleTestPrinter);
+    // Hardware pump/LED control, tests, and settings now live only on the Main ESP32's
+    // TestServer (port 8081) - see TestServer.h. Keeps a single source of truth so the TZT
+    // dashboard and that server can't issue conflicting commands.
     server.on("/api/test/send-message", HTTP_POST, handleTestSendMessage);
     server.on("/api/test/play-audio", HTTP_POST, handleTestPlayAudio);
     server.on("/api/test/show-image", HTTP_POST, handleTestShowImage);
@@ -3796,7 +3320,7 @@ void setup() {
 
     esp_task_wdt_reset();  // Feed WDT before backend init
     Logger::setLevel(LOG_LEVEL_INFO);
-    backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT);
+    backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT, BACKEND_API_KEY);
     backend->setRetryPolicy(3, 1000);
     backend->setRateLimit(60);
     reminderService = new ReminderService(backend);
@@ -3808,7 +3332,6 @@ void setup() {
     }
     loadGroceries();
     loadTodos();
-    loadSettingsFromSD();  // Restore LED, autoDispense, autoBrightness, pump duration/cooldown; send to Main
 
     // Initialize SD card (VSPI — independent of display HSPI)
     if (sdCard.begin()) {
@@ -3897,8 +3420,6 @@ void setup() {
                 delay(100);  // Small delay for peer to be fully registered
                 if (esp_now_is_peer_exist(mainESP32Mac)) {
                     espNowInitialized = true;
-                    if (bootSettingsCount > 0 && bootSettingsIndex < bootSettingsCount)
-                        applyNextBootSetting();
                 } else {
                     Logger::warn("ESP-NOW", "peer verify failed");
                 }
@@ -4132,16 +3653,6 @@ void loop() {
         }
     }
 
-    // Save settings to SD (debounced: max once per 5s) so restart remembers LED, toggles, pump duration/cooldown
-    if (settingsNeedSave && sdCard.isReady()) {
-        unsigned long now = millis();
-        if (now - lastSettingsSaveTime >= SAVE_DEBOUNCE_MS) {
-            settingsNeedSave = false;
-            lastSettingsSaveTime = now;
-            saveSettingsToSD();
-        }
-    }
-    
     // Save todos to SD
     if (todosNeedSave && sdCard.isReady()) {
         todosNeedSave = false;

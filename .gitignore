@@ -1,2 +1,12 @@
 include/secrets.h
 .pio/
+.claude/
+
+# Python backend (raspberrypi/, scripts/)
+venv/
+__pycache__/
+*.pyc
+.env
+raspberrypi/data.json
+raspberrypi/data.json.lock
+raspberrypi/uploads/

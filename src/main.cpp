@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ESP32 Print-n-Prick - Hardware Controller (Main ESP32)
  * Receives commands from TZT via ESP-NOW; controls printer, pump, sensors, LED.
  * TZT runs web server and HTTP backend, and sends all commands here.
@@ -8,6 +8,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <WebServer.h>
+#include <esp_task_wdt.h>
 #include <time.h>
 #include <ArduinoJson.h>
 
@@ -20,14 +22,14 @@
 #include "OTAUpdateService.h"
 #include "EspNowService.h"
 #include "EspNowProtocol.h"
-#include "HardwareTest.h"
+#include "TestServer.h"
 
 // Global service instances
 HardwareAbstraction* hardware;
 PrinterService* printerService;
 OTAUpdateService* otaService;
 EspNowService* espNowService;
-HardwareTest* hardwareTest;
+TestServer* testServer;
 
 String deviceIP = "";  // For logging
 
@@ -36,6 +38,12 @@ static uint8_t espNowTestType = 0;           // 0=none, 1=pump, 2=led
 static unsigned long espNowTestStartMs = 0;  // millis() when test started
 static const unsigned long TEST_PUMP_DURATION_MS = 800;
 static const unsigned long TEST_LED_DURATION_MS = 1000;
+static unsigned long espNowTestDurationMs = 0;  // actual duration for the in-flight test (set per-call)
+
+// Cancels this file's in-flight pump/LED test pulse without touching the
+// actuator - called before TestServer starts its own pulse, so only one
+// timer is left owning the shutoff. Defined here so TestServer.cpp can call it.
+void cancelEspNowTest() { espNowTestType = 0; }
 
 // Auto-dispense: when true, IR sensor triggers pump; when false, only manual/ESP-NOW commands do
 static bool autoDispenseEnabled = true;
@@ -78,7 +86,6 @@ static String boundedMessageString(const char* buf, size_t cap) {
 void setupWiFi();
 void setupTime();
 void handleEspNowCommand(CommandPacket* cmd);
-void handleSerialCommands();
 static bool isPreformattedPrint(const String& full);
 static String getWeatherOneLine();
 
@@ -117,7 +124,7 @@ void setup() {
     
     // CRITICAL: GPIO 0 is now used for Touch IRQ, ensure it stays HIGH during boot
     // GPIO 0 must be HIGH for normal boot mode (already set above, but ensure it's stable)
-    // No need to set Serial2 pins (GPIO 4, 33) - they're safe and don't interfere with boot
+    // Serial2 pins (GPIO 17, 16) are configured by HardwareAbstraction::initializePrinter()
     delay(100);  // Ensure pins are stable
     
     Serial.begin(115200);
@@ -131,14 +138,20 @@ void setup() {
     Logger::info("Main", "Build: " + String(BUILD_DATE) + " " + String(BUILD_TIME));
     Logger::info("Main", "========================================");
     Logger::info("Main", "Strapping pins set to safe state (all pins moved to non-strapping GPIOs)");
-    
+
+    // 200s so the WiFi config portal (up to 180s) doesn't trip the watchdog; loop() feeds every iteration.
+    esp_task_wdt_init(200, true);
+    esp_task_wdt_add(NULL);
+
     // Setup WiFi FIRST - so the "Print-n-Prick" config AP appears even if hardware
     // (printer, sensors, etc.) fails or is disconnected. lets you use WiFi Manager
     // to connect to your network before any peripheral init.
+    esp_task_wdt_reset();  // Feed before blocking WiFi connect/portal
     setupWiFi();
     Serial.println("Print-n-Prick ready | MAC: " + WiFi.macAddress() + " | IP: " + deviceIP);
     delay(500);
-    
+    esp_task_wdt_reset();
+
     // Initialize hardware abstraction layer
     hardware = new HardwareAbstraction();
     if (!hardware->initialize()) {
@@ -146,18 +159,15 @@ void setup() {
         // Don't halt - continue without some hardware features
         Logger::warn("Main", "Continuing with limited hardware functionality");
     }
-    
+
     // Initialize printer service
     printerService = new PrinterService(hardware);
     Logger::info("Main", "Printer service initialized");
-    
-    // Initialize hardware test suite
-    hardwareTest = new HardwareTest(hardware, printerService);
-    Logger::info("Main", "Hardware test suite initialized");
-    
+
+    esp_task_wdt_reset();  // Feed before NTP sync (network call, can block)
     // Setup time
     setupTime();
-    
+
     // Initialize ESP-NOW (receive commands from TZT, send sensor data to TZT)
     espNowService = new EspNowService();
     espNowService->setCommandCallback(handleEspNowCommand);  // Always set: commands are handled even if peer add fails (we can still receive)
@@ -176,15 +186,20 @@ void setup() {
     otaService->initialize("Print-n-Prick");
     #endif
     Logger::info("Main", "OTA update service initialized");
-    
+
+    testServer = new TestServer(hardware, printerService, &autoDispenseEnabled);
+    testServer->begin();
+
     Logger::info("Main", "Setup complete!");
     Logger::info("Main", "Starting main loop...");
 }
 
 void loop() {
-    // Handle Serial commands (for testing)
-    handleSerialCommands();
-    
+    esp_task_wdt_reset();
+
+    testServer->handleClient();
+    testServer->update();
+
     // Handle OTA updates (high priority)
     otaService->handle();
     
@@ -201,10 +216,10 @@ void loop() {
     // Non-blocking ESP-NOW test timeout (TEST_PUMP / TEST_LED)
     if (espNowTestType != 0 && hardware) {
         unsigned long elapsed = millis() - espNowTestStartMs;
-        if (espNowTestType == 1 && elapsed >= TEST_PUMP_DURATION_MS) {
+        if (espNowTestType == 1 && elapsed >= espNowTestDurationMs) {
             hardware->stopPump();
             espNowTestType = 0;
-        } else if (espNowTestType == 2 && elapsed >= TEST_LED_DURATION_MS) {
+        } else if (espNowTestType == 2 && elapsed >= espNowTestDurationMs) {
             hardware->setLEDBrightness(0);
             espNowTestType = 0;
         }
@@ -241,7 +256,7 @@ void loop() {
         lastLEDUpdate = millis();
     }
     
-    // Fast path: sensor → actuator (light → LED). Only when auto-brightness on (saves CPU when manual).
+    // Fast path: sensor â†’ actuator (light â†’ LED). Only when auto-brightness on (saves CPU when manual).
     static unsigned long lastActuatorUpdate = 0;
     if (hardware->isAutoBrightnessEnabled() && (millis() - lastActuatorUpdate >= SENSOR_ACTUATOR_INTERVAL_MS)) {
         hardware->readLightSensor();   // Keep light cache fresh for LED
@@ -253,7 +268,7 @@ void loop() {
     static unsigned long lastSensorCheck = 0;
     if (millis() - lastSensorCheck > SENSOR_CHECK_INTERVAL) {
         hardware->readMoistureSensor();
-        hardware->readIRSensor();      // Cache for ESP-NOW; IR→pump trigger uses digitalRead every loop
+        hardware->readIRSensor();      // Cache for ESP-NOW; IRâ†’pump trigger uses digitalRead every loop
         hardware->readLightSensor();   // Keep cache in sync for ESP-NOW payload
         lastSensorCheck = millis();
     }
@@ -320,7 +335,7 @@ void loop() {
                     printerService->setWeather(getWeatherOneLine());
                     printerService->printReceipt(full, true, time(nullptr));
                 }
-                Serial.println("✅ Printed (" + String(nChunks) + " chunks)");
+                Serial.println("âœ… Printed (" + String(nChunks) + " chunks)");
             }
         }
         // Drain CHUNK_ACK queue (never send from callback = no NO_MEM). One ACK per 40ms so prints never stall.
@@ -337,7 +352,7 @@ void loop() {
             espNowService->clearRetryState();
         }
         // Wait at least 3 seconds after ESP-NOW init before sending.
-        // Skip during chunked print (first chunk received → pause until print done + 500ms).
+        // Skip during chunked print (first chunk received â†’ pause until print done + 500ms).
         // Skip if CHUNK_ACK queue has pending (so ACKs drain first; avoids NO_MEM).
         // Skip if a send is still in flight to avoid ESP-NOW NO_MEM (TX queue full).
         else if ((millis() - espNowInitTime) >= 3000 && (millis() - lastEspNowSend >= ESP_NOW_SEND_INTERVAL) && !espNowService->hasSendInFlight()
@@ -392,7 +407,7 @@ void loop() {
         }
     }
 
-    delay(1);  // Short delay for sensor→actuator responsiveness (IR→pump, light→LED). HTTP latency not a priority.
+    delay(1);  // Short delay for sensorâ†’actuator responsiveness (IRâ†’pump, lightâ†’LED). HTTP latency not a priority.
 }
 
 void setupWiFi() {
@@ -430,7 +445,7 @@ void setupWiFi() {
     Logger::info("WiFi", "Final WiFi status code: " + String(finalStatus));
     
     if (!res) {
-        Logger::error("WiFi", "❌ Failed to connect to WiFi");
+        Logger::error("WiFi", "âŒ Failed to connect to WiFi");
         String statusStr = "";
         switch(finalStatus) {
             case WL_IDLE_STATUS: statusStr = "IDLE"; break;
@@ -445,7 +460,7 @@ void setupWiFi() {
         Logger::error("WiFi", "WiFi status: " + statusStr);
     } else {
         deviceIP = WiFi.localIP().toString();
-        Logger::info("WiFi", "✅ Connected successfully!");
+        Logger::info("WiFi", "âœ… Connected successfully!");
         Logger::info("WiFi", "IP Address: " + deviceIP);
         Logger::info("WiFi", "RSSI: " + String(WiFi.RSSI()) + " dBm");
         Logger::info("WiFi", "SSID: " + String(WiFi.SSID()));
@@ -535,28 +550,6 @@ static String getWeatherOneLine() {
 }
 
 // Human-readable command name for serial logs (matches TZT naming)
-static const char* espNowCommandName(uint8_t cmd) {
-    switch (cmd) {
-        case CMD_PRINT: return "PRINT";
-        case CMD_PRINT_CHUNK: return "PRINT_CHUNK";
-        case CMD_PRINT_CHUNK_START: return "PRINT_CHUNK_START";
-        case CMD_DISPENSE_START: return "DISPENSE_START";
-        case CMD_DISPENSE_STOP: return "DISPENSE_STOP";
-        case CMD_RESET_SANITIZER: return "RESET_SANITIZER";
-        case CMD_SET_LED_BRIGHTNESS: return "SET_LED_BRIGHTNESS";
-        case CMD_SET_LED_STATE: return "SET_LED_STATE";
-        case CMD_SET_AUTO_BRIGHTNESS: return "SET_AUTO_BRIGHTNESS";
-        case CMD_TEST_PRINTER: return "TEST_PRINTER";
-        case CMD_TEST_PUMP: return "TEST_PUMP";
-        case CMD_TEST_LED: return "TEST_LED";
-        case CMD_SET_PUMP_DURATION: return "SET_PUMP_DURATION";
-        case CMD_SET_PUMP_COOLDOWN: return "SET_PUMP_COOLDOWN";
-        case CMD_SET_AUTO_DISPENSE: return "SET_AUTO_DISPENSE";
-        case CMD_SET_LIGHT_CALIBRATION: return "SET_LIGHT_CALIBRATION";
-        default: return "CMD_?";
-    }
-}
-
 // True if message is already formatted (e.g. from TZT: "MESSAGE\n----...", "REMINDER", "GROCERY LIST", "TODO LIST")
 static bool isPreformattedPrint(const String& full) {
     return full.startsWith("MESSAGE\n") || full.startsWith("REMINDER") ||
@@ -638,26 +631,26 @@ void handleEspNowCommand(CommandPacket* cmd) {
         case CMD_DISPENSE_START:
             if (!hardware->isPumpRunning()) {
                 hardware->startPump();
-                Serial.println("✅ Executed: DISPENSE_START (pump on)");
+                Serial.println("âœ… Executed: DISPENSE_START (pump on)");
             }
             break;
         case CMD_DISPENSE_STOP:
             if (hardware->isPumpRunning()) {
                 hardware->stopPump();
-                Serial.println("✅ Executed: DISPENSE_STOP (pump off)");
+                Serial.println("âœ… Executed: DISPENSE_STOP (pump off)");
             }
             break;
         case CMD_RESET_SANITIZER:
             if (hardware->getSanitizerLevel() < 99.0f) {
                 hardware->resetSanitizer();
-                Serial.println("✅ Executed: RESET_SANITIZER");
+                Serial.println("âœ… Executed: RESET_SANITIZER");
             }
             break;
         case CMD_SET_LED_BRIGHTNESS:
             if (hardware->getLEDBrightness() != cmd->param1) {
                 hardware->setLEDBrightness(cmd->param1);
                 if (cmd->param1 == 0) hardware->setAutoBrightness(false);  // User turned off LED
-                Serial.println("✅ Executed: SET_LED_BRIGHTNESS=" + String(cmd->param1));
+                Serial.println("âœ… Executed: SET_LED_BRIGHTNESS=" + String(cmd->param1));
             }
             break;
         case CMD_SET_LED_STATE: {
@@ -666,7 +659,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             if (wantOn != currentlyOn) {
                 hardware->setLEDBrightness(wantOn ? 255 : 0);
                 if (!wantOn) hardware->setAutoBrightness(false);
-                Serial.println("✅ Executed: SET_LED_STATE=" + String(cmd->param1 ? 1 : 0));
+                Serial.println("âœ… Executed: SET_LED_STATE=" + String(cmd->param1 ? 1 : 0));
             }
             break;
         }
@@ -674,7 +667,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             bool wantOn = (cmd->param1 != 0);
             if (hardware->isAutoBrightnessEnabled() != wantOn) {
                 hardware->setAutoBrightness(wantOn);
-                Serial.println("✅ Executed: SET_AUTO_BRIGHTNESS=" + String(cmd->param1 ? 1 : 0));
+                Serial.println("âœ… Executed: SET_AUTO_BRIGHTNESS=" + String(cmd->param1 ? 1 : 0));
             }
             break;
         }
@@ -683,34 +676,38 @@ void handleEspNowCommand(CommandPacket* cmd) {
             pendingSimpleTestPrintReady = true;
             break;
         case CMD_TEST_PUMP:
+            if (testServer) testServer->cancelActiveTest();
             espNowTestType = 1;
             espNowTestStartMs = millis();
+            espNowTestDurationMs = TEST_PUMP_DURATION_MS;
             hardware->startPump();
-            Serial.println("✅ Executed: TEST_PUMP (pump on for " + String(TEST_PUMP_DURATION_MS) + "ms, non-blocking)");
+            Serial.println("âœ… Executed: TEST_PUMP (pump on for " + String(TEST_PUMP_DURATION_MS) + "ms, non-blocking)");
             break;
         case CMD_TEST_LED:
+            if (testServer) testServer->cancelActiveTest();
             espNowTestType = 2;
             espNowTestStartMs = millis();
+            espNowTestDurationMs = TEST_LED_DURATION_MS;
             hardware->setLEDBrightness(255);
-            Serial.println("✅ Executed: TEST_LED (LED on for " + String(TEST_LED_DURATION_MS) + "ms, non-blocking)");
+            Serial.println("âœ… Executed: TEST_LED (LED on for " + String(TEST_LED_DURATION_MS) + "ms, non-blocking)");
             break;
         case CMD_SET_PUMP_DURATION: {
-            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = duration in 100ms units (0–25.5s)
+            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = duration in 100ms units (0â€“25.5s)
             unsigned long cur = hardware->getMaxDispenseDurationMs();
             unsigned long effectiveCur = (cur > 0) ? cur : MAX_DISPENSE_DURATION_MS;
             if (effectiveCur != ms) {
                 hardware->setMaxDispenseDurationMs(ms);
-                Serial.println("✅ Executed: SET_PUMP_DURATION=" + String(ms) + "ms");
+                Serial.println("âœ… Executed: SET_PUMP_DURATION=" + String(ms) + "ms");
             }
             break;
         }
         case CMD_SET_PUMP_COOLDOWN: {
-            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = cooldown in 100ms units (0–25.5s)
+            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = cooldown in 100ms units (0â€“25.5s)
             unsigned long cur = hardware->getDispenseCooldownMs();
             unsigned long effectiveCur = (cur > 0) ? cur : DISPENSE_COOLDOWN_MS;
             if (effectiveCur != ms) {
                 hardware->setDispenseCooldownMs(ms);
-                Serial.println("✅ Executed: SET_PUMP_COOLDOWN=" + String(ms) + "ms");
+                Serial.println("âœ… Executed: SET_PUMP_COOLDOWN=" + String(ms) + "ms");
             }
             break;
         }
@@ -718,7 +715,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             bool wantOn = (cmd->param1 != 0);
             if (autoDispenseEnabled != wantOn) {
                 autoDispenseEnabled = wantOn;
-                Serial.println("✅ Executed: SET_AUTO_DISPENSE=" + String(autoDispenseEnabled ? 1 : 0));
+                Serial.println("âœ… Executed: SET_AUTO_DISPENSE=" + String(autoDispenseEnabled ? 1 : 0));
             }
             break;
         }
@@ -733,7 +730,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             // Apply new calibration to LED immediately (uses cached lightPercent)
             if (hardware->isAutoBrightnessEnabled())
                 hardware->updateLEDBrightness();
-            Serial.println("✅ Executed: SET_LIGHT_CALIBRATION " + String(isMax ? "max" : "min") + " (light=" + String(pct, 1) + "%)");
+            Serial.println("âœ… Executed: SET_LIGHT_CALIBRATION " + String(isMax ? "max" : "min") + " (light=" + String(pct, 1) + "%)");
             break;
         }
         default:
@@ -744,75 +741,6 @@ void handleEspNowCommand(CommandPacket* cmd) {
     if (isSettingCommandType(cmd->commandType)) {
         lastSettingKey = (uint32_t)(cmd->commandType << 16) | (cmd->param1 << 8) | cmd->param2;
         lastSettingTime = millis();
-    }
-}
-
-void handleSerialCommands() {
-    // Check for Serial input (non-blocking)
-    if (Serial.available() > 0) {
-        String command = Serial.readStringUntil('\n');
-        command.replace("\r", "");
-        command.trim();
-        if (command.length() == 0) return;  // Ignore empty line (e.g. Enter only)
-        command.toLowerCase();
-        
-        if (command == "test" || command == "t") {
-            Serial.println("\n>>> Entering Hardware Test Mode");
-            Serial.println(">>> Type 'exit' to return to normal operation\n");
-            
-            if (!hardwareTest) {
-                Serial.println("Test suite not initialized!");
-                return;
-            }
-            
-            // Show initial menu
-            hardwareTest->printTestMenu();
-            
-            // Enter test mode loop
-            while (true) {
-                // Run interactive test menu (handles input and tests)
-                // Returns false if user wants to exit
-                bool continueTesting = hardwareTest->runInteractiveTests();
-                if (!continueTesting) {
-                    Serial.println("\n>>> Exiting test mode");
-                    break;
-                }
-            }
-        } else if (command == "help" || command == "h") {
-            Serial.println("\n=== Available Commands ===");
-            Serial.println("  test, t  - Enter hardware test mode");
-            Serial.println("  help, h  - Show this help message");
-            Serial.println("  status   - Show hardware status");
-            Serial.println("  diag     - Print diagnostics");
-            Serial.println("  light    - Quick light sensor check");
-        } else if (command == "status") {
-            if (hardware) {
-                Serial.println("\n=== Hardware Status ===");
-                Serial.println(hardware->getStatusJSON());
-            }
-        } else if (command == "diag") {
-            if (hardware) {
-                hardware->printDiagnostics();
-            }
-        } else if (command == "light" || command == "l") {
-            // Quick light sensor diagnostic
-            Serial.println("\n=== Light Sensor Quick Check ===");
-            Serial.println("GPIO Pin: " + String(LIGHT_SENSOR_PIN));
-            Serial.println("\nTaking 5 readings...");
-            for (int i = 0; i < 5; i++) {
-                int rawValue = analogRead(LIGHT_SENSOR_PIN);
-                float voltage = (rawValue * 3.3) / 4095.0;
-                float light = hardware->readLightSensor();
-                Serial.println("[" + String(i+1) + "] Raw: " + String(rawValue) + "/4095 | " +
-                             "Voltage: " + String(voltage, 3) + "V | " +
-                             "Light: " + String(light, 1) + "%");
-                delay(500);
-            }
-            Serial.println("\n💡 Tip: Cover/uncover sensor and run 'light' again to see if values change");
-        } else if (command.length() > 0) {
-            Serial.println("Unknown command: " + command);
-            Serial.println("Type 'help' for available commands");
-        }
     }
 }
 

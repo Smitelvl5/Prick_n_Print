@@ -6,8 +6,8 @@
 // ============================================================================
 
 #define SANITIZER_PUMP_PIN 26  // IRF520 MOSFET Driver Module Gate (pump control via MOSFET module) - moved from GPIO 4
-#define THERMAL_TX_PIN 4       // TX2 - Thermal printer TX (ESP32 TX → Printer RX) - moved from GPIO 17 to avoid flash memory boot issues
-#define THERMAL_RX_PIN 33      // RX2 - Thermal printer RX (ESP32 RX → Printer TX) - moved from GPIO 16 to avoid flash memory boot issues
+#define THERMAL_TX_PIN 17      // TX2 - Thermal printer TX (ESP32 TX → Printer RX)
+#define THERMAL_RX_PIN 16      // RX2 - Thermal printer RX (ESP32 RX → Printer TX)
 #define IR_SENSOR_PIN 32       // Infrared sensor (motion detection)
 #define MOISTURE_SENSOR_PIN 34 // Moisture sensor (analog input, input-only pin)
 #define LIGHT_SENSOR_PIN 35    // LM393 Light Sensor Module (analog input, input-only pin)
@@ -61,9 +61,7 @@
 #define DAYLIGHT_OFFSET_SEC 3600     // +1 hour during Daylight Saving Time
 
 // Weather API Settings (using coordinates)
-// WEATHER_API_KEY now comes from secrets.h
-#define WEATHER_LATITUDE 35.074824
-#define WEATHER_LONGITUDE -89.796545
+// WEATHER_API_KEY, WEATHER_LATITUDE, WEATHER_LONGITUDE now come from secrets.h
 
 // Onboard blue LED (GPIO 2 on most ESP32 DevKit). Set to -1 to disable.
 #define BOARD_LED_PIN 2

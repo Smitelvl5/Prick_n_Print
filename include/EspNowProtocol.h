@@ -102,4 +102,28 @@ inline bool verifyChecksum(uint8_t* data, size_t len) {
     return calculated == data[len - 1];
 }
 
+// Human-readable name for a CMD_* constant, for logging (shared by Main and TZT
+// to avoid the two copies drifting out of sync when a command is added/renamed).
+inline const char* espNowCommandName(uint8_t cmd) {
+    switch (cmd) {
+        case CMD_PRINT: return "PRINT";
+        case CMD_PRINT_CHUNK: return "PRINT_CHUNK";
+        case CMD_PRINT_CHUNK_START: return "PRINT_CHUNK_START";
+        case CMD_DISPENSE_START: return "DISPENSE_START";
+        case CMD_DISPENSE_STOP: return "DISPENSE_STOP";
+        case CMD_RESET_SANITIZER: return "RESET_SANITIZER";
+        case CMD_SET_LED_BRIGHTNESS: return "SET_LED_BRIGHTNESS";
+        case CMD_SET_LED_STATE: return "SET_LED_STATE";
+        case CMD_SET_AUTO_BRIGHTNESS: return "SET_AUTO_BRIGHTNESS";
+        case CMD_TEST_PRINTER: return "TEST_PRINTER";
+        case CMD_TEST_PUMP: return "TEST_PUMP";
+        case CMD_TEST_LED: return "TEST_LED";
+        case CMD_SET_PUMP_DURATION: return "SET_PUMP_DURATION";
+        case CMD_SET_PUMP_COOLDOWN: return "SET_PUMP_COOLDOWN";
+        case CMD_SET_AUTO_DISPENSE: return "SET_AUTO_DISPENSE";
+        case CMD_SET_LIGHT_CALIBRATION: return "SET_LIGHT_CALIBRATION";
+        default: return "CMD_?";
+    }
+}
+
 #endif // ESP_NOW_PROTOCOL_H

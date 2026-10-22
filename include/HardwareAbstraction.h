@@ -96,6 +96,7 @@ public:
     bool printerWriteString(const String& str);
     bool printerPrintln(const String& str);
     bool printerAvailable() const;
+    bool printerFeed(uint8_t lines);  // ESC d n - feed n lines, same as holding the printer's FEED button
     
     // Diagnostic
     void printDiagnostics() const;

@@ -1,0 +1,7 @@
+line-length = 120
+
+[lint]
+# Baseline: real correctness/style issues (pyflakes + pycodestyle + isort).
+# Not opting into ruff's stricter opinionated rule sets (datetime tz-awareness,
+# flake8-simplify, etc.) for this small internal tool.
+select = ["E", "F", "I"]

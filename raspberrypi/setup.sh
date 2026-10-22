@@ -3,6 +3,7 @@
 # Prick_n_Print Raspberry Pi setup
 # Installs: Tailscale, nginx (reverse proxy), ufw (firewall), Python Flask server
 # Run: sudo ./setup.sh
+# Re-running is safe and keeps existing data.json/uploads; pass --wipe-data to discard them.
 # Ref: https://tailscale.com/docs/quick-guides
 #
 
@@ -21,17 +22,21 @@ echo "Script dir: $SCRIPT_DIR"
 echo "App user:   $APP_USER"
 echo ""
 
-# --- Clean install: remove old runtime files ---
-echo ">>> Cleaning for fresh install..."
+# --- Clean install: remove old build artifacts (keeps data.json/uploads) ---
+echo ">>> Cleaning build artifacts..."
 systemctl stop prick-n-print 2>/dev/null || true
 cd "$SCRIPT_DIR"
 rm -rf venv
 rm -rf __pycache__ .pytest_cache "templates/__pycache__"
-rm -f data.json
-rm -rf uploads
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
-echo "   Cleaned venv, cache, data.json, uploads"
+echo "   Cleaned venv and cache"
+
+if [[ "${1:-}" == "--wipe-data" ]]; then
+  echo ">>> --wipe-data passed: removing data.json and uploads/"
+  rm -f data.json
+  rm -rf uploads
+fi
 
 # --- Update system ---
 echo ">>> Updating apt..."
@@ -50,6 +55,20 @@ chown -R "$APP_USER:$APP_USER" .
 sudo -u "$APP_USER" python3 -m venv venv
 sudo -u "$APP_USER" ./venv/bin/pip install -q -r requirements.txt
 
+# --- API key (required; ESP32 devices and the web UI send it as X-API-Key) ---
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ -f "$ENV_FILE" ] && grep -q '^PRICK_N_PRINT_API_KEY=' "$ENV_FILE"; then
+  echo ">>> Reusing existing API key from $ENV_FILE"
+else
+  echo ">>> Generating API key..."
+  API_KEY_VALUE="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  echo "PRICK_N_PRINT_API_KEY=$API_KEY_VALUE" > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  chown "$APP_USER:$APP_USER" "$ENV_FILE"
+  echo "   Key written to $ENV_FILE (chmod 600). Copy it into include/secrets.h as BACKEND_API_KEY"
+  echo "   on every ESP32 you flash: $API_KEY_VALUE"
+fi
+
 # --- Systemd service ---
 echo ">>> Creating systemd service..."
 cat > /etc/systemd/system/prick-n-print.service << EOF
@@ -61,7 +80,8 @@ After=network.target
 Type=simple
 User=$APP_USER
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=$SCRIPT_DIR/venv/bin/python $SCRIPT_DIR/app.py
+EnvironmentFile=$ENV_FILE
+ExecStart=$SCRIPT_DIR/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 --access-logfile - --error-logfile - app:app
 Restart=always
 RestartSec=5
 
@@ -71,7 +91,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable prick-n-print
-systemctl start prick-n-print
+systemctl restart prick-n-print
 
 # --- HTTP Basic Auth (for public/port-forwarded access) ---
 # Local & Tailscale IPs skip auth; public internet requires password
@@ -90,10 +110,15 @@ if [ -t 0 ]; then
   chmod 640 "$HTPASSWD_FILE"
   echo "   Auth configured. Local/Tailscale: no password. Public: username=$AUTH_USER"
 else
-  echo ">>> Creating default HTTP auth (change with: sudo ./set-http-password.sh)"
-  htpasswd -bc "$HTPASSWD_FILE" admin changeme
-  chmod 640 "$HTPASSWD_FILE"
-  echo "   WARNING: Using admin/changeme. Run set-http-password.sh to change."
+  echo ""
+  echo "ERROR: Running non-interactively (stdin is not a terminal), so no HTTP Basic Auth"
+  echo "password can be prompted for. Refusing to fall back to a default credential."
+  echo ""
+  echo "Re-run this script interactively (sudo ./setup.sh), or set one now with:"
+  echo "  sudo htpasswd -bc $HTPASSWD_FILE YOUR_USER YOUR_PASSWORD"
+  echo "  sudo chmod 640 $HTPASSWD_FILE"
+  echo "then re-run setup.sh."
+  exit 1
 fi
 
 # --- Nginx reverse proxy ---

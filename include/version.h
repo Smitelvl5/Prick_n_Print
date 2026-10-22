@@ -7,10 +7,4 @@
 #define PROJECT_NAME "Print-n-Prick"
 #define HARDWARE_VERSION "1.0"
 
-// Feature flags
-#define FEATURE_OTA_UPDATE 1
-#define FEATURE_WEB_AUTH 1
-#define FEATURE_RATE_LIMITING 1
-#define FEATURE_HEALTH_CHECK 1
-
 #endif // VERSION_H

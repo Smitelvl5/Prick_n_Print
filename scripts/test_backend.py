@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Test posting message, image, and audio to the TZT backend (Raspberry Pi).
-Run with: python scripts/test_backend.py --url http://192.168.1.50:5000
+Run with: python scripts/test_backend.py --url http://192.168.1.50:5000 --api-key YOUR_KEY
 """
 
 import argparse
@@ -22,9 +22,16 @@ SAMPLES = os.path.join(PROJECT_ROOT, "raspberrypi", "samples")
 def main():
     ap = argparse.ArgumentParser(description="Test TZT backend (message, image, audio)")
     ap.add_argument("--url", "-u", required=True, help="Backend URL (e.g. http://192.168.1.50:5000)")
+    ap.add_argument("--api-key", "-k", default=os.environ.get("PRICK_N_PRINT_API_KEY", ""),
+                     help="Backend API key (or set PRICK_N_PRINT_API_KEY)")
     ap.add_argument("--image", "-i", help="Image path (default: raspberrypi/samples/sample.jpg)")
     ap.add_argument("--audio", "-a", help="Audio path (default: raspberrypi/samples/sample.mp3)")
     args = ap.parse_args()
+
+    if not args.api_key:
+        print("Error: --api-key or PRICK_N_PRINT_API_KEY is required", file=sys.stderr)
+        return 1
+    headers = {"X-API-Key": args.api_key}
 
     base = args.url.rstrip("/")
     image_path = args.image or os.path.join(SAMPLES, "sample.jpg")
@@ -52,6 +59,7 @@ def main():
         r = requests.post(
             f"{base}/api/commands",
             json={"type": "print", "data": "Test from script!", "source": "test"},
+            headers=headers,
             timeout=10,
         )
         if r.status_code in (200, 201):
@@ -71,6 +79,7 @@ def main():
                     f"{base}/api/images",
                     files={"file": (os.path.basename(image_path), f)},
                     data={"name": os.path.basename(image_path)},
+                    headers=headers,
                     timeout=30,
                 )
             if r.status_code in (200, 201):
@@ -92,6 +101,7 @@ def main():
                     f"{base}/api/audio",
                     files={"file": (os.path.basename(audio_path), f)},
                     data={"name": os.path.basename(audio_path)},
+                    headers=headers,
                     timeout=30,
                 )
             if r.status_code in (200, 201):

@@ -6,7 +6,7 @@ An IoT system that pairs a thermal receipt printer with a hand sanitizer dispens
 
 The TZT display polls your web server for commands, audio, and images. You run the included Flask server (or your own) and POST commands to it; the ESP32 polls `/api/commands`, `/api/audio`, and `/api/images`.
 
-**Configure:** In **`include/config_tzt.h`** set **`BACKEND_URL`** to your server (e.g. `"http://192.168.1.146:5000"`). See [BACKEND_HTTP.md](BACKEND_HTTP.md) for setup and usage.
+**Configure:** In **`include/config_tzt.h`** set **`BACKEND_URL`** to your server (e.g. `"http://192.168.1.100:5000"`). See [BACKEND_HTTP.md](BACKEND_HTTP.md) for setup and usage.
 
 | What you send | What the TZT does |
 |---------------|-------------------|
@@ -14,7 +14,7 @@ The TZT display polls your web server for commands, audio, and images. You run t
 | **Audio** | Saves it to SD (`/data/audio/`) and plays it on the TZT. You can send a **URL** (TZT downloads and saves) or a **filename** (play a file already on SD). |
 | **Image** | Saves it to SD (`/data/images/`) and shows it on the TZT. You can send a **URL** (TZT downloads and saves) or a **filename** (show a file already on SD). |
 
-**Command types** (POST to your backend; see `server/README.md` for the API):
+**Command types** (POST to your backend; see `raspberrypi/README.md` for the API):
 
 - **`print`** – Text message (`type`, `data`, optional `source`)
 - **`download_audio`** – Download audio from URL, save to SD, and play
@@ -34,7 +34,7 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 |---|---|---|
 | **Role** | Hardware controller | Brain / UI / cloud |
 | **PlatformIO env** | `esp32-wroom-32` | `tzt-esp32-devkit` |
-| **Serial port** | COM4 | COM3 |
+| **Serial port** | COM3 (CP210x) | COM7 (CH340) |
 | **Controls** | Printer, pump, LED, sensors | 2.4" TFT + touch, web server, HTTP backend, SD card, speaker |
 | **Network** | WiFi (for ESP-NOW channel sync) | WiFi + HTTP backend + HTTP server (port 8080) |
 | **Config file** | `include/config.h` | `include/config_tzt.h` |
@@ -104,18 +104,18 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 
 Each board prints its MAC address on boot over serial. Copy them into the config files:
 
-- Main ESP32's MAC goes into `include/config_tzt.h` as `MAIN_ESP32_MAC_ADDRESS`
-- TZT Display's MAC goes into `include/config.h` as `TZT_DISPLAY_MAC_ADDRESS`
+- Main ESP32's MAC goes into TZT's own config, `include/config_tzt.h`, as `MAIN_ESP32_MAC_ADDRESS`
+- TZT Display's MAC goes into Main's own config, `include/config.h`, as `TZT_DISPLAY_MAC_ADDRESS`
 
 Format: `{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}`
 
 ### 2. Build and Flash
 
 ```bash
-# Main ESP32 (COM4)
+# Main ESP32 (COM3)
 pio run -e esp32-wroom-32 -t upload -t monitor
 
-# TZT Display (COM3)
+# TZT Display (COM7)
 pio run -e tzt-esp32-devkit -t upload -t monitor
 ```
 
@@ -125,8 +125,8 @@ On first boot each board creates a WiFi access point for configuration:
 
 | Board | AP SSID | AP Password | Portal URL |
 |---|---|---|---|
-| Main ESP32 | `Print-n-Prick` | `08202022` | `http://192.168.4.1` |
-| TZT Display | `TZT_Display` | `08202022` | `http://192.168.4.1` |
+| Main ESP32 | `Print-n-Prick` | `your-portal-password` | `http://192.168.4.1` |
+| TZT Display | `TZT_Display` | `your-portal-password` | `http://192.168.4.1` |
 
 Connect to each AP, open the portal, and enter your home WiFi credentials. The boards save them and reconnect automatically on future boots.
 
@@ -138,7 +138,7 @@ Once TZT is on your WiFi, find its IP in the serial monitor and open:
 http://<TZT-IP>:8080
 ```
 
-Password: `0820`
+Password: `your-web-password` (set via `WEB_PASSWORD` in `secrets.h`)
 
 ---
 
@@ -151,15 +151,15 @@ Password: `0820`
 | GPIO | Function | Direction | Component |
 |------|----------|-----------|-----------|
 | 2 | Onboard LED | Output | Status indicator |
-| 4 | Serial TX2 | Output | Thermal printer TX |
+| 16 | Serial RX2 | Input | Thermal printer RX |
+| 17 | Serial TX2 | Output | Thermal printer TX |
 | 26 | Pump control | Output | IRF520 MOSFET gate |
 | 27 | LED PWM | Output | 12 V LED via MOSFET |
 | 32 | IR sensor | Input | Motion detection |
-| 33 | Serial RX2 | Input | Thermal printer RX |
 | 34 | Moisture sensor | ADC Input | Capacitive moisture probe |
 | 35 | Light sensor | ADC Input | LM393 analog output |
 
-> GPIO 34 and 35 are input-only pins (no internal pull-ups). GPIO 4 and 33 replaced GPIO 16/17 to avoid flash-memory boot conflicts.
+> GPIO 34 and 35 are input-only pins (no internal pull-ups). GPIO 16/17 are used for the thermal printer's Serial2 UART.
 
 #### Components
 
@@ -229,11 +229,12 @@ The TZT module is an [ESP32 Cheap Yellow Display](https://github.com/witnessmeno
 
 #### LVGL Screens
 
-The touchscreen GUI has three screens, navigated with Prev/Next buttons:
+The touchscreen GUI has a bottom navigation bar with four tabs, plus a persistent status bar (time/IP/WiFi SSID):
 
-1. **Message** -- shows the last printed message (scrollable text area)
-2. **Sensors** -- live moisture, sanitizer, LED, and pump status from the Main ESP32
-3. **Sketch Board** -- freehand drawing canvas with 10 colors
+1. **Home** -- latest printed message, quick status, and a button into message history (SD card)
+2. **Sensors** -- live moisture, sanitizer, LED, and pump status from the Main ESP32 (read-only)
+3. **Media** -- Photo/Audio sub-tab toggle: browse and play received images/audio, reminders, groceries, and todos
+4. **Settings** -- WiFi SSID display, volume control, and device configuration
 
 ---
 
@@ -293,24 +294,29 @@ The TZT Display hosts a web server on port 8080 with a mobile-optimized dashboar
 
 ### Authentication
 
-- Password: `0820` (configured in `config_tzt.h` as `WEB_PASSWORD`)
+- Password: `your-web-password` (set via `WEB_PASSWORD` in `secrets.h`)
 - Session tokens valid for 1 hour (cookie-based)
 
 ### Sections
 
-- **Sensor Status** -- Moisture, sanitizer level, light, IR, LED brightness, pump state
+- **Sensor Status** -- Moisture, sanitizer level, light, IR, LED brightness, pump state (read-only; live data from the Main ESP32 over ESP-NOW)
 - **Reminders** -- Schedule messages to print at a future time (presets: 1 min to 1 week)
 - **Grocery List** -- Add items, print the list, clear all
 - **Todo List** -- Add items, print the list, clear all
-- **Hardware Controls** -- Test pump, test printer, LED brightness slider, auto-dispense toggle
+- **Hardware Diagnostics** -- Read sensors, send a test message through the full print pipeline (SD save -> ESP-NOW -> Main prints)
+
+> Pump/LED testing and hardware settings (duration, cooldown, calibration, auto-dispense, auto-brightness) live only on the **Main ESP32's test server** (`http://<Main-ESP32-IP>:8081`) -- see [Hardware Testing](#hardware-testing) below. They used to be duplicated here and on the TZT, which let the two boards fight over settings on every TZT boot; now there's a single place that owns them.
 
 ### API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/login` | Shortcut-friendly login (session cookie) |
 | GET | `/api/status` | Sensor readings |
-| GET | `/api/health` | Uptime, memory, WiFi info |
 | POST | `/api/reset-sanitizer` | Reset sanitizer to 100% |
+| POST | `/api/test/send-message` | Send a test message through the full print pipeline |
+| POST | `/api/test/play-audio` | Play an audio file already on SD |
+| POST | `/api/test/show-image` | Show an image file already on SD |
 | GET/POST | `/api/reminders` | List or add reminders |
 | DELETE | `/api/reminders/{id}` | Delete a reminder |
 | GET/POST | `/api/groceries` | List or add grocery items |
@@ -319,13 +325,8 @@ The TZT Display hosts a web server on port 8080 with a mobile-optimized dashboar
 | GET/POST | `/api/todos` | List or add todo items |
 | DELETE | `/api/todos` | Clear todo list |
 | POST | `/api/todos/print` | Print todo list |
-| POST | `/api/test/pump` | Test pump |
-| POST | `/api/test/printer` | Test printer |
-| POST | `/api/test/led12v` | Test 12 V LED |
-| POST | `/api/led/calibrate` | Calibrate light sensor |
-| POST | `/api/pump/duration` | Set pump duration |
-| POST | `/api/pump/cooldown` | Set pump cooldown |
-| POST | `/api/pump/auto-dispense` | Toggle auto-dispense |
+
+Pump/LED/printer hardware control, tests, and settings are not on this server -- see [Hardware Testing](#hardware-testing) for the Main ESP32's own test server.
 
 ---
 
@@ -347,7 +348,7 @@ Create a shortcut with these four actions:
 ```
 
 3. **Get Contents of URL**
-   - URL: `http://<YOUR-BACKEND-URL>/api/commands` (e.g. `http://192.168.1.146:5000/api/commands`)
+   - URL: `http://<YOUR-BACKEND-URL>/api/commands` (e.g. `http://192.168.1.100:5000/api/commands`)
    - Method: POST
    - Headers: `Content-Type: application/json`
    - Request Body: **File** (select the Text from step 2)
@@ -392,47 +393,31 @@ Your message text here
 
 ## Hardware Testing
 
-### Main ESP32 Test Suite
+### Main ESP32 Test Server
 
-Type `test` in the serial monitor (115200 baud) to enter the interactive test menu:
+The Main ESP32 runs an HTTP test server on **port 8081** (`http://<Main-ESP32-IP>:8081`) -- open it in a browser for a bench-test panel, or hit the routes directly with curl. This is the **only** place hardware is tested or reconfigured; the TZT dashboard's old duplicate controls (and its boot-time settings push over ESP-NOW) were removed so the two boards can no longer fight over pump/LED settings.
 
-| Key | Test |
-|-----|------|
-| 1 | Pump (1 s run) |
-| 2 | LED (full brightness, 2 s) |
-| 3 | LED ramp up/down |
-| 4 | IR sensor (5 s monitor) |
-| 5 | Moisture sensor (5 s) |
-| 6 | Light sensor (continuous) |
-| 7 | Thermal printer |
-| 8 | All sensors (10 s) |
-| 9 | Run all tests |
-
-Type `exit` to return to normal operation.
-
-### TZT Display -- SD Card and Speaker Test
-
-A standalone test sketch lives in the `test/` directory:
-
-```bash
-cd test
-pio run -e tzt-sd-speaker -t upload -t monitor
-```
-
-| Key | Test |
-|-----|------|
-| 1 | SD card -- detect, read, write, append, speed test |
-| 2 | Speaker -- beep, ascending tones, frequency sweep, melody |
-| 3 | Both |
+| Route | Description |
+|-------|-------------|
+| GET `/` | Bench-test web panel |
+| GET `/status` | Live hardware status (JSON) |
+| GET `/sensors` | Read moisture/IR/light now |
+| GET `/printer/test` | Printer test pattern |
+| GET `/printer/raw` | Raw test line |
+| GET `/printer/receipt` | Sample receipt |
+| GET `/printer/feed?lines=N` | Feed N lines |
+| GET `/pump?ms=N` | Run pump for N ms (max 5000) |
+| GET `/led?level=N&ms=N` | Set LED level (0-255) for N ms |
+| GET `/settings` | Get pump duration/cooldown, auto-dispense, auto-brightness |
+| GET `/settings/pump-duration?ms=N` | Set max pump dispense duration |
+| GET `/settings/pump-cooldown?ms=N` | Set pump cooldown between dispenses |
+| GET `/settings/auto-dispense?enabled=0\|1` | Toggle IR-sensor-triggers-pump |
+| GET `/settings/auto-brightness?enabled=0\|1` | Toggle LED-follows-light-sensor |
+| GET `/settings/light-calibration?point=min\|max` | Record current light reading as the dark/bright calibration point |
 
 ### TZT Display -- Touch Calibration
 
-```bash
-cd test
-pio run -e tzt-touch-cal -t upload -t monitor
-```
-
-Six-point affine calibration with outlier rejection. Outputs `TOUCH_AX` through `TOUCH_CY` coefficients to paste into `config_tzt.h`.
+The current `TOUCH_AX`-`TOUCH_CY` coefficients in `config_tzt.h` were captured from a one-off calibration sketch that is no longer part of this repo. If the touchscreen needs recalibrating on different hardware, write a small sketch using `TFT_eSPI`'s built-in `calibrateTouch()` and paste the resulting coefficients into `config_tzt.h`.
 
 ---
 
@@ -446,7 +431,7 @@ Prick_n_Print/
 │   ├── User_Setup.h          # TFT_eSPI pin definitions (copied into library at build time)
 │   ├── lv_conf.h             # LVGL configuration
 │   ├── HardwareAbstraction.h # Hardware abstraction layer
-│   ├── HardwareTest.h        # Test suite header
+│   ├── TestServer.h          # Bench-test HTTP server (port 8081) - hardware tests & settings
 │   ├── PrinterService.h      # Thermal printer service
 │   ├── HttpBackendService.h  # HTTP backend client
 │   ├── ReminderService.h     # Reminder scheduler
@@ -454,30 +439,35 @@ Prick_n_Print/
 ├── src/
 │   ├── main.cpp              # Main ESP32 entry point
 │   ├── HardwareAbstraction.cpp
-│   ├── HardwareTest.cpp      # Interactive hardware test suite
+│   ├── TestServer.cpp        # Bench-test HTTP server (port 8081) - hardware tests & settings
 │   ├── PrinterService.cpp
 │   ├── Logger.cpp
 │   └── tzt-display/
 │       └── main.cpp          # TZT Display entry point (web server, HTTP backend, LVGL, ESP-NOW)
-├── data/
-│   └── index.html            # Standalone message-sending page (posts to backend)
+├── raspberrypi/
+│   ├── app.py                # Flask backend (commands, audio, images, reminders)
+│   ├── setup.sh              # Pi install script (Tailscale, nginx, ufw, systemd)
+│   └── tests/                # pytest suite for app.py
 ├── scripts/
-│   └── copy_tft_user_setup.py  # Pre-build script: copies User_Setup.h into TFT_eSPI library
-├── test/
-│   ├── platformio.ini        # Test environments (tzt-sd-speaker, tzt-touch-cal)
-│   └── src/
-│       ├── sd_speaker_test.cpp   # SD card + speaker hardware test
-│       └── main.cpp              # Touch calibration tool
-└── platformio.ini            # Main build configuration (esp32-wroom-32, tzt-esp32-devkit)
+│   ├── copy_tft_user_setup.py  # Pre-build script: copies User_Setup.h into TFT_eSPI library
+│   ├── ota_upload_auth.py      # OTA upload auth helper (esp32-*-ota envs)
+│   ├── post_to_backend.py      # CLI: send a message/image/audio to the backend
+│   └── test_backend.py         # CLI: smoke-test a running backend
+└── platformio.ini            # Build configuration (esp32-wroom-32[-debug|-ota], tzt-esp32-devkit[-ota], tzt-esp32-lvgl)
 ```
 
 ### Build Environments
 
-| Environment | Board | Source Filter | Purpose |
+| Environment | Board | Port | Purpose |
 |---|---|---|---|
-| `esp32-wroom-32` | ESP32 Dev | `+<*> -<tzt-display/>` | Main ESP32 firmware |
-| `tzt-esp32-devkit` | ESP32 Dev | `-<*> +<tzt-display/>` | TZT Display firmware |
-| `esp32-wroom-32-debug` | ESP32 Dev | same as main | Debug build with verbose logging |
+| `esp32-wroom-32` | ESP32 Dev | COM3 | Main ESP32 firmware (release) |
+| `esp32-wroom-32-debug` | ESP32 Dev | COM3 | Main ESP32, verbose logging (`CORE_DEBUG_LEVEL=5`) |
+| `esp32-wroom-32-ota` | ESP32 Dev | `Print-n-Prick.local` | Main ESP32, OTA upload over WiFi |
+| `tzt-esp32-devkit` | ESP32 Dev | COM7 | TZT Display firmware (release) |
+| `tzt-esp32-lvgl` | ESP32 Dev | auto-detect | Same TZT firmware as `tzt-esp32-devkit`, no fixed port |
+| `tzt-esp32-devkit-ota` | ESP32 Dev | `TZT-Display.local` | TZT Display, OTA upload over WiFi |
+
+Main uses `build_src_filter = +<*> -<tzt-display/>`; TZT uses `-<*> +<tzt-display/>` (plus the shared `HttpBackendService`/`ReminderService`/`Logger`/`OTAUpdateService` files). OTA uploads require `OTA_PASSWORD` in `secrets.h` and the board already on WiFi from a prior USB flash.
 
 ---
 
@@ -488,14 +478,14 @@ Prick_n_Print/
 | Define | Default | Description |
 |--------|---------|-------------|
 | `SANITIZER_PUMP_PIN` | 26 | Pump MOSFET gate GPIO |
-| `THERMAL_TX_PIN` | 4 | Printer TX GPIO |
-| `THERMAL_RX_PIN` | 33 | Printer RX GPIO |
+| `THERMAL_TX_PIN` | 17 | Printer TX GPIO |
+| `THERMAL_RX_PIN` | 16 | Printer RX GPIO |
 | `IR_SENSOR_PIN` | 32 | IR motion sensor GPIO |
 | `MOISTURE_SENSOR_PIN` | 34 | Moisture sensor ADC GPIO |
 | `LIGHT_SENSOR_PIN` | 35 | Light sensor ADC GPIO |
 | `LED_PWM_PIN` | 27 | 12 V LED MOSFET GPIO |
 | `AP_SSID` | `"Print-n-Prick"` | WiFi AP name (first boot) |
-| `AP_PASSWORD` | `"08202022"` | WiFi AP password |
+| `AP_PASSWORD` | `"your-portal-password"` | WiFi AP password |
 | `TZT_DISPLAY_MAC_ADDRESS` | -- | TZT board's MAC (from serial) |
 | `ESP_NOW_CHANNEL` | 6 | Fallback ESP-NOW channel |
 | `ESP_NOW_SEND_INTERVAL` | 10000 | Sensor broadcast interval (ms) |
@@ -511,10 +501,10 @@ Prick_n_Print/
 | `TZT_TOUCH_CS` | 33 | Touch controller CS GPIO |
 | `TZT_TFT_BL_PIN` | 27 | Backlight GPIO |
 | `TZT_AP_SSID` | `"TZT_Display"` | WiFi AP name (first boot) |
-| `TZT_AP_PASSWORD` | `"08202022"` | WiFi AP password |
+| `TZT_AP_PASSWORD` | `"your-portal-password"` | WiFi AP password |
 | `MAIN_ESP32_MAC_ADDRESS` | -- | Main board's MAC (from serial) |
-| `BACKEND_URL` | `"http://192.168.1.146:5000"` | HTTP backend server URL (no trailing slash) |
-| `WEB_PASSWORD` | `"0820"` | Web dashboard login password |
+| `BACKEND_URL` | `"http://192.168.1.100:5000"` | HTTP backend server URL (no trailing slash) |
+| `WEB_PASSWORD` | `"your-web-password"` | Web dashboard login password |
 | `ESP_NOW_CHANNEL` | 6 | Fallback ESP-NOW channel |
 | `WEATHER_API_KEY` | -- | OpenWeatherMap API key |
 | `WEATHER_LATITUDE` | -- | Location latitude |

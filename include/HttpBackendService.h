@@ -15,6 +15,7 @@ class HttpBackendService : public IBackendService {
 private:
     static const char* TAG;
     String baseUrl;  // e.g. http://192.168.1.100:5000 (no trailing slash)
+    String apiKey;   // sent as X-API-Key on every request; must match server's PRICK_N_PRINT_API_KEY
     int timeout;
     int retryCount;
     int retryDelay;
@@ -27,7 +28,7 @@ private:
     String pathToApiPath(const String& path, bool isGet);
 
 public:
-    HttpBackendService(const String& url, int timeoutMs = 10000);
+    HttpBackendService(const String& url, int timeoutMs = 10000, const String& apiKey = "");
     ~HttpBackendService() override;
 
     void setRetryPolicy(int count, int delayMs) override;
