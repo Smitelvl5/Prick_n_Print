@@ -15,7 +15,9 @@
 #include <lvgl.h>
 #include <TFT_eSPI.h>
 #include <JPEGDecoder.h>
+#include "UiTheme.h"
 #endif
+#include "WebTheme.h"
 
 #include "version.h"
 #include "config_tzt.h"
@@ -55,7 +57,8 @@ static const char* const JSON_FAIL_UNAUTHORIZED = "{\"error\":\"Unauthorized\"}"
 // Cached sensor data from Main (received via ESP-NOW) - declared early for calculateSensorHash()
 SensorDataPacket lastSensorData;
 bool lastSensorDataValid = false;
-unsigned long lastSensorDataReceiveTime = 0;  // Track when we last received data from Main
+volatile unsigned long lastSensorDataReceiveTime = 0;  // Track when we last received data from Main
+#define SENSOR_DATA_STALE_MS 35000  // 3 missed 10 s heartbeats (+ margin) -> show "main board offline"
 volatile bool sensorDataNeedsPanelUpdate = false;  // Set in recv callback; loop() refreshes GUI
 
 #if !defined(TZT_HEADLESS)
@@ -68,48 +71,43 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 static lv_color_t disp_buf1[TZT_DISP_BUF_PIXELS];
 static lv_color_t disp_buf2[TZT_DISP_BUF_PIXELS];
-static lv_obj_t* screen1 = nullptr;  // Home: latest message + quick status + History button
-static lv_obj_t* screen2 = nullptr;  // Sensors (read-only)
-static lv_obj_t* screen3 = nullptr;  // Message history (SD card) - reached via button on Home
-static lv_obj_t* audioListScreen = nullptr;   // sub-screen: audio list + now playing
-static lv_obj_t* imageListScreen = nullptr;   // sub-screen: image gallery list
-static int currentScreenIndex = 0;
-#define SCREEN_COUNT 4   // Bottom nav tabs: Home, Sensors, Media (Photo/Audio toggle), Settings
-static int mediaSubTab = 0;   // Media tab sub-selection: 0 = Photo, 1 = Audio
-#define DASHBOARD_AUTO_ADVANCE_MS  5000   // rotate to next tab every 5s when not touched
-#define DASHBOARD_TOUCH_PAUSE_MS  120000  // after touch, stay on tab for 2 min then resume auto-rotate
-static unsigned long lastDashboardTouchTime = 0;   // touch or tab tap pauses auto-rotate
-static unsigned long lastDashboardAutoAdvance = 0;
-static lv_obj_t* dashboardPhotoScreen = nullptr;  // Media tab, Photo sub-tab
-static lv_obj_t* dashboardAudioScreen = nullptr;  // Media tab, Audio sub-tab
-static void switchMediaSubTab(int which);  // 0 = Photo, 1 = Audio
-static String lastDashboardImagePath;   // latest received/shown image for Photo tab
-static String lastDashboardAudioName;   // latest received/played audio for Audio tab
-static lv_obj_t* dashboardAudioNameLabel = nullptr;  // label on Audio tab, updated when lastDashboardAudioName changes
-// Screen 1: message (dashboard tab 1)
-static lv_obj_t* labelMessage = nullptr;
-static String lastPrintMessage = "(No messages yet)";
-// Screen 3: message history
+// Launcher = three big buttons (Messages, Sounds, Pictures); Settings opens from the header gear.
+// Each section is its own full screen under the status bar.
+static lv_obj_t* messagesScreen = nullptr;   // message list + full-text overlay
+static lv_obj_t* soundsScreen = nullptr;     // sound list + now-playing bar
+static lv_obj_t* picturesScreen = nullptr;   // picture list (tap -> full-screen viewer)
+#define SCREEN_COUNT 4      // Sections: 0 Messages, 1 Sounds, 2 Pictures, 3 Settings
+#define SCREEN_MESSAGES 0
+#define SCREEN_SOUNDS   1
+#define SCREEN_PICTURES 2
+#define SCREEN_SETTINGS 3
+#define LAUNCHER_BUTTONS 3  // Settings is not a launcher button
+#define SCREEN_LAUNCHER -1
+static int currentScreenIndex = SCREEN_LAUNCHER;
+#define DASHBOARD_IDLE_RETURN_MS  120000  // untouched for 2 min on a section -> back to launcher
+static unsigned long lastDashboardTouchTime = 0;   // any touch resets the idle-return timer
+static lv_obj_t* launcherScreen = nullptr;
+#define NO_MESSAGE_TEXT "(No messages yet)"
+static String lastPrintMessage = NO_MESSAGE_TEXT;
+// Messages section
 static lv_obj_t* historyList = nullptr;
 static lv_obj_t* historyDetail = nullptr;
 static lv_obj_t* historyDetailLabel = nullptr;
 static void refreshHistoryList();
 static void historyItemCb(lv_event_t* e);
 static void historyBackCb(lv_event_t* e);
-static void historyOpenCb(lv_event_t* e);   // Home -> History
-static void historyCloseCb(lv_event_t* e);  // History -> Home
-// Screen 4: audio player
+// Sounds section
 static lv_obj_t* audioList = nullptr;
-static lv_obj_t* audioHeaderBar = nullptr;
+static lv_obj_t* audioNowPlayingLabel = nullptr;
 static lv_obj_t* audioStopBtn = nullptr;
-static void updateAudioHeaderState();
+static void updateNowPlaying();
 #define MAX_AUDIO_FILES 20
 static String audioFileNames[MAX_AUDIO_FILES];
 static int audioFileCount = 0;
 static void refreshAudioList();
 static void audioFileCb(lv_event_t* e);
 static void audioStopCb(lv_event_t* e);
-// Screen 5: image gallery
+// Pictures section
 #define MAX_IMAGE_FILES 30
 static String imageFileNames[MAX_IMAGE_FILES];
 static int imageFileCount = 0;
@@ -120,52 +118,45 @@ static void imageFileCb(lv_event_t* e);
 static void imageBackCb(lv_event_t* e);
 static void drawSdJpegToTft(const char* path, int maxY = 240);
 static String currentImagePath;  // set when image viewer is open so we redraw JPEG each frame
-// Screen 2: sensor labels + progress bars
-static lv_obj_t* labelMoisture = nullptr;
-static lv_obj_t* labelSanitizer = nullptr;
-static lv_obj_t* labelLED = nullptr;
-static lv_obj_t* labelPump = nullptr;
-static lv_obj_t* barMoisture = nullptr;
-static lv_obj_t* barSanitizer = nullptr;
-static lv_obj_t* barLED = nullptr;
 static unsigned long lastPanelUpdate = 0;
 static uint32_t lastSensorHash = 0;
 static void createControlPanel();
 static void updateControlPanelStatus();
-// Status bar (persistent top layer: title + IP + time; WiFi SSID shown on Settings tab)
+// Status bar (persistent top layer: title + time + WiFi glyph; SSID and IP shown on Settings)
 static lv_obj_t* statusBar = nullptr;
 static lv_obj_t* statusTimeLabel = nullptr;
-static lv_obj_t* statusIpLabel = nullptr;
+static lv_obj_t* statusIpLabel = nullptr;    // created on Settings screen
+static lv_obj_t* statusWifiIcon = nullptr;   // header glyph on every screen: accent = connected, red = not
 static lv_obj_t* statusWifiLabel = nullptr;  // created on Settings screen, updated by updateStatusBar()
+static lv_obj_t* statusSettingsBtn = nullptr; // gear on the launcher header -> Settings
 static void updateStatusBar();
-// Home screen sensor summary strip
-static lv_obj_t* homeSensorStrip = nullptr;
-// Volume: inline on Settings tab (Settings is a normal bottom-nav tab, not an overlay)
+// Volume: inline on the Settings screen
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* settingsVolumeValueLabel = nullptr;
 static lv_obj_t* settingsScreen = nullptr;
 static void volumeSliderCb(lv_event_t* e);
+// LED brightness card on Settings (level is owned by Main; sent via the settings queue)
+static lv_obj_t* ledLevelSlider = nullptr;
+static lv_obj_t* ledLevelValueLabel = nullptr;
+static lv_obj_t* ledSwitch = nullptr;
+static unsigned long lastLedControlTouch = 0;  // ignore Main's echo for a few seconds after a local change
+#define LED_CONTROL_ECHO_HOLD_MS 4000
 static void gesture_timer_cb(lv_timer_t* t);
 
-// Layout: status bar, content, bottom nav
-#define TZT_STATUS_H   18
-#define TZT_NAV_BAR_H  48
+// Layout: status bar (doubles as section header with Back button), then content to the bottom edge
+#define TZT_STATUS_H   32
 #define TZT_CONTENT_TOP    TZT_STATUS_H
-#define TZT_CONTENT_H      (TZT_SCREEN_HEIGHT - TZT_STATUS_H - TZT_NAV_BAR_H)
+#define TZT_CONTENT_H      (TZT_SCREEN_HEIGHT - TZT_STATUS_H)
 // Finger-friendly: minimum touch targets and consistent spacing (48px min for tap targets)
 #define TZT_MIN_TOUCH_H    48
-#define TZT_LIST_ITEM_H    48
-#define TZT_HEADER_BAR_H   48
-#define TZT_BTN_PAD_V      6
-#define TZT_LIST_PAD       8
-#define TZT_NAV_BTN_GAP    4   // Real gap between bottom-nav tabs so adjacent taps don't misfire
-static lv_obj_t* navBarContainer = nullptr;
-static lv_obj_t* navBtns[SCREEN_COUNT] = { nullptr };
-static void updateNavHighlight(int index);
-static void navBtnCb(lv_event_t* e);
+static lv_obj_t* statusBackBtn = nullptr;    // "< Home" in status bar; hidden on launcher
+static lv_obj_t* statusTitleLabel = nullptr; // section name in status bar; hidden on launcher
+static lv_obj_t* statusAppName = nullptr;    // app name in status bar; shown on launcher only
+static void updateHeader();
+static void launcherTileCb(lv_event_t* e);
 static void goToScreenIndex(int index);
-static void showNavBar();
-static void hideNavBar();
+static void showStatusBar();
+static void hideStatusBar();
 // Splash: show splash.jpg at startup until UI is ready (defer createControlPanel to first loop).
 // Copy scripts/splash.jpg to the root of the SD card as /splash.jpg (optional; black screen if missing).
 #define SPLASH_PATH       "/splash.jpg"
@@ -180,7 +171,8 @@ static uint32_t calculateSensorHash() {
            ((uint32_t)lastSensorData.ledBrightness << 8) |
            (lastSensorData.isDispensing ? 1 : 0) |
            (lastSensorData.autoDispense ? 2 : 0) |
-           (lastSensorData.autoBrightness ? 4 : 0);
+           (lastSensorData.ledSchedule ? 4 : 0) |
+           ((uint32_t)(lastSensorData.ledOnMinute ^ lastSensorData.ledOffMinute) << 3);
 }
 #endif  // TZT_HEADLESS
 
@@ -267,9 +259,17 @@ bool todosNeedSave = false;  // Flag to save todos in background
 
 String deviceIP = "";
 String webPassword = WEB_PASSWORD;
-String authToken = "";
-unsigned long authTokenExpiry = 0;
 const unsigned long AUTH_TOKEN_DURATION = 3600000;  // 1 hour
+
+// Several concurrent sessions so logging in on one device (phone, laptop, script)
+// doesn't log out the others. When full, the session closest to expiry is replaced.
+#define MAX_AUTH_SESSIONS 4
+struct AuthSession { String token; unsigned long expiry; };
+AuthSession authSessions[MAX_AUTH_SESSIONS];
+
+bool sessionActive(const AuthSession& s) {
+    return s.token.length() > 0 && (long)(s.expiry - millis()) > 0;  // wrap-safe
+}
 
 // Failed-login backoff: doubles each consecutive failure (capped), resets on success.
 // Beats a flat 1s delay against repeated/scripted password guesses.
@@ -291,6 +291,41 @@ String generateAuthToken() {
     for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", buf[i]);
     hex[32] = '\0';
     return String(hex);
+}
+
+String createSession() {
+    int slot = 0;
+    for (int i = 0; i < MAX_AUTH_SESSIONS; i++) {
+        if (!sessionActive(authSessions[i])) { slot = i; break; }
+        if ((long)(authSessions[i].expiry - authSessions[slot].expiry) < 0) slot = i;
+    }
+    authSessions[slot].token = generateAuthToken();
+    authSessions[slot].expiry = millis() + AUTH_TOKEN_DURATION;
+    return authSessions[slot].token;
+}
+
+bool sessionTokenValid(const String& token) {
+    if (token.length() == 0) return false;
+    for (int i = 0; i < MAX_AUTH_SESSIONS; i++) {
+        if (sessionActive(authSessions[i]) && authSessions[i].token == token) return true;
+    }
+    return false;
+}
+
+void endSession(const String& token) {
+    for (int i = 0; i < MAX_AUTH_SESSIONS; i++) {
+        if (authSessions[i].token == token) authSessions[i].token = "";
+    }
+}
+
+// Session token from the auth cookie (requires "Cookie" in server.collectHeaders)
+String requestCookieToken() {
+    String cookie = server.header("Cookie");
+    int start = cookie.indexOf("auth=");
+    if (start < 0) return "";
+    start += 5;
+    int end = cookie.indexOf(";", start);
+    return cookie.substring(start, end < 0 ? cookie.length() : end);
 }
 
 void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -354,21 +389,12 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
     }
 }
 
-// ESP-NOW receive: sensor data from Main
-// Preserve autoDispense/autoBrightness so HTTP toggles don't get overwritten by Main's packet (avoids UI bounce)
+// ESP-NOW receive: sensor data from Main. Main owns LED/pump settings (set via its :8081 test server),
+// so every packet is taken as-is - the GUIs always show Main's real state.
 void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
     if (len >= (int)sizeof(SensorDataPacket) && data[0] == ESP_NOW_MSG_SENSOR_DATA) {
         if (verifyChecksum((uint8_t*)data, sizeof(SensorDataPacket))) {
-            bool hadValid = lastSensorDataValid;
-            bool prevAutoDispense = lastSensorData.autoDispense;
-            bool prevAutoBrightness = lastSensorData.autoBrightness;
-            uint8_t prevLedBrightness = lastSensorData.ledBrightness;
             memcpy(&lastSensorData, data, sizeof(SensorDataPacket));
-            if (hadValid) {
-                lastSensorData.autoDispense = prevAutoDispense;
-                lastSensorData.autoBrightness = prevAutoBrightness;
-                lastSensorData.ledBrightness = prevLedBrightness;  // Optimistic: keep our sent value
-            }
             lastSensorDataValid = true;
             lastSensorDataReceiveTime = millis();
             sensorDataNeedsPanelUpdate = true;  // Refresh GUI on next loop (don't call LVGL from callback)
@@ -427,7 +453,7 @@ bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
     return sendCommandViaESPNow(CMD_PRINT_CHUNK, 0, (uint8_t)totalChunks, chunk0.c_str());
 }
 
-// Enqueue a setting command to be sent 4x with 200ms spacing (only when printer idle). Latest overwrites.
+// Enqueue a setting command: sent until Main ACKs it (up to SETTINGS_MAX_ATTEMPTS, SETTINGS_ACK_TIMEOUT_MS apart). Latest overwrites.
 void enqueueSettingCommand(uint8_t commandType, uint8_t param1, uint8_t param2, const char* message) {
     if (!espNowInitialized) return;
     pendingSettingCommandType = commandType;
@@ -442,7 +468,7 @@ void enqueueSettingCommand(uint8_t commandType, uint8_t param1, uint8_t param2, 
     pendingSettingNextSendAt = millis();  // First send on next loop when printer idle
 }
 
-// Send pump Start/Stop once; sendCommandViaESPNow does 2x esp_now_send per call, and loop retries once on FAIL. Main dedupes by state (no-op if pump already in that state).
+// Send pump Start/Stop once; the loop retries on FAIL. Main dedupes by state (no-op if pump already in that state).
 static bool sendPumpCommandRepeated(uint8_t commandType) {
     if (!espNowInitialized) return false;
     return sendCommandViaESPNow(commandType, 0, 0, "", false, true);  // fromSettingsQueue=true to skip long pre-send delay
@@ -457,38 +483,11 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
         return false;
     }
     if (!isRetry) retryCount = 0;  // New user-initiated send; allow one retry on FAIL
-    
-    // Print commands: send immediately (minimal delay). Settings queue: no long delay (loop sends when idle).
-    bool isPrintCommand = (commandType == CMD_PRINT || commandType == CMD_PRINT_CHUNK || commandType == CMD_PRINT_CHUNK_START || commandType == CMD_TEST_PRINTER);
-    if (isPrintCommand) {
-        delay(50);  // Brief delay to avoid back-to-back TX; print goes out right away
-    } else if (!fromSettingsQueue && lastSensorDataReceiveTime > 0) {
-        unsigned long timeSinceLastReceive = millis() - lastSensorDataReceiveTime;
-        const unsigned long MIN_AFTER_RECEIVE_MS = 700;
-        const unsigned long SAFE_WINDOW_END_MS = 1700;
-        if (timeSinceLastReceive < MIN_AFTER_RECEIVE_MS) {
-            delay(MIN_AFTER_RECEIVE_MS - timeSinceLastReceive);
-        } else if (timeSinceLastReceive <= SAFE_WINDOW_END_MS) {
-            delay(random(20, 60));
-        } else {
-            const unsigned long MAIN_SEND_INTERVAL_MS = 10000;
-            unsigned long nextMainSend = ((timeSinceLastReceive + MAIN_SEND_INTERVAL_MS - 1) / MAIN_SEND_INTERVAL_MS) * MAIN_SEND_INTERVAL_MS;
-            long wait = (long)(nextMainSend - timeSinceLastReceive) + (long)MIN_AFTER_RECEIVE_MS;
-            if (wait > 0 && wait < (long)MAIN_SEND_INTERVAL_MS) delay((unsigned long)wait);
-            else if (wait <= 0) delay(random(20, 60));
-            else delay(MIN_AFTER_RECEIVE_MS);
-        }
-    } else if (!fromSettingsQueue) {
-        delay(100);
-    } else {
-        delay(random(15, 40));  // Small jitter when sending from settings queue
-    }
-    // Pump commands: avoid sending in the first ~400ms after Main's sensor (half-duplex collision)
-    if (fromSettingsQueue && (commandType == CMD_DISPENSE_START || commandType == CMD_DISPENSE_STOP) && lastSensorDataReceiveTime > 0) {
-        unsigned long timeSinceSensor = millis() - lastSensorDataReceiveTime;
-        if (timeSinceSensor < 400) delay(400 - timeSinceSensor);
-    }
-    
+    (void)fromSettingsQueue;
+    // No pre-send waiting: 802.11 carrier sense already keeps the two boards from talking over each
+    // other, and unicast ESP-NOW frames are retried by the radio. The old "wait for Main's quiet window"
+    // delays blocked the loop (screen, web, OTA) for up to ~10 s per command.
+
     // Verify peer exists and channel is correct before sending
     bool peerExists = esp_now_is_peer_exist(mainESP32Mac);
     uint8_t currentChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
@@ -599,9 +598,8 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
         lastSentMessage[sizeof(lastSentMessage) - 1] = '\0';
     }
     
-    // Send with one retry after 80ms to improve delivery (WiFi half-duplex can cause occasional FAIL)
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (attempt > 0) delay(80);
+    // Sent once. Delivery failures come back through onDataSentStatic (retry) or a missing ACK (settings queue).
+    {
         esp_err_t result = esp_now_send(mainESP32Mac, (uint8_t*)&packet, sizeof(CommandPacket));
         if (result != ESP_OK) {
             String errStr = "";
@@ -642,8 +640,9 @@ static int32_t gestureEndX = 0, gestureEndY = 0;
 #define SWIPE_THRESHOLD 40
 #define GESTURE_COOLDOWN_MS 120
 static uint32_t lastGestureTime = 0;
-#define MEDIA_SUBMENU_IGNORE_MS 400  // ignore taps on Media hub buttons right after switching to Media tab
-static uint32_t lastMediaScreenOpenTime = 0;
+#define SECTION_TAP_IGNORE_MS 400  // ignore list taps right after opening a section (the launcher press can land on a row)
+static uint32_t lastSectionOpenTime = 0;
+static bool sectionJustOpened() { return (uint32_t)millis() - lastSectionOpenTime < SECTION_TAP_IGNORE_MS; }
 static void touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
     (void)indev_drv;
     if (displayFlushing) {
@@ -704,53 +703,106 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     lv_disp_flush_ready(drv);
 }
 
-// Nav: change screen by index (bottom nav: 0=Home, 1=Sensors, 2=Media, 3=Settings)
+// Nav: launcher (SCREEN_LAUNCHER) or section by index (0=Messages, 1=Sounds, 2=Pictures, 3=Settings)
+static const char* const sectionTitles[SCREEN_COUNT] = { "Messages", "Sounds", "Pictures", "Settings" };
+static const char* const sectionIcons[SCREEN_COUNT] = {
+    LV_SYMBOL_ENVELOPE, LV_SYMBOL_AUDIO, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
+
 static lv_obj_t* screenByIndex(int idx) {
     switch (idx) {
-        case 0: return screen1;   // Home
-        case 1: return screen2;   // Sensors
-        case 2: return mediaSubTab == 0 ? dashboardPhotoScreen : dashboardAudioScreen;  // Media
-        case 3: return settingsScreen;
-        default: return screen1;
+        case SCREEN_MESSAGES: return messagesScreen;
+        case SCREEN_SOUNDS:   return soundsScreen;
+        case SCREEN_PICTURES: return picturesScreen;
+        case SCREEN_SETTINGS: return settingsScreen;
+        default: return launcherScreen;
     }
 }
 
+static void refreshAudioList();
+static void refreshImageList();
+
+// Open a section (or the launcher). Lists are re-read from SD on every open so they're never stale.
 static void goToScreenIndex(int index) {
-    if (index < 0 || index >= SCREEN_COUNT) return;
-    if (index == currentScreenIndex) return;
-    int dir = (index > currentScreenIndex) ? 1 : -1;
+    if (index != SCREEN_LAUNCHER && (index < 0 || index >= SCREEN_COUNT)) return;
+    lv_obj_t* target = screenByIndex(index);
+    if (index == currentScreenIndex && lv_scr_act() == target) return;
+    bool opening = (index != SCREEN_LAUNCHER);
+    currentImagePath = "";
+    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);  // Messages always opens on the list
     currentScreenIndex = index;
-    lv_obj_t* scr = screenByIndex(currentScreenIndex);
-    lv_scr_load_anim(scr,
-        dir > 0 ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+    if (index == SCREEN_MESSAGES) refreshHistoryList();
+    else if (index == SCREEN_SOUNDS) refreshAudioList();
+    else if (index == SCREEN_PICTURES) refreshImageList();
+    if (opening) lastSectionOpenTime = (uint32_t)millis();
+    showStatusBar();  // the image viewer hides it
+    lv_scr_load_anim(target, opening ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
         180, 0, false);
-    updateNavHighlight(currentScreenIndex);
+    updateHeader();
 }
 
-static void navBtnCb(lv_event_t* e) {
+static void launcherTileCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    lastDashboardTouchTime = millis();  // tab tap pauses auto-rotate 2 min
-    goToScreenIndex(idx);
+    goToScreenIndex((int)(intptr_t)lv_event_get_user_data(e));
 }
 
-static void updateNavHighlight(int index) {
-    for (int i = 0; i < SCREEN_COUNT && navBtns[i]; i++) {
-        if (i == index)
-            lv_obj_set_style_bg_color(navBtns[i], lv_color_hex(0x2a5514), 0);
-        else
-            lv_obj_set_style_bg_color(navBtns[i], lv_color_hex(0x0a1806), 0);
+// Jump to the launcher from any screen, including the image viewer
+static void returnToLauncher() {
+    goToScreenIndex(SCREEN_LAUNCHER);
+}
+
+static void statusBackCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    goToScreenIndex(SCREEN_LAUNCHER);
+}
+
+static void statusSettingsCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    goToScreenIndex(SCREEN_SETTINGS);
+}
+
+// Status bar: launcher shows app name + settings gear; sections show "<" back + section title.
+// Time and WiFi glyph sit on the right, shifted left on the launcher to make room for the gear.
+static void updateHeader() {
+    bool onLauncher = (currentScreenIndex == SCREEN_LAUNCHER);
+    if (statusTitleLabel && !onLauncher) lv_label_set_text(statusTitleLabel, sectionTitles[currentScreenIndex]);
+    lv_obj_t* sectionOnly[] = { statusBackBtn, statusTitleLabel };
+    for (lv_obj_t* o : sectionOnly) {
+        if (!o) continue;
+        if (onLauncher) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
     }
+    lv_obj_t* launcherOnly[] = { statusAppName, statusSettingsBtn };
+    for (lv_obj_t* o : launcherOnly) {
+        if (!o) continue;
+        if (onLauncher) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    int right = onLauncher ? UI_BACK_W : UI_MARGIN;
+    if (statusWifiIcon) lv_obj_align(statusWifiIcon, LV_ALIGN_RIGHT_MID, -right, 0);
+    if (statusTimeLabel) lv_obj_align(statusTimeLabel, LV_ALIGN_RIGHT_MID, -(right + 24), 0);
 }
 
-static void showNavBar() {
-    if (navBarContainer) lv_obj_clear_flag(navBarContainer, LV_OBJ_FLAG_HIDDEN);
+static void showStatusBar() {
     if (statusBar) lv_obj_clear_flag(statusBar, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void hideNavBar() {
-    if (navBarContainer) lv_obj_add_flag(navBarContainer, LV_OBJ_FLAG_HIDDEN);
+static void hideStatusBar() {
     if (statusBar) lv_obj_add_flag(statusBar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void setLabelIfChanged(lv_obj_t* label, const char* text) {
+    if (label && strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static String baseName(const String& path) {
+    int slash = path.lastIndexOf('/');
+    return slash >= 0 ? path.substring(slash + 1) : path;
+}
+
+// Minutes since midnight -> "4:45 PM"
+static void formatMinute(uint16_t minute, char* out, size_t len) {
+    int h = (minute / 60) % 24, m = minute % 60;
+    snprintf(out, len, "%d:%02d %s", h % 12 == 0 ? 12 : h % 12, m, h < 12 ? "AM" : "PM");
 }
 
 static void updateStatusBar() {
@@ -764,13 +816,16 @@ static void updateStatusBar() {
         if (tbuf[0] == '0') memmove(tbuf, tbuf + 1, strlen(tbuf));
         lv_label_set_text(statusTimeLabel, tbuf);
     }
+    bool wifiUp = (WiFi.status() == WL_CONNECTED);
+    // Colour alone carries the state, like Spectral's header Bluetooth rune
+    if (statusWifiIcon) lv_obj_set_style_text_color(statusWifiIcon, uiColor(wifiUp ? UI_ACCENT : UI_WARNING), 0);
     if (statusWifiLabel) {
-        if (WiFi.status() == WL_CONNECTED) {
+        if (wifiUp) {
             lv_label_set_text(statusWifiLabel, WiFi.SSID().length() ? WiFi.SSID().c_str() : "Connected");
-            lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0x6ab82e), 0);
+            lv_obj_set_style_text_color(statusWifiLabel, uiColor(UI_TEXT), 0);
         } else {
             lv_label_set_text(statusWifiLabel, "Disconnected");
-            lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0xaaaaaa), 0);
+            lv_obj_set_style_text_color(statusWifiLabel, uiColor(UI_WARNING), 0);
         }
     }
     if (statusIpLabel) {
@@ -785,25 +840,182 @@ static void updateStatusBar() {
 }
 
 static void setScreenStyle(lv_obj_t* scr) {
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a3d0e), 0);
-    lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_color(scr, uiColor(UI_BACKGROUND), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 }
 
-// Pressed-state style applied to every button for tactile feedback
+// Pressed-state style applied to every button for tactile feedback (Spectral's row tap flash)
 static lv_style_t style_btn_pressed;
 static bool btn_style_inited = false;
 static void applyBtnPressStyle(lv_obj_t* btn) {
     if (!btn_style_inited) {
         lv_style_init(&style_btn_pressed);
-        lv_style_set_bg_color(&style_btn_pressed, lv_color_hex(0x5a9c3a));
+        lv_style_set_bg_color(&style_btn_pressed, uiColor(UI_SELECTION));
         lv_style_set_transform_width(&style_btn_pressed, -2);
         lv_style_set_transform_height(&style_btn_pressed, -2);
         btn_style_inited = true;
     }
     lv_obj_add_style(btn, &style_btn_pressed, LV_STATE_PRESSED);
+}
+
+// ---- Shared components (same family as Spectral's TFT_Display) ----
+
+static lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, const lv_font_t* font, UiColor color) {
+    lv_obj_t* l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, uiColor(color), 0);
+    return l;
+}
+
+// Rounded card: header band / tile / row tone, no border
+static void styleCard(lv_obj_t* obj, int pad) {
+    lv_obj_set_style_bg_color(obj, uiColor(UI_CARD), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_shadow_width(obj, 0, 0);
+    lv_obj_set_style_radius(obj, UI_RADIUS, 0);
+    lv_obj_set_style_pad_all(obj, pad, 0);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+// Primary = the next step (filled accent, white text); secondary = BUTTON fill
+static void styleButton(lv_obj_t* btn, bool primary) {
+    applyBtnPressStyle(btn);
+    lv_obj_set_style_bg_color(btn, uiColor(primary ? UI_BORDER : UI_BUTTON), 0);
+    lv_obj_set_style_text_color(btn, uiColor(primary ? UI_TITLE : UI_TEXT), 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, UI_RADIUS, 0);
+}
+
+static lv_obj_t* makeButton(lv_obj_t* parent, const char* text, int w, int h, bool primary,
+                            lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    styleButton(btn, primary);
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(lbl);
+    if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    return btn;
+}
+
+// Transparent icon button in the status bar (the "<" back target and the settings gear):
+// full bar height, hit area extended to a 48px target, flashes on press
+static lv_obj_t* makeBarIconButton(lv_obj_t* bar, const char* icon, lv_event_cb_t cb) {
+    lv_obj_t* btn = lv_btn_create(bar);
+    lv_obj_set_size(btn, UI_BACK_W, TZT_STATUS_H);
+    lv_obj_set_ext_click_area(btn, (TZT_MIN_TOUCH_H - TZT_STATUS_H) / 2);
+    applyBtnPressStyle(btn);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 0, 0);
+    lv_obj_t* glyph = makeLabel(btn, icon, &lv_font_montserrat_18, UI_TEXT);
+    lv_obj_center(glyph);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    return btn;
+}
+
+// Scrolling list under the status bar: transparent, rows are separate cards with a gap between
+static lv_obj_t* makeCardList(lv_obj_t* parent, int h = TZT_CONTENT_H) {
+    lv_obj_t* list = lv_list_create(parent);
+    lv_obj_set_size(list, TZT_SCREEN_WIDTH, h);
+    lv_obj_set_pos(list, 0, TZT_STATUS_H);
+    lv_obj_set_style_bg_color(list, uiColor(UI_BACKGROUND), 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_radius(list, 0, 0);
+    lv_obj_set_style_pad_all(list, UI_MARGIN, 0);
+    lv_obj_set_style_pad_row(list, UI_GAP, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    return list;
+}
+
+// One list row card - Spectral's drawMenuRow(): label left, and a chevron
+// on the right only when the row opens another page (opensPage).
+// Rows share static styles rather than local ones: a list can hold 20+ rows and
+// per-object local style props add up in LVGL's heap.
+static lv_style_t style_row, style_row_icon;
+static lv_obj_t* addListRow(lv_obj_t* list, const char* icon, const char* text, bool opensPage,
+                            lv_event_cb_t cb, int idx) {
+    static bool inited = false;
+    if (!inited) {
+        lv_style_init(&style_row);
+        lv_style_set_height(&style_row, UI_ROW_H);
+        lv_style_set_bg_color(&style_row, uiColor(UI_CARD));
+        lv_style_set_bg_opa(&style_row, LV_OPA_COVER);
+        lv_style_set_border_width(&style_row, 0);
+        lv_style_set_shadow_width(&style_row, 0);
+        lv_style_set_radius(&style_row, UI_RADIUS);
+        lv_style_set_pad_hor(&style_row, 12);
+        lv_style_set_pad_ver(&style_row, 0);
+        lv_style_set_text_font(&style_row, &lv_font_montserrat_14);
+        lv_style_set_text_color(&style_row, uiColor(UI_TEXT));
+        lv_style_init(&style_row_icon);
+        lv_style_set_text_color(&style_row_icon, uiColor(UI_ACCENT));
+        inited = true;
+    }
+    lv_obj_t* btn = lv_list_add_btn(list, icon, text);
+    lv_obj_add_style(btn, &style_row, 0);
+    applyBtnPressStyle(btn);
+    lv_obj_t* img = lv_obj_get_child(btn, 0);  // the icon: a symbol, drawn in the text colour
+    if (icon && img) lv_obj_add_style(img, &style_row_icon, 0);
+    lv_obj_t* lbl = lv_obj_get_child(btn, icon ? 1 : 0);
+    if (lbl) lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    if (opensPage) makeLabel(btn, LV_SYMBOL_RIGHT, &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void*)(uintptr_t)idx);
+    return btn;
+}
+
+// Empty/error state inside a card list
+static void addListNote(lv_obj_t* list, const char* text) {
+    lv_obj_t* t = lv_list_add_text(list, text);
+    lv_obj_set_style_bg_opa(t, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(t, uiColor(UI_TEXT_MUTED), 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_pad_ver(t, 12, 0);
+}
+
+// App-style toggle: accent pill + white knob when on, dark outlined track when off
+static lv_obj_t* makeSwitch(lv_obj_t* parent) {
+    lv_obj_t* sw = lv_switch_create(parent);
+    lv_obj_set_size(sw, UI_SWITCH_W, UI_SWITCH_H);
+    lv_obj_set_ext_click_area(sw, 10);
+    lv_obj_set_style_bg_color(sw, uiColor(UI_FIELD), LV_PART_MAIN);
+    lv_obj_set_style_border_color(sw, uiColor(UI_TEXT_MUTED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(sw, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sw, 0, LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, uiColor(UI_BORDER), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, uiColor(UI_TEXT_MUTED), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(sw, uiColor(UI_TITLE), LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_set_style_pad_all(sw, -3, LV_PART_KNOB);
+    lv_obj_set_style_anim_time(sw, 120, 0);
+    return sw;
+}
+
+// Slider on a FIELD track with an accent fill and a white knob
+static lv_obj_t* makeSlider(lv_obj_t* parent, int w, int min, int max, int value) {
+    lv_obj_t* s = lv_slider_create(parent);
+    lv_slider_set_range(s, min, max);
+    lv_slider_set_value(s, value, LV_ANIM_OFF);
+    lv_obj_set_size(s, w, 10);
+    lv_obj_set_style_anim_time(s, 0, LV_PART_MAIN);  // no animation so knob follows finger directly
+    lv_obj_set_ext_click_area(s, 16);                 // easier to hit knob with finger
+    lv_obj_set_style_bg_color(s, uiColor(UI_FIELD), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s, uiColor(UI_BORDER), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s, uiColor(UI_TITLE), LV_PART_KNOB);
+    lv_obj_set_style_radius(s, 5, LV_PART_MAIN);
+    lv_obj_set_style_radius(s, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s, 6, LV_PART_KNOB);    // larger knob for easier drag
+    return s;
 }
 
 static void gesture_timer_cb(lv_timer_t* t) {
@@ -823,368 +1035,116 @@ static void volumeSliderCb(lv_event_t* e) {
     if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", (int)v);
 }
 
-static void mediaOpenAudioCb(lv_event_t* e) {
-    (void)e;
-    if ((uint32_t)millis() - lastMediaScreenOpenTime < MEDIA_SUBMENU_IGNORE_MS) return;
-    refreshAudioList();
-    hideNavBar();
-    lv_scr_load_anim(audioListScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+static void ledLevelSliderCb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t v = lv_slider_get_value(lv_event_get_target(e));
+    if (v < 1) v = 1;
+    if (v > 100) v = 100;
+    lastLedControlTouch = millis();
+    if (ledLevelValueLabel) lv_label_set_text_fmt(ledLevelValueLabel, "%d%%", (int)v);
+    // Send once on release, not on every drag step (ESP-NOW + Main NVS write per change)
+    if (code == LV_EVENT_RELEASED) enqueueSettingCommand(CMD_SET_LED_BRIGHTNESS, (uint8_t)v, 0);
 }
 
-static void mediaOpenImagesCb(lv_event_t* e) {
-    (void)e;
-    if ((uint32_t)millis() - lastMediaScreenOpenTime < MEDIA_SUBMENU_IGNORE_MS) return;
-    refreshImageList();
-    hideNavBar();
-    lv_scr_load_anim(imageListScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
+static void ledToggleCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    bool turnOn = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);  // switch already flipped (optimistic)
+    lastLedControlTouch = millis();
+    enqueueSettingCommand(CMD_SET_LED_STATE, turnOn ? 1 : 0, 0);
 }
 
-static void audioBackToMediaCb(lv_event_t* e) {
-    (void)e;
-    mediaSubTab = 1;  // Audio
-    currentScreenIndex = 2;  // Media tab
-    lastMediaScreenOpenTime = (uint32_t)millis();
-    lv_scr_load_anim(dashboardAudioScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
-    showNavBar();
-    updateNavHighlight(2);
-}
-
-static void imageListBackCb(lv_event_t* e) {
-    (void)e;
-    mediaSubTab = 0;  // Photo
-    currentScreenIndex = 2;  // Media tab
-    lastMediaScreenOpenTime = (uint32_t)millis();
-    lv_scr_load_anim(dashboardPhotoScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
-    showNavBar();
-    updateNavHighlight(2);
-}
-
-// Switch which sub-screen the Media tab shows (Photo/Audio); no-op if Media tab isn't active
-static void switchMediaSubTab(int which) {
-    if (mediaSubTab == which) return;
-    mediaSubTab = which;
-    if (currentScreenIndex == 2) {
-        lv_scr_load(screenByIndex(2));
-    }
-}
-
-static void mediaTogglePhotoCb(lv_event_t* e) {
-    (void)e;
-    lastDashboardTouchTime = millis();
-    switchMediaSubTab(0);
-}
-
-static void mediaToggleAudioCb(lv_event_t* e) {
-    (void)e;
-    lastDashboardTouchTime = millis();
-    switchMediaSubTab(1);
-}
-
-static void historyOpenCb(lv_event_t* e) {
-    (void)e;
-    refreshHistoryList();
-    hideNavBar();
-    lv_scr_load_anim(screen3, LV_SCR_LOAD_ANIM_MOVE_LEFT, 180, 0, false);
-}
-
-static void historyCloseCb(lv_event_t* e) {
-    (void)e;
-    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);  // reset to list view for next visit
-    currentScreenIndex = 0;  // Home
-    showNavBar();
-    lv_scr_load_anim(screen1, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 180, 0, false);
-    updateNavHighlight(0);
+// Icon (accent) + title, the caption row used on tiles and cards
+static void makeIconTitle(lv_obj_t* parent, const char* icon, const char* text,
+                          const lv_font_t* font, UiColor textColor, int textX) {
+    lv_obj_t* i = makeLabel(parent, icon, font, UI_ACCENT);
+    lv_obj_set_pos(i, 0, 0);
+    lv_obj_t* t = makeLabel(parent, text, font, textColor);
+    lv_obj_set_pos(t, textX, 0);
 }
 
 static void createControlPanel() {
-    // ---- Screen 1: Home (latest message + sensor summary + History button) ----
-    screen1 = lv_obj_create(NULL);
-    setScreenStyle(screen1);
-    #define HOME_STRIP_H 22
-    #define HOME_HEADER_H 36
-    lv_obj_t* homeHeader = lv_obj_create(screen1);
-    lv_obj_set_size(homeHeader, TZT_SCREEN_WIDTH - 8, HOME_HEADER_H);
-    lv_obj_set_pos(homeHeader, 4, TZT_CONTENT_TOP);
-    lv_obj_set_style_bg_opa(homeHeader, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(homeHeader, 0, 0);
-    lv_obj_set_style_pad_all(homeHeader, 0, 0);
-    lv_obj_clear_flag(homeHeader, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* homeTitle = lv_label_create(homeHeader);
-    lv_label_set_text(homeTitle, LV_SYMBOL_ENVELOPE " Latest Message");
-    lv_obj_set_style_text_color(homeTitle, lv_color_hex(0x99bb88), 0);
-    lv_obj_set_style_text_font(homeTitle, &lv_font_montserrat_14, 0);
-    lv_obj_align(homeTitle, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_t* historyBtn = lv_btn_create(homeHeader);
-    applyBtnPressStyle(historyBtn);
-    lv_obj_set_size(historyBtn, 92, HOME_HEADER_H - 4);
-    lv_obj_align(historyBtn, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_set_style_bg_color(historyBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_border_color(historyBtn, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(historyBtn, 1, 0);
-    lv_obj_set_style_radius(historyBtn, 6, 0);
-    lv_obj_t* historyLbl = lv_label_create(historyBtn);
-    lv_label_set_text(historyLbl, LV_SYMBOL_LIST " History");
-    lv_obj_set_style_text_font(historyLbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(historyLbl, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_center(historyLbl);
-    lv_obj_add_event_cb(historyBtn, historyOpenCb, LV_EVENT_CLICKED, nullptr);
+    const int cardW = TZT_SCREEN_WIDTH - 2 * UI_MARGIN;
+    const int top = TZT_CONTENT_TOP + UI_GAP;   // first content row under the status bar
 
-    int msgBoxTop = TZT_CONTENT_TOP + HOME_HEADER_H + 2;
-    int msgBoxH = TZT_CONTENT_H - HOME_HEADER_H - HOME_STRIP_H - 6;
-    lv_obj_t* msgBox = lv_obj_create(screen1);
-    lv_obj_set_size(msgBox, TZT_SCREEN_WIDTH - 8, msgBoxH);
-    lv_obj_set_pos(msgBox, 4, msgBoxTop);
-    lv_obj_set_style_bg_color(msgBox, lv_color_hex(0x142e0a), 0);
-    lv_obj_set_style_bg_opa(msgBox, LV_OPA_90, 0);
-    lv_obj_set_style_border_color(msgBox, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(msgBox, 1, 0);
-    lv_obj_set_style_pad_all(msgBox, 6, 0);
-    lv_obj_set_style_radius(msgBox, 4, 0);
-    lv_obj_add_flag(msgBox, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scrollbar_mode(msgBox, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_scroll_dir(msgBox, LV_DIR_VER);
-    labelMessage = lv_label_create(msgBox);
-    lv_label_set_long_mode(labelMessage, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(labelMessage, TZT_SCREEN_WIDTH - 28);
-    lv_label_set_text(labelMessage, lastPrintMessage.c_str());
-    lv_obj_set_style_text_color(labelMessage, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_set_style_text_font(labelMessage, &lv_font_montserrat_16, 0);
-    // Compact sensor summary at bottom of home screen
-    homeSensorStrip = lv_label_create(screen1);
-    lv_obj_set_style_text_color(homeSensorStrip, lv_color_hex(0x99cc77), 0);
-    lv_obj_set_style_text_font(homeSensorStrip, &lv_font_montserrat_14, 0);
-    lv_label_set_text(homeSensorStrip, LV_SYMBOL_CHARGE " --   San --   LED --   Pump --");
-    lv_obj_set_pos(homeSensorStrip, 8, msgBoxTop + msgBoxH + 4);
-
-    // ---- Screen 2: Sensor Data with progress bars ----
-    screen2 = lv_obj_create(NULL);
-    setScreenStyle(screen2);
+    // ---- Launcher: three tall buttons, a big icon over the section name ----
+    launcherScreen = lv_obj_create(NULL);
+    setScreenStyle(launcherScreen);
     {
-        int pad = 4, gap = 3;
-        int boxW = (TZT_SCREEN_WIDTH - pad * 2 - gap) / 2;
-        int boxH = (TZT_CONTENT_H - gap) / 2;
-        int y0 = TZT_CONTENT_TOP;
-        auto addSensorCard = [&](int col, int row, const char* icon, const char* name,
-                                  lv_obj_t*& valueLabel, lv_obj_t*& bar) {
-            int x = pad + col * (boxW + gap);
-            int y = y0 + row * (boxH + gap);
-            lv_obj_t* box = lv_obj_create(screen2);
-            lv_obj_set_size(box, boxW, boxH);
-            lv_obj_set_pos(box, x, y);
-            lv_obj_set_style_bg_color(box, lv_color_hex(0x1e4210), 0);
-            lv_obj_set_style_border_color(box, lv_color_hex(0x3a6820), 0);
-            lv_obj_set_style_border_width(box, 1, 0);
-            lv_obj_set_style_pad_all(box, 5, 0);
-            lv_obj_set_style_radius(box, 6, 0);
-            lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_t* header = lv_label_create(box);
-            char hbuf[32]; snprintf(hbuf, sizeof(hbuf), "%s %s", icon, name);
-            lv_label_set_text(header, hbuf);
-            lv_obj_set_style_text_color(header, lv_color_hex(0x99bb88), 0);
-            lv_obj_set_style_text_font(header, &lv_font_montserrat_14, 0);
-            lv_obj_set_pos(header, 0, 0);
-            lv_obj_t* val = lv_label_create(box);
-            lv_label_set_text(val, "--");
-            lv_obj_set_style_text_color(val, lv_color_hex(0xffffff), 0);
-            lv_obj_set_style_text_font(val, &lv_font_montserrat_18, 0);
-            lv_obj_align(val, LV_ALIGN_CENTER, 0, 2);
-            valueLabel = val;
-            if (bar != (lv_obj_t*)1) {
-                bar = lv_bar_create(box);
-                lv_obj_set_size(bar, boxW - 14, 10);
-                lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -2);
-                lv_bar_set_range(bar, 0, 100);
-                lv_bar_set_value(bar, 0, LV_ANIM_OFF);
-                lv_obj_set_style_bg_color(bar, lv_color_hex(0x0d1f07), LV_PART_MAIN);
-                lv_obj_set_style_bg_color(bar, lv_color_hex(0x6ab82e), LV_PART_INDICATOR);
-                lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
-                lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
-            } else {
-                bar = nullptr;
-            }
-        };
-        lv_obj_t* noBar = (lv_obj_t*)1;
-        addSensorCard(0, 0, LV_SYMBOL_CHARGE, "Moisture", labelMoisture, barMoisture);
-        addSensorCard(1, 0, LV_SYMBOL_REFRESH, "Sanitizer", labelSanitizer, barSanitizer);
-        addSensorCard(0, 1, LV_SYMBOL_SETTINGS, "LED", labelLED, barLED);
-        addSensorCard(1, 1, LV_SYMBOL_POWER, "Pump", labelPump, noBar);
+        int btnW = (cardW - (LAUNCHER_BUTTONS - 1) * UI_GAP) / LAUNCHER_BUTTONS;
+        int btnH = TZT_SCREEN_HEIGHT - top - UI_MARGIN;
+        for (int i = 0; i < LAUNCHER_BUTTONS; i++) {
+            lv_obj_t* btn = lv_btn_create(launcherScreen);
+            lv_obj_set_size(btn, btnW, btnH);
+            lv_obj_set_pos(btn, UI_MARGIN + i * (btnW + UI_GAP), top);
+            styleCard(btn, 0);
+            applyBtnPressStyle(btn);
+            lv_obj_add_event_cb(btn, launcherTileCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+            lv_obj_t* icon = makeLabel(btn, sectionIcons[i], &lv_font_montserrat_32, UI_ACCENT);
+            lv_obj_align(icon, LV_ALIGN_CENTER, 0, -14);
+            lv_obj_t* name = makeLabel(btn, sectionTitles[i], &lv_font_montserrat_16, UI_TEXT);
+            lv_obj_align(name, LV_ALIGN_CENTER, 0, 26);
+        }
     }
 
-    // ---- Screen 3: History (messages from SD) - reached via History button on Home ----
-    screen3 = lv_obj_create(NULL);
-    setScreenStyle(screen3);
-    lv_obj_t* historyHeaderBar = lv_obj_create(screen3);
-    lv_obj_set_size(historyHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
-    lv_obj_set_pos(historyHeaderBar, 0, 0);
-    lv_obj_set_style_bg_color(historyHeaderBar, lv_color_hex(0x0d1f07), 0);
-    lv_obj_set_style_border_color(historyHeaderBar, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_border_width(historyHeaderBar, 1, 0);
-    lv_obj_set_style_border_side(historyHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_radius(historyHeaderBar, 0, 0);
-    lv_obj_set_style_pad_all(historyHeaderBar, 0, 0);
-    lv_obj_clear_flag(historyHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* historyHomeBtn = lv_btn_create(historyHeaderBar);
-    applyBtnPressStyle(historyHomeBtn);
-    lv_obj_set_size(historyHomeBtn, 100, TZT_MIN_TOUCH_H);
-    lv_obj_align(historyHomeBtn, LV_ALIGN_LEFT_MID, 6, 0);
-    lv_obj_set_style_bg_color(historyHomeBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_radius(historyHomeBtn, 8, 0);
-    lv_obj_t* historyHomeLbl = lv_label_create(historyHomeBtn);
-    lv_label_set_text(historyHomeLbl, LV_SYMBOL_LEFT " Home");
-    lv_obj_set_style_text_font(historyHomeLbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(historyHomeLbl, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_center(historyHomeLbl);
-    lv_obj_add_event_cb(historyHomeBtn, historyCloseCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* historyTitleLbl = lv_label_create(historyHeaderBar);
-    lv_label_set_text(historyTitleLbl, LV_SYMBOL_LIST " History");
-    lv_obj_set_style_text_color(historyTitleLbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(historyTitleLbl, &lv_font_montserrat_18, 0);
-    lv_obj_align(historyTitleLbl, LV_ALIGN_CENTER, 0, 0);
+    // ---- Messages: list (newest first); tap a row to read it in full ----
+    messagesScreen = lv_obj_create(NULL);
+    setScreenStyle(messagesScreen);
+    historyList = makeCardList(messagesScreen);
 
-    historyList = lv_list_create(screen3);
-    lv_obj_set_size(historyList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
-    lv_obj_set_pos(historyList, 4, TZT_HEADER_BAR_H + 4);
-    lv_obj_set_style_bg_color(historyList, lv_color_hex(0x142e0a), 0);
-    lv_obj_set_style_bg_opa(historyList, LV_OPA_90, 0);
-    lv_obj_set_style_border_color(historyList, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(historyList, 1, 0);
-    lv_obj_set_style_pad_all(historyList, TZT_LIST_PAD, 0);
-    lv_obj_set_style_radius(historyList, 4, 0);
-    lv_obj_set_scrollbar_mode(historyList, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_add_flag(historyList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scroll_dir(historyList, LV_DIR_VER);
-    refreshHistoryList();
-
-    historyDetail = lv_obj_create(screen3);
-    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
-    lv_obj_set_pos(historyDetail, 4, TZT_HEADER_BAR_H + 4);
-    lv_obj_set_style_bg_color(historyDetail, lv_color_hex(0x0d1f07), 0);
+    historyDetail = lv_obj_create(messagesScreen);
+    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH, TZT_CONTENT_H);
+    lv_obj_set_pos(historyDetail, 0, TZT_CONTENT_TOP);
+    lv_obj_set_style_bg_color(historyDetail, uiColor(UI_BACKGROUND), 0);
     lv_obj_set_style_bg_opa(historyDetail, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(historyDetail, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_border_width(historyDetail, 2, 0);
-    lv_obj_set_style_radius(historyDetail, 8, 0);
-    lv_obj_set_style_pad_all(historyDetail, TZT_LIST_PAD, 0);
-    lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scroll_dir(historyDetail, LV_DIR_VER);
+    lv_obj_set_style_border_width(historyDetail, 0, 0);
+    lv_obj_set_style_radius(historyDetail, 0, 0);
+    lv_obj_set_style_pad_all(historyDetail, UI_MARGIN, 0);
     lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(historyDetail, LV_OBJ_FLAG_SCROLLABLE);
+    {
+        const int backH = 40;
+        lv_obj_t* textCard = lv_obj_create(historyDetail);
+        lv_obj_set_size(textCard, cardW, TZT_CONTENT_H - 2 * UI_MARGIN - backH - UI_GAP);
+        lv_obj_set_pos(textCard, 0, 0);
+        styleCard(textCard, 10);
+        lv_obj_add_flag(textCard, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+        lv_obj_set_scroll_dir(textCard, LV_DIR_VER);
+        historyDetailLabel = makeLabel(textCard, "", &lv_font_montserrat_16, UI_TEXT);
+        lv_label_set_long_mode(historyDetailLabel, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(historyDetailLabel, cardW - 24);
+        lv_obj_t* backBtn = makeButton(historyDetail, LV_SYMBOL_LIST " All messages", 150, backH, false, historyBackCb);
+        lv_obj_align(backBtn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    }
 
-    historyDetailLabel = lv_label_create(historyDetail);
-    lv_label_set_long_mode(historyDetailLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(historyDetailLabel, TZT_SCREEN_WIDTH - 56);
-    lv_obj_set_style_text_color(historyDetailLabel, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_set_style_text_font(historyDetailLabel, &lv_font_montserrat_16, 0);
+    // ---- Sounds: list (tap to play) over a now-playing bar with Stop ----
+    soundsScreen = lv_obj_create(NULL);
+    setScreenStyle(soundsScreen);
+    {
+        const int barH = UI_ROW_H + UI_MARGIN;
+        audioList = makeCardList(soundsScreen, TZT_CONTENT_H - barH);
+        lv_obj_t* bar = lv_obj_create(soundsScreen);
+        lv_obj_set_size(bar, cardW, UI_ROW_H);
+        lv_obj_set_pos(bar, UI_MARGIN, TZT_SCREEN_HEIGHT - UI_MARGIN - UI_ROW_H);
+        styleCard(bar, 0);
+        lv_obj_set_style_pad_hor(bar, 12, 0);
+        lv_obj_t* icon = makeLabel(bar, LV_SYMBOL_AUDIO, &lv_font_montserrat_16, UI_ACCENT);
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
+        const int stopW = 64;
+        audioNowPlayingLabel = makeLabel(bar, "Nothing playing", &lv_font_montserrat_14, UI_TEXT_MUTED);
+        lv_obj_set_width(audioNowPlayingLabel, cardW - 24 - 26 - stopW - UI_GAP);
+        lv_label_set_long_mode(audioNowPlayingLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_align(audioNowPlayingLabel, LV_ALIGN_LEFT_MID, 26, 0);
+        audioStopBtn = makeButton(bar, LV_SYMBOL_STOP, stopW, UI_ROW_H - 10, false, audioStopCb);
+        lv_obj_align(audioStopBtn, LV_ALIGN_RIGHT_MID, 6, 0);
+        lv_obj_set_ext_click_area(audioStopBtn, 5);
+    }
 
-    lv_obj_t* backBtn = lv_btn_create(historyDetail);
-    applyBtnPressStyle(backBtn);
-    lv_obj_set_size(backBtn, 100, TZT_MIN_TOUCH_H);
-    lv_obj_align(backBtn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_radius(backBtn, 6, 0);
-    lv_obj_t* backLbl = lv_label_create(backBtn);
-    lv_label_set_text(backLbl, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_font(backLbl, &lv_font_montserrat_16, 0);
-    lv_obj_center(backLbl);
-    lv_obj_add_event_cb(backBtn, historyBackCb, LV_EVENT_CLICKED, nullptr);
+    // ---- Pictures: list; tap a row for the full-screen viewer ----
+    picturesScreen = lv_obj_create(NULL);
+    setScreenStyle(picturesScreen);
+    imageList = makeCardList(picturesScreen);
 
-    // ---- Audio list sub-screen (from Media) ----
-    audioListScreen = lv_obj_create(NULL);
-    setScreenStyle(audioListScreen);
-    audioHeaderBar = lv_obj_create(audioListScreen);
-    lv_obj_set_size(audioHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
-    lv_obj_set_pos(audioHeaderBar, 0, 0);
-    lv_obj_set_style_bg_color(audioHeaderBar, lv_color_hex(0x0d1f07), 0);
-    lv_obj_set_style_border_color(audioHeaderBar, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_border_width(audioHeaderBar, 1, 0);
-    lv_obj_set_style_border_side(audioHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_radius(audioHeaderBar, 0, 0);
-    lv_obj_set_style_pad_all(audioHeaderBar, 0, 0);
-    lv_obj_clear_flag(audioHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* audioBackBtn = lv_btn_create(audioHeaderBar);
-    applyBtnPressStyle(audioBackBtn);
-    lv_obj_set_size(audioBackBtn, 100, TZT_MIN_TOUCH_H);
-    lv_obj_align(audioBackBtn, LV_ALIGN_LEFT_MID, 6, 0);
-    lv_obj_set_style_bg_color(audioBackBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_radius(audioBackBtn, 8, 0);
-    lv_obj_t* audioBackLbl = lv_label_create(audioBackBtn);
-    lv_label_set_text(audioBackLbl, LV_SYMBOL_LEFT " Media");
-    lv_obj_set_style_text_font(audioBackLbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(audioBackLbl, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_center(audioBackLbl);
-    lv_obj_add_event_cb(audioBackBtn, audioBackToMediaCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* audioTitleLbl = lv_label_create(audioHeaderBar);
-    lv_label_set_text(audioTitleLbl, LV_SYMBOL_AUDIO " Audio");
-    lv_obj_set_style_text_color(audioTitleLbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(audioTitleLbl, &lv_font_montserrat_18, 0);
-    lv_obj_align(audioTitleLbl, LV_ALIGN_CENTER, 0, 0);
-    audioStopBtn = lv_btn_create(audioHeaderBar);
-    applyBtnPressStyle(audioStopBtn);
-    lv_obj_set_size(audioStopBtn, 72, TZT_MIN_TOUCH_H);
-    lv_obj_align(audioStopBtn, LV_ALIGN_RIGHT_MID, -8, 0);
-    lv_obj_set_style_bg_color(audioStopBtn, lv_color_hex(0xcc3333), 0);
-    lv_obj_set_style_radius(audioStopBtn, 8, 0);
-    lv_obj_t* stopLbl = lv_label_create(audioStopBtn);
-    lv_label_set_text(stopLbl, LV_SYMBOL_STOP);
-    lv_obj_set_style_text_font(stopLbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(stopLbl, lv_color_white(), 0);
-    lv_obj_center(stopLbl);
-    lv_obj_add_event_cb(audioStopBtn, audioStopCb, LV_EVENT_CLICKED, nullptr);
-    audioList = lv_list_create(audioListScreen);
-    lv_obj_set_size(audioList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
-    lv_obj_set_pos(audioList, 4, TZT_HEADER_BAR_H + 4);
-    lv_obj_set_style_bg_color(audioList, lv_color_hex(0x1a3d0e), 0);
-    lv_obj_set_style_bg_opa(audioList, LV_OPA_80, 0);
-    lv_obj_set_style_border_color(audioList, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_border_width(audioList, 2, 0);
-    lv_obj_set_style_pad_all(audioList, TZT_LIST_PAD, 0);
-    lv_obj_set_style_radius(audioList, 6, 0);
-    lv_obj_set_scrollbar_mode(audioList, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_add_flag(audioList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scroll_dir(audioList, LV_DIR_VER);
-
-    // ---- Image list sub-screen (from Media) ----
-    imageListScreen = lv_obj_create(NULL);
-    setScreenStyle(imageListScreen);
-    lv_obj_t* imageHeaderBar = lv_obj_create(imageListScreen);
-    lv_obj_set_size(imageHeaderBar, TZT_SCREEN_WIDTH, TZT_HEADER_BAR_H);
-    lv_obj_set_pos(imageHeaderBar, 0, 0);
-    lv_obj_set_style_bg_color(imageHeaderBar, lv_color_hex(0x0d1f07), 0);
-    lv_obj_set_style_border_color(imageHeaderBar, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_border_width(imageHeaderBar, 1, 0);
-    lv_obj_set_style_border_side(imageHeaderBar, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_radius(imageHeaderBar, 0, 0);
-    lv_obj_set_style_pad_all(imageHeaderBar, 0, 0);
-    lv_obj_clear_flag(imageHeaderBar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* imgBackBtn = lv_btn_create(imageHeaderBar);
-    applyBtnPressStyle(imgBackBtn);
-    lv_obj_set_size(imgBackBtn, 100, TZT_MIN_TOUCH_H);
-    lv_obj_align(imgBackBtn, LV_ALIGN_LEFT_MID, 6, 0);
-    lv_obj_set_style_bg_color(imgBackBtn, lv_color_hex(0x2d5016), 0);
-    lv_obj_set_style_radius(imgBackBtn, 8, 0);
-    lv_obj_t* imgBackLbl = lv_label_create(imgBackBtn);
-    lv_label_set_text(imgBackLbl, LV_SYMBOL_LEFT " Media");
-    lv_obj_set_style_text_font(imgBackLbl, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(imgBackLbl, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_center(imgBackLbl);
-    lv_obj_add_event_cb(imgBackBtn, imageListBackCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* imageTitleLbl = lv_label_create(imageHeaderBar);
-    lv_label_set_text(imageTitleLbl, LV_SYMBOL_IMAGE " Images");
-    lv_obj_set_style_text_color(imageTitleLbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(imageTitleLbl, &lv_font_montserrat_18, 0);
-    lv_obj_align(imageTitleLbl, LV_ALIGN_CENTER, 0, 0);
-    imageList = lv_list_create(imageListScreen);
-    lv_obj_set_size(imageList, TZT_SCREEN_WIDTH - 8, TZT_SCREEN_HEIGHT - TZT_HEADER_BAR_H - 8);
-    lv_obj_set_pos(imageList, 4, TZT_HEADER_BAR_H + 4);
-    lv_obj_set_style_bg_color(imageList, lv_color_hex(0x1a3d0e), 0);
-    lv_obj_set_style_bg_opa(imageList, LV_OPA_80, 0);
-    lv_obj_set_style_border_color(imageList, lv_color_hex(0x4a7c2a), 0);
-    lv_obj_set_style_border_width(imageList, 2, 0);
-    lv_obj_set_style_pad_all(imageList, TZT_LIST_PAD, 0);
-    lv_obj_set_style_radius(imageList, 6, 0);
-    lv_obj_set_scrollbar_mode(imageList, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_add_flag(imageList, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scroll_dir(imageList, LV_DIR_VER);
-
-    // Image viewer: full screen; tap anywhere to go back to list
+    // Image viewer: full screen; tap anywhere to go back to the Pictures list
     imageViewerScreen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(imageViewerScreen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(imageViewerScreen, LV_OPA_COVER, 0);
@@ -1193,358 +1153,139 @@ static void createControlPanel() {
     lv_obj_add_flag(imageViewerScreen, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(imageViewerScreen, imageBackCb, LV_EVENT_CLICKED, nullptr);
 
-    #define MEDIA_TOGGLE_H 32
-    #define MEDIA_TOGGLE_GAP 6
-    #define MEDIA_CONTENT_TOP (TZT_CONTENT_TOP + MEDIA_TOGGLE_H + MEDIA_TOGGLE_GAP)
-    int mediaToggleBtnW = (TZT_SCREEN_WIDTH - 16 - 4) / 2;
-
-    // ---- Media tab, Photo sub-tab (full-area image when active; drawn in loop) ----
-    dashboardPhotoScreen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(dashboardPhotoScreen, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(dashboardPhotoScreen, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(dashboardPhotoScreen, 0, 0);
-    lv_obj_set_size(dashboardPhotoScreen, TZT_SCREEN_WIDTH, TZT_SCREEN_HEIGHT);
-    {
-        lv_obj_t* toggleRow = lv_obj_create(dashboardPhotoScreen);
-        lv_obj_set_size(toggleRow, TZT_SCREEN_WIDTH - 16, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleRow, 8, TZT_CONTENT_TOP);
-        lv_obj_set_style_bg_opa(toggleRow, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(toggleRow, 0, 0);
-        lv_obj_set_style_pad_all(toggleRow, 0, 0);
-        lv_obj_clear_flag(toggleRow, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_t* toggleBtnPhoto = lv_btn_create(toggleRow);
-        lv_obj_set_size(toggleBtnPhoto, mediaToggleBtnW, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleBtnPhoto, 0, 0);
-        lv_obj_set_style_bg_color(toggleBtnPhoto, lv_color_hex(0x2a5514), 0);  // active
-        lv_obj_set_style_radius(toggleBtnPhoto, 6, 0);
-        lv_obj_t* toggleLblPhoto = lv_label_create(toggleBtnPhoto);
-        lv_label_set_text(toggleLblPhoto, LV_SYMBOL_IMAGE " Photo");
-        lv_obj_set_style_text_font(toggleLblPhoto, &lv_font_montserrat_14, 0);
-        lv_obj_center(toggleLblPhoto);
-        lv_obj_add_event_cb(toggleBtnPhoto, mediaTogglePhotoCb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t* toggleBtnAudio = lv_btn_create(toggleRow);
-        lv_obj_set_size(toggleBtnAudio, mediaToggleBtnW, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleBtnAudio, mediaToggleBtnW + 4, 0);
-        lv_obj_set_style_bg_color(toggleBtnAudio, lv_color_hex(0x0a1806), 0);  // inactive
-        lv_obj_set_style_radius(toggleBtnAudio, 6, 0);
-        lv_obj_t* toggleLblAudio = lv_label_create(toggleBtnAudio);
-        lv_label_set_text(toggleLblAudio, LV_SYMBOL_AUDIO " Audio");
-        lv_obj_set_style_text_font(toggleLblAudio, &lv_font_montserrat_14, 0);
-        lv_obj_center(toggleLblAudio);
-        lv_obj_add_event_cb(toggleBtnAudio, mediaToggleAudioCb, LV_EVENT_CLICKED, nullptr);
-    }
-    lv_obj_t* photoTitle = lv_label_create(dashboardPhotoScreen);
-    lv_label_set_text(photoTitle, LV_SYMBOL_IMAGE " Latest photo");
-    lv_obj_set_style_text_color(photoTitle, lv_color_hex(0x99bb88), 0);
-    lv_obj_set_style_text_font(photoTitle, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(photoTitle, 8, MEDIA_CONTENT_TOP);
-    lv_obj_t* photoPlaceholder = lv_label_create(dashboardPhotoScreen);
-    lv_label_set_text(photoPlaceholder, "No photo yet");
-    lv_obj_set_style_text_color(photoPlaceholder, lv_color_hex(0x668866), 0);
-    lv_obj_set_style_text_font(photoPlaceholder, &lv_font_montserrat_14, 0);
-    lv_obj_center(photoPlaceholder);
-    lv_obj_t* galleryBtn = lv_btn_create(dashboardPhotoScreen);
-    applyBtnPressStyle(galleryBtn);
-    lv_obj_set_size(galleryBtn, 90, TZT_MIN_TOUCH_H);
-    lv_obj_align(galleryBtn, LV_ALIGN_TOP_RIGHT, -8, MEDIA_CONTENT_TOP);
-    lv_obj_set_style_radius(galleryBtn, 6, 0);
-    lv_obj_t* galleryLbl = lv_label_create(galleryBtn);
-    lv_label_set_text(galleryLbl, "Gallery");
-    lv_obj_center(galleryLbl);
-    lv_obj_add_event_cb(galleryBtn, mediaOpenImagesCb, LV_EVENT_CLICKED, nullptr);
-
-    // ---- Media tab, Audio sub-tab ----
-    dashboardAudioScreen = lv_obj_create(NULL);
-    setScreenStyle(dashboardAudioScreen);
-    {
-        lv_obj_t* toggleRow = lv_obj_create(dashboardAudioScreen);
-        lv_obj_set_size(toggleRow, TZT_SCREEN_WIDTH - 16, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleRow, 8, TZT_CONTENT_TOP);
-        lv_obj_set_style_bg_opa(toggleRow, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(toggleRow, 0, 0);
-        lv_obj_set_style_pad_all(toggleRow, 0, 0);
-        lv_obj_clear_flag(toggleRow, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_t* toggleBtnPhoto = lv_btn_create(toggleRow);
-        lv_obj_set_size(toggleBtnPhoto, mediaToggleBtnW, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleBtnPhoto, 0, 0);
-        lv_obj_set_style_bg_color(toggleBtnPhoto, lv_color_hex(0x0a1806), 0);  // inactive
-        lv_obj_set_style_radius(toggleBtnPhoto, 6, 0);
-        lv_obj_t* toggleLblPhoto = lv_label_create(toggleBtnPhoto);
-        lv_label_set_text(toggleLblPhoto, LV_SYMBOL_IMAGE " Photo");
-        lv_obj_set_style_text_font(toggleLblPhoto, &lv_font_montserrat_14, 0);
-        lv_obj_center(toggleLblPhoto);
-        lv_obj_add_event_cb(toggleBtnPhoto, mediaTogglePhotoCb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t* toggleBtnAudio = lv_btn_create(toggleRow);
-        lv_obj_set_size(toggleBtnAudio, mediaToggleBtnW, MEDIA_TOGGLE_H);
-        lv_obj_set_pos(toggleBtnAudio, mediaToggleBtnW + 4, 0);
-        lv_obj_set_style_bg_color(toggleBtnAudio, lv_color_hex(0x2a5514), 0);  // active
-        lv_obj_set_style_radius(toggleBtnAudio, 6, 0);
-        lv_obj_t* toggleLblAudio = lv_label_create(toggleBtnAudio);
-        lv_label_set_text(toggleLblAudio, LV_SYMBOL_AUDIO " Audio");
-        lv_obj_set_style_text_font(toggleLblAudio, &lv_font_montserrat_14, 0);
-        lv_obj_center(toggleLblAudio);
-        lv_obj_add_event_cb(toggleBtnAudio, mediaToggleAudioCb, LV_EVENT_CLICKED, nullptr);
-    }
-    lv_obj_t* audioTitle = lv_label_create(dashboardAudioScreen);
-    lv_label_set_text(audioTitle, LV_SYMBOL_AUDIO " Latest audio");
-    lv_obj_set_style_text_color(audioTitle, lv_color_hex(0x99bb88), 0);
-    lv_obj_set_style_text_font(audioTitle, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(audioTitle, 8, MEDIA_CONTENT_TOP);
-    dashboardAudioNameLabel = lv_label_create(dashboardAudioScreen);
-    lv_label_set_text(dashboardAudioNameLabel, "No audio yet");
-    lv_obj_set_style_text_color(dashboardAudioNameLabel, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_set_style_text_font(dashboardAudioNameLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(dashboardAudioNameLabel, 8, MEDIA_CONTENT_TOP + TZT_MIN_TOUCH_H + 4);
-    lv_obj_set_width(dashboardAudioNameLabel, TZT_SCREEN_WIDTH - 16);
-    lv_label_set_long_mode(dashboardAudioNameLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_t* playlistBtn = lv_btn_create(dashboardAudioScreen);
-    applyBtnPressStyle(playlistBtn);
-    lv_obj_set_size(playlistBtn, 90, TZT_MIN_TOUCH_H);
-    lv_obj_align(playlistBtn, LV_ALIGN_TOP_RIGHT, -8, MEDIA_CONTENT_TOP);
-    lv_obj_set_style_radius(playlistBtn, 6, 0);
-    lv_obj_t* playlistLbl = lv_label_create(playlistBtn);
-    lv_label_set_text(playlistLbl, "Playlist");
-    lv_obj_center(playlistLbl);
-    lv_obj_add_event_cb(playlistBtn, mediaOpenAudioCb, LV_EVENT_CLICKED, nullptr);
-
-    currentScreenIndex = 0;
-    mediaSubTab = 0;
+    currentScreenIndex = SCREEN_LAUNCHER;
     lastDashboardTouchTime = millis();
-    lastDashboardAutoAdvance = millis();
-    lv_scr_load(screen1);  // start on Home tab
+    lv_scr_load(launcherScreen);
 
-    // ---- Bottom navigation bar (icons + labels) ----
+    // ---- Status bar (top layer): card-tone header like Spectral's drawTitleBar() ----
+    // Launcher: app name + settings gear. Sections: "<" back + section title. Right: time + WiFi glyph.
     {
-        lv_obj_t* top = lv_layer_top();
-        navBarContainer = lv_obj_create(top);
-        lv_obj_set_size(navBarContainer, TZT_SCREEN_WIDTH, TZT_NAV_BAR_H);
-        lv_obj_set_pos(navBarContainer, 0, TZT_SCREEN_HEIGHT - TZT_NAV_BAR_H);
-        lv_obj_set_style_bg_color(navBarContainer, lv_color_hex(0x0a1806), 0);
-        lv_obj_set_style_border_color(navBarContainer, lv_color_hex(0x2d5016), 0);
-        lv_obj_set_style_border_width(navBarContainer, 1, 0);
-        lv_obj_set_style_border_side(navBarContainer, LV_BORDER_SIDE_TOP, 0);
-        lv_obj_set_style_radius(navBarContainer, 0, 0);
-        lv_obj_set_style_pad_all(navBarContainer, 0, 0);
-        lv_obj_clear_flag(navBarContainer, LV_OBJ_FLAG_SCROLLABLE);
-        const char* navIcons[]  = { LV_SYMBOL_HOME, LV_SYMBOL_EYE_OPEN, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
-        const char* navLabels[] = { "Home", "Sensors", "Media", "Settings" };
-        // Real gaps between tabs so adjacent taps don't misfire (see TZT_NAV_BTN_GAP)
-        int btnW = (TZT_SCREEN_WIDTH - TZT_NAV_BTN_GAP * (SCREEN_COUNT + 1)) / SCREEN_COUNT;
-        for (int i = 0; i < SCREEN_COUNT; i++) {
-            lv_obj_t* btn = lv_btn_create(navBarContainer);
-            applyBtnPressStyle(btn);
-            lv_obj_set_size(btn, btnW, TZT_NAV_BAR_H - 2);
-            lv_obj_set_pos(btn, TZT_NAV_BTN_GAP + i * (btnW + TZT_NAV_BTN_GAP), 1);
-            lv_obj_set_style_radius(btn, 6, 0);
-            lv_obj_set_style_bg_color(btn, i == 0 ? lv_color_hex(0x2a5514) : lv_color_hex(0x0a1806), 0);
-            lv_obj_set_style_border_width(btn, 0, 0);
-            lv_obj_set_style_shadow_width(btn, 0, 0);
-            lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
-            lv_obj_t* ico = lv_label_create(btn);
-            lv_label_set_text(ico, navIcons[i]);
-            lv_obj_set_style_text_font(ico, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_color(ico, lv_color_hex(0xccddbb), 0);
-            lv_obj_align(ico, LV_ALIGN_TOP_MID, 0, 0);
-            lv_obj_t* lbl = lv_label_create(btn);
-            lv_label_set_text(lbl, navLabels[i]);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(lbl, lv_color_hex(0x99aa88), 0);
-            lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
-            lv_obj_add_event_cb(btn, navBtnCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-            navBtns[i] = btn;
-        }
-    }
-
-    // ---- Status bar (top layer: time + WiFi) ----
-    {
-        lv_obj_t* top = lv_layer_top();
-        statusBar = lv_obj_create(top);
+        lv_obj_t* layer = lv_layer_top();
+        statusBar = lv_obj_create(layer);
         lv_obj_set_size(statusBar, TZT_SCREEN_WIDTH, TZT_STATUS_H);
         lv_obj_set_pos(statusBar, 0, 0);
-        lv_obj_set_style_bg_color(statusBar, lv_color_hex(0x0a1806), 0);
-        lv_obj_set_style_bg_opa(statusBar, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(statusBar, lv_color_hex(0x2d5016), 0);
-        lv_obj_set_style_border_width(statusBar, 1, 0);
-        lv_obj_set_style_border_side(statusBar, LV_BORDER_SIDE_BOTTOM, 0);
+        styleCard(statusBar, 0);
         lv_obj_set_style_radius(statusBar, 0, 0);
-        lv_obj_set_style_pad_hor(statusBar, 6, 0);
-        lv_obj_set_style_pad_ver(statusBar, 1, 0);
-        lv_obj_clear_flag(statusBar, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t* appName = lv_label_create(statusBar);
-        lv_label_set_text(appName, LV_SYMBOL_HOME " Prick'n'Print");
-        lv_obj_set_style_text_font(appName, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(appName, lv_color_hex(0x88aa77), 0);
-        lv_obj_align(appName, LV_ALIGN_LEFT_MID, 0, 0);
+        statusAppName = makeLabel(statusBar, "Prick'n'Print", &lv_font_montserrat_16, UI_TEXT);
+        lv_obj_align(statusAppName, LV_ALIGN_LEFT_MID, UI_MARGIN + 4, 0);
 
-        statusIpLabel = lv_label_create(statusBar);
-        lv_label_set_text(statusIpLabel, "");
-        lv_obj_set_style_text_font(statusIpLabel, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(statusIpLabel, lv_color_hex(0x668866), 0);
-        lv_obj_align_to(statusIpLabel, appName, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+        statusBackBtn = makeBarIconButton(statusBar, LV_SYMBOL_LEFT, statusBackCb);
+        lv_obj_align(statusBackBtn, LV_ALIGN_LEFT_MID, 0, 0);
 
-        // Settings is reached via the bottom nav tab now (was a tiny 28x14 corner button - too small to tap reliably)
-        statusTimeLabel = lv_label_create(statusBar);
-        lv_label_set_text(statusTimeLabel, "--:--");
-        lv_obj_set_style_text_font(statusTimeLabel, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(statusTimeLabel, lv_color_hex(0xaabb99), 0);
-        lv_obj_align(statusTimeLabel, LV_ALIGN_RIGHT_MID, -4, 0);
+        statusTitleLabel = makeLabel(statusBar, "", &lv_font_montserrat_16, UI_TEXT);
+        lv_obj_align(statusTitleLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 2, 0);
+
+        statusSettingsBtn = makeBarIconButton(statusBar, LV_SYMBOL_SETTINGS, statusSettingsCb);
+        lv_obj_align(statusSettingsBtn, LV_ALIGN_RIGHT_MID, 0, 0);
+
+        statusWifiIcon = makeLabel(statusBar, LV_SYMBOL_WIFI, &lv_font_montserrat_14, UI_WARNING);
+        statusTimeLabel = makeLabel(statusBar, "--:--", &lv_font_montserrat_14, UI_TEXT);
+        // Right-side positions are set by updateHeader() (they shift for the gear on the launcher)
     }
-    updateStatusBar();
 
-    // ---- Settings tab (card layout: WiFi + Volume; Back to Home) ----
+    // ---- Settings (card rows: WiFi + IP, Volume, LED) ----
     settingsScreen = lv_obj_create(NULL);
     setScreenStyle(settingsScreen);
-    int setPad = TZT_LIST_PAD, setGap = 6;
-    int setCardW = TZT_SCREEN_WIDTH - setPad * 2;
-    int setCardH = 56;
+    const int setCardPad = 10, wifiCardH = 44, sliderCardH = 66;
 
-    // WiFi card (same style as Status/Media cards)
+    // WiFi row: name left, network over IP address on the right (Spectral's value-on-the-right row)
     lv_obj_t* wifiCard = lv_obj_create(settingsScreen);
-    lv_obj_set_size(wifiCard, setCardW, setCardH);
-    lv_obj_set_pos(wifiCard, setPad, TZT_CONTENT_TOP);
-    lv_obj_set_style_bg_color(wifiCard, lv_color_hex(0x1e4210), 0);
-    lv_obj_set_style_border_color(wifiCard, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(wifiCard, 1, 0);
-    lv_obj_set_style_pad_all(wifiCard, TZT_LIST_PAD, 0);
-    lv_obj_set_style_radius(wifiCard, 6, 0);
-    lv_obj_clear_flag(wifiCard, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* wifiHeader = lv_label_create(wifiCard);
-    lv_label_set_text(wifiHeader, LV_SYMBOL_WIFI " WiFi");
-    lv_obj_set_style_text_color(wifiHeader, lv_color_hex(0x99bb88), 0);
-    lv_obj_set_style_text_font(wifiHeader, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(wifiHeader, 0, 0);
-    statusWifiLabel = lv_label_create(wifiCard);
-    lv_label_set_text(statusWifiLabel, "--");
-    lv_obj_set_style_text_color(statusWifiLabel, lv_color_hex(0x6ab82e), 0);
-    lv_obj_set_style_text_font(statusWifiLabel, &lv_font_montserrat_16, 0);
-    lv_obj_align(statusWifiLabel, LV_ALIGN_CENTER, 0, 2);
+    lv_obj_set_size(wifiCard, cardW, wifiCardH);
+    lv_obj_set_pos(wifiCard, UI_MARGIN, top);
+    styleCard(wifiCard, 0);
+    lv_obj_set_style_pad_hor(wifiCard, setCardPad, 0);
+    lv_obj_t* wifiTitle = makeLabel(wifiCard, LV_SYMBOL_WIFI, &lv_font_montserrat_14, UI_ACCENT);
+    lv_obj_align(wifiTitle, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t* wifiName = makeLabel(wifiCard, "WiFi", &lv_font_montserrat_14, UI_TEXT);
+    lv_obj_align(wifiName, LV_ALIGN_LEFT_MID, 22, 0);
+    const int wifiValueW = cardW - 2 * setCardPad - 80;
+    statusWifiLabel = makeLabel(wifiCard, "--", &lv_font_montserrat_14, UI_TEXT);
+    lv_label_set_long_mode(statusWifiLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(statusWifiLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(statusWifiLabel, wifiValueW);
+    lv_obj_align(statusWifiLabel, LV_ALIGN_TOP_RIGHT, 0, 4);
+    statusIpLabel = makeLabel(wifiCard, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_set_style_text_align(statusIpLabel, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(statusIpLabel, wifiValueW);
+    lv_obj_align(statusIpLabel, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
+
+    auto makeSliderCard = [&](int y, const char* icon, const char* name) {
+        lv_obj_t* card = lv_obj_create(settingsScreen);
+        lv_obj_set_size(card, cardW, sliderCardH);
+        lv_obj_set_pos(card, UI_MARGIN, y);
+        styleCard(card, setCardPad);
+        makeIconTitle(card, icon, name, &lv_font_montserrat_14, UI_TEXT, 22);
+        return card;
+    };
+    const int sliderW = cardW - 2 * setCardPad - 16;  // room for the knob at both ends
 
     // Volume card
-    int volCardY = TZT_CONTENT_TOP + setCardH + setGap;
-    lv_obj_t* volCard = lv_obj_create(settingsScreen);
-    lv_obj_set_size(volCard, setCardW, setCardH + 20);
-    lv_obj_set_pos(volCard, setPad, volCardY);
-    lv_obj_set_style_bg_color(volCard, lv_color_hex(0x1e4210), 0);
-    lv_obj_set_style_border_color(volCard, lv_color_hex(0x3a6820), 0);
-    lv_obj_set_style_border_width(volCard, 1, 0);
-    lv_obj_set_style_pad_all(volCard, TZT_LIST_PAD, 0);
-    lv_obj_set_style_radius(volCard, 6, 0);
-    lv_obj_clear_flag(volCard, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* setVolLbl = lv_label_create(volCard);
-    lv_label_set_text(setVolLbl, LV_SYMBOL_VOLUME_MAX " Volume");
-    lv_obj_set_style_text_color(setVolLbl, lv_color_hex(0x99bb88), 0);
-    lv_obj_set_style_text_font(setVolLbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(setVolLbl, 0, 0);
-    volumeSlider = lv_slider_create(volCard);
-    lv_slider_set_range(volumeSlider, 0, 100);
-    lv_slider_set_value(volumeSlider, (int32_t)(audioSvc.getVolume() * 100.0f), LV_ANIM_OFF);
-    lv_obj_set_size(volumeSlider, setCardW - 50, 24);
-    lv_obj_set_pos(volumeSlider, 0, 24);
-    lv_obj_set_style_anim_time(volumeSlider, 0, LV_PART_MAIN);  // no animation so knob follows finger directly
-    lv_obj_set_ext_click_area(volumeSlider, 16);                 // easier to hit knob with finger
-    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x2d5016), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x6ab82e), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(volumeSlider, lv_color_hex(0x8bc34a), LV_PART_KNOB);
-    lv_obj_set_style_radius(volumeSlider, 10, LV_PART_MAIN);
-    lv_obj_set_style_radius(volumeSlider, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(volumeSlider, 14, LV_PART_KNOB);
-    lv_obj_set_style_pad_all(volumeSlider, 10, LV_PART_KNOB);    // larger knob for easier drag
-    lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    settingsVolumeValueLabel = lv_label_create(volCard);
+    int volCardY = top + wifiCardH + UI_GAP;
+    lv_obj_t* volCard = makeSliderCard(volCardY, LV_SYMBOL_VOLUME_MAX, "Volume");
     int v0 = (int)(audioSvc.getVolume() * 100.0f);
+    settingsVolumeValueLabel = makeLabel(volCard, "", &lv_font_montserrat_14, UI_TEXT_MUTED);
     lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v0);
-    lv_obj_set_style_text_font(settingsVolumeValueLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(settingsVolumeValueLabel, lv_color_hex(0xe8e8e8), 0);
-    lv_obj_set_pos(settingsVolumeValueLabel, setCardW - 42, 26);
+    lv_obj_align(settingsVolumeValueLabel, LV_ALIGN_TOP_RIGHT, 0, 0);
+    volumeSlider = makeSlider(volCard, sliderW, 0, 100, v0);
+    lv_obj_align(volumeSlider, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    // No "Back to Home" button needed - Settings is a normal bottom-nav tab, just tap Home to leave.
+    // LED card: on/off switch + brightness
+    int ledCardY = volCardY + sliderCardH + UI_GAP;
+    lv_obj_t* ledCard = makeSliderCard(ledCardY, LV_SYMBOL_CHARGE, "LED");
+    ledSwitch = makeSwitch(ledCard);
+    lv_obj_align(ledSwitch, LV_ALIGN_TOP_RIGHT, 0, -3);
+    lv_obj_add_event_cb(ledSwitch, ledToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    ledLevelValueLabel = makeLabel(ledCard, "--", &lv_font_montserrat_14, UI_TEXT_MUTED);
+    lv_obj_align(ledLevelValueLabel, LV_ALIGN_TOP_RIGHT, -(UI_SWITCH_W + 10), 0);
+    ledLevelSlider = makeSlider(ledCard, sliderW, 1, 100, 10);
+    lv_obj_align(ledLevelSlider, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_RELEASED, nullptr);
 
-    updateStatusBar();  // set WiFi label on Settings screen
-    updateNavHighlight(0);
-    // Gesture is processed in loop() right before lv_timer_handler() for minimal latency (no 80ms timer delay)
+    updateStatusBar();  // fill time, WiFi glyph and the Settings WiFi/IP labels
+    updateHeader();
 }
 
-static lv_color_t sensorColor(float val, float warnLow, float critLow) {
-    if (val < critLow) return lv_color_hex(0xff4444);
-    if (val < warnLow) return lv_color_hex(0xffcc00);
-    return lv_color_hex(0x66dd44);
-}
-
+// Main's sensor packets carry the LED state; keep the Settings LED controls in sync with it
 static void updateControlPanelStatus() {
-    if (!labelMoisture) return;
-    if (!lastSensorDataValid) {
-        lv_label_set_text(labelMoisture, "--");
-        lv_label_set_text(labelSanitizer, "--");
-        lv_label_set_text(labelLED, "--");
-        lv_label_set_text(labelPump, "--");
-        if (barMoisture) lv_bar_set_value(barMoisture, 0, LV_ANIM_OFF);
-        if (barSanitizer) lv_bar_set_value(barSanitizer, 0, LV_ANIM_OFF);
-        if (barLED) lv_bar_set_value(barLED, 0, LV_ANIM_OFF);
-        if (homeSensorStrip) lv_label_set_text(homeSensorStrip, LV_SYMBOL_CHARGE " --   San --   LED --   Pump --");
-        return;
-    }
-    char buf[32];
-    float m = lastSensorData.moisturePercent;
-    float s = lastSensorData.sanitizerLevel;
-    int ledPct = (lastSensorData.ledBrightness * 100) / 255;
-    bool pumping = lastSensorData.isDispensing;
-
-    if (std::isfinite(m) && m >= 0 && m <= 100) {
-        snprintf(buf, sizeof(buf), "%.0f%%", (double)m);
-        lv_label_set_text(labelMoisture, buf);
-        lv_obj_set_style_text_color(labelMoisture, sensorColor(m, 40, 20), 0);
-        if (barMoisture) {
-            lv_bar_set_value(barMoisture, (int)m, LV_ANIM_ON);
-            lv_obj_set_style_bg_color(barMoisture, sensorColor(m, 40, 20), LV_PART_INDICATOR);
+    if (!launcherScreen) return;
+    if (lastSensorDataValid && millis() - lastLedControlTouch > LED_CONTROL_ECHO_HOLD_MS) {
+        bool ledOn = lastSensorData.ledBrightness > 0;
+        if (ledSwitch) {
+            if (ledOn) lv_obj_add_state(ledSwitch, LV_STATE_CHECKED);
+            else lv_obj_clear_state(ledSwitch, LV_STATE_CHECKED);
         }
-    } else {
-        lv_label_set_text(labelMoisture, "--");
-    }
-    if (std::isfinite(s) && s >= 0 && s <= 100) {
-        snprintf(buf, sizeof(buf), "%.0f%%", (double)s);
-        lv_label_set_text(labelSanitizer, buf);
-        lv_obj_set_style_text_color(labelSanitizer, sensorColor(s, 50, 20), 0);
-        if (barSanitizer) {
-            lv_bar_set_value(barSanitizer, (int)s, LV_ANIM_ON);
-            lv_obj_set_style_bg_color(barSanitizer, sensorColor(s, 50, 20), LV_PART_INDICATOR);
+        if (ledLevelSlider && !lv_obj_has_state(ledLevelSlider, LV_STATE_PRESSED) && lastSensorData.ledLevel >= 1) {
+            lv_slider_set_value(ledLevelSlider, lastSensorData.ledLevel, LV_ANIM_OFF);
+            if (ledLevelValueLabel) lv_label_set_text_fmt(ledLevelValueLabel, "%d%%", (int)lastSensorData.ledLevel);
         }
-    } else {
-        lv_label_set_text(labelSanitizer, "--");
-    }
-    snprintf(buf, sizeof(buf), "%d%%", ledPct);
-    lv_label_set_text(labelLED, buf);
-    if (barLED) lv_bar_set_value(barLED, ledPct, LV_ANIM_ON);
-
-    lv_label_set_text(labelPump, pumping ? "ACTIVE" : "Idle");
-    lv_obj_set_style_text_color(labelPump, pumping ? lv_color_hex(0x66dd44) : lv_color_hex(0x99aa88), 0);
-
-    // Update home screen sensor summary strip
-    if (homeSensorStrip) {
-        char strip[64];
-        snprintf(strip, sizeof(strip), LV_SYMBOL_CHARGE " %.0f%%   San %.0f%%   LED %d%%   %s",
-                 (double)m, (double)s, ledPct, pumping ? "PUMP" : "");
-        lv_label_set_text(homeSensorStrip, strip);
     }
     updateStatusBar();
 }
 
 // ── Message History screen helpers ──────────────────────────────
 
+#define LATEST_MESSAGE_IDX -1  // list row for the in-memory latest message (no SD card)
+
 static void refreshHistoryList() {
     if (!historyList) return;
     lv_obj_clean(historyList);
-    if (!sdCard.isReady()) {
-        lv_list_add_text(historyList, "SD card not available");
-        return;
-    }
-    int n = sdCard.getMessageCount();
-    if (n == 0) {
-        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+    bool haveLatest = lastPrintMessage.length() > 0 && lastPrintMessage != NO_MESSAGE_TEXT;
+    int n = 0;
+    if (sdCard.isReady()) {
         n = sdCard.getMessageCount();
+        if (n == 0) {
+            sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+            n = sdCard.getMessageCount();
+        }
     }
     if (n == 0) {
-        lv_list_add_text(historyList, "No messages saved yet");
+        // No history on SD: still show the message received since boot
+        if (haveLatest) addListRow(historyList, LV_SYMBOL_ENVELOPE, lastPrintMessage.c_str(), true, historyItemCb, LATEST_MESSAGE_IDX);
+        if (!sdCard.isReady()) addListNote(historyList, haveLatest ? "No SD card: only the latest message is kept" : "No messages yet (no SD card)");
+        else if (!haveLatest) addListNote(historyList, "No messages yet");
         return;
     }
     // Show newest first
@@ -1560,20 +1301,14 @@ static void refreshHistoryList() {
         } else {
             snprintf(label, sizeof(label), "%s", m.preview);
         }
-        lv_obj_t* btn = lv_list_add_btn(historyList, LV_SYMBOL_FILE, label);
-        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
-        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
-        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
-        lv_obj_add_event_cb(btn, historyItemCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+        addListRow(historyList, LV_SYMBOL_ENVELOPE, label, true, historyItemCb, i);
     }
 }
 
 static void historyItemCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    String full = sdCard.readFullMessage(idx);
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    String full = (idx == LATEST_MESSAGE_IDX) ? lastPrintMessage : sdCard.readFullMessage(idx);
     if (full.length() == 0) full = "(could not read message)";
     if (historyDetailLabel) lv_label_set_text(historyDetailLabel, full.c_str());
     if (historyDetail) lv_obj_clear_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
@@ -1590,51 +1325,55 @@ static void refreshAudioList() {
     if (!audioList) return;
     lv_obj_clean(audioList);
     if (!sdCard.isReady()) {
-        lv_list_add_text(audioList, "SD card not available");
+        addListNote(audioList, "SD card not available");
         return;
     }
     audioFileCount = sdCard.listAudioFiles(audioFileNames, MAX_AUDIO_FILES);
     if (audioFileCount == 0) {
-        lv_list_add_text(audioList, "No audio files on SD");
+        addListNote(audioList, "No audio files on SD");
         return;
     }
     for (int i = 0; i < audioFileCount; i++) {
-        lv_obj_t* btn = lv_list_add_btn(audioList, LV_SYMBOL_AUDIO, audioFileNames[i].c_str());
-        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
-        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
-        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
-        lv_obj_add_event_cb(btn, audioFileCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+        addListRow(audioList, LV_SYMBOL_PLAY, audioFileNames[i].c_str(), false, audioFileCb, i);
     }
-    updateAudioHeaderState();
+    updateNowPlaying();
 }
 
-static void updateAudioHeaderState() {
+// Now-playing bar: file name while playing; Stop is the destructive action, red only while playing.
+// Called every loop on the Sounds screen, so it only touches LVGL when the state changes.
+static void updateNowPlaying() {
+    static int shownPlaying = -1;
+    static String shownFile;
     bool playing = audioSvc.isPlaying();
-    if (audioHeaderBar) {
-        lv_obj_set_style_bg_color(audioHeaderBar, playing ? lv_color_hex(0x1a3d1a) : lv_color_hex(0x0d1f07), 0);
+    String file = playing ? audioSvc.currentFile() : String();
+    if ((int)playing == shownPlaying && file == shownFile) return;
+    shownPlaying = playing;
+    shownFile = file;
+    if (audioNowPlayingLabel) {
+        lv_label_set_text(audioNowPlayingLabel, playing ? baseName(file).c_str() : "Nothing playing");
+        lv_obj_set_style_text_color(audioNowPlayingLabel, uiColor(playing ? UI_TEXT : UI_TEXT_MUTED), 0);
     }
     if (audioStopBtn) {
-        lv_obj_set_style_bg_color(audioStopBtn, playing ? lv_color_hex(0xe85555) : lv_color_hex(0xcc3333), 0);
+        lv_obj_set_style_bg_color(audioStopBtn, uiColor(playing ? UI_WARNING : UI_BUTTON), 0);
+        lv_obj_set_style_text_color(audioStopBtn, uiColor(playing ? UI_TITLE : UI_TEXT_MUTED), 0);
     }
 }
 
 static void audioFileCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= audioFileCount) return;
     String path = String(AUDIO_DIR) + "/" + audioFileNames[idx];
     // Only one audio at a time: if already playing this file, leave it; else stop any current and play
     if (audioSvc.isPlaying() && audioSvc.currentFile() == path) return;
     audioSvc.playFile(path);
-    updateAudioHeaderState();
+    updateNowPlaying();
 }
 
 static void audioStopCb(lv_event_t* e) {
     (void)e;
     audioSvc.stop();
-    updateAudioHeaderState();
+    updateNowPlaying();
 }
 
 // ── Splash (raw TFT before LVGL) and Image Gallery ──────────────
@@ -1706,42 +1445,35 @@ static void refreshImageList() {
     if (!imageList) return;
     lv_obj_clean(imageList);
     if (!sdCard.isReady()) {
-        lv_list_add_text(imageList, "SD card not available");
+        addListNote(imageList, "SD card not available");
         return;
     }
     imageFileCount = sdCard.listImageFiles(imageFileNames, MAX_IMAGE_FILES);
     if (imageFileCount == 0) {
-        lv_list_add_text(imageList, "No images on SD");
+        addListNote(imageList, "No images on SD");
         return;
     }
     for (int i = 0; i < imageFileCount; i++) {
-        lv_obj_t* btn = lv_list_add_btn(imageList, LV_SYMBOL_IMAGE, imageFileNames[i].c_str());
-        lv_obj_set_height(btn, TZT_LIST_ITEM_H);
-        lv_obj_set_style_text_font(btn, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(btn, lv_color_hex(0xe8e8e8), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1e4210), 0);
-        lv_obj_set_style_pad_ver(btn, TZT_BTN_PAD_V, 0);
-        lv_obj_add_event_cb(btn, imageFileCb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+        addListRow(imageList, LV_SYMBOL_IMAGE, imageFileNames[i].c_str(), true, imageFileCb, i);
     }
 }
 
 static void imageFileCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= imageFileCount) return;
     String path = String(IMAGES_DIR) + "/" + imageFileNames[idx];
     String lower = imageFileNames[idx];
     lower.toLowerCase();
 #if !defined(TZT_HEADLESS)
-    lastDashboardImagePath = path;
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
         currentImagePath = path;
-        hideNavBar();
+        hideStatusBar();
         lv_scr_load(imageViewerScreen);
     } else {
         Logger::warn("Image", "Only JPEG is displayed; file is not .jpg/.jpeg: " + path);
         currentImagePath = "";
-        hideNavBar();
+        hideStatusBar();
         lv_scr_load(imageViewerScreen);
     }
 #else
@@ -1750,10 +1482,10 @@ static void imageFileCb(lv_event_t* e) {
 #endif
 }
 
+// Tap on the viewer: back to the Pictures list (also when the image was pushed from the backend)
 static void imageBackCb(lv_event_t* e) {
     (void)e;
-    currentImagePath = "";
-    lv_scr_load(imageListScreen);  // stay in Media flow; nav still hidden until Back to Media
+    goToScreenIndex(SCREEN_PICTURES);
 }
 #endif
 
@@ -1801,31 +1533,9 @@ void saveTodos() {
     sdCard.writeFile(DATA_DIR "/todos.json", json);
 }
 
+// The request itself must carry a valid session token (cookie or ?token=)
 bool isAuthenticated() {
-    // Check token expiry
-    if (authToken.length() > 0 && millis() < authTokenExpiry) {
-        return true;
-    }
-    
-    // Check cookie
-    String cookie = server.header("Cookie");
-    if (cookie.indexOf("auth=") >= 0) {
-        int start = cookie.indexOf("auth=") + 5;
-        int end = cookie.indexOf(";", start);
-        if (end < 0) end = cookie.length();
-        String token = cookie.substring(start, end);
-        if (token == authToken && authToken.length() > 0 && millis() < authTokenExpiry) {
-            return true;
-        }
-    }
-    
-    // Check URL parameter
-    String tokenParam = server.arg("token");
-    if (tokenParam.length() > 0 && tokenParam == authToken && authToken.length() > 0 && millis() < authTokenExpiry) {
-        return true;
-    }
-    
-    return false;
+    return sessionTokenValid(requestCookieToken()) || sessionTokenValid(server.arg("token"));
 }
 
 void handleLogin() {
@@ -1841,8 +1551,7 @@ void handleLogin() {
         
         if (password == webPassword) {
             loginFailCount = 0;
-            authToken = generateAuthToken();
-            authTokenExpiry = millis() + AUTH_TOKEN_DURATION;
+            String authToken = createSession();
 
             String cookieHeader = "auth=" + authToken + "; Path=/; Max-Age=3600; SameSite=Lax";
             server.sendHeader("Set-Cookie", cookieHeader);
@@ -1863,144 +1572,45 @@ void handleLogin() {
         return;
     }
     
-    String errorMsg = server.hasArg("error") ? "<p class=\"error-msg\">❌ Incorrect password</p>" : "";
-    
-    String loginPage = R"HTML(
-<!DOCTYPE html>
+    static const char LOGIN_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="theme-color" content="#1a3d0e">
-    <title>Login - Print-n-Prick</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(74, 124, 42, 0.2); }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(180deg, #0d1f07 0%, #1a3d0e 50%, #2d5016 100%);
-            min-height: 100vh;
-            min-height: 100dvh;
-            margin: 0;
-            padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
-            color: #333;
-            position: relative;
-            -webkit-font-smoothing: antialiased;
-        }
-        body::before { content: '🌵'; position: fixed; font-size: 150px; opacity: 0.03; top: -50px; left: -50px; z-index: 0; }
-        body::after { content: '🖨️'; position: fixed; font-size: 120px; opacity: 0.03; bottom: -40px; right: -40px; z-index: 0; }
-        @media (min-width: 768px) {
-            body::before { font-size: 300px; top: -100px; left: -100px; }
-            body::after { font-size: 250px; bottom: -80px; right: -80px; }
-        }
-        body.login-page {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 16px;
-            overflow: hidden;
-        }
-        body.login-page::before { font-size: 120px; opacity: 0.05; top: -30px; left: -30px; transform: rotate(-15deg); }
-        body.login-page::after { font-size: 100px; opacity: 0.05; bottom: -20px; right: -20px; transform: rotate(15deg); }
-        @media (min-width: 768px) {
-            body.login-page { padding: 20px; }
-            body.login-page::before { font-size: 200px; top: -50px; left: -50px; }
-            body.login-page::after { font-size: 150px; bottom: -30px; right: -30px; }
-        }
-        .login-container {
-            background: linear-gradient(135deg, #f5f5f0 0%, #ffffff 100%);
-            border-radius: 20px;
-            padding: 32px 24px;
-            box-shadow: 0 20px 60px rgba(26, 18, 12, 0.5), 0 0 0 3px rgba(74, 124, 42, 0.2);
-            border: 3px solid #4a7c2a;
-            max-width: 420px;
-            width: 100%;
-            position: relative;
-            z-index: 1;
-        }
-        @media (min-width: 768px) {
-            .login-container { border-radius: 24px; padding: 50px 40px; }
-        }
-        .logo { text-align: center; margin-bottom: 32px; }
-        @media (min-width: 768px) { .logo { margin-bottom: 40px; } }
-        .logo-icon { font-size: 56px; margin-bottom: 10px; display: block; animation: float 3s ease-in-out infinite; }
-        @media (min-width: 768px) { .logo-icon { font-size: 64px; } }
-        @keyframes float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-10px); } }
-        h1 { color: #2d5016; font-weight: 700; text-shadow: 2px 2px 4px rgba(0,0,0,0.1); }
-        .tagline { font-style: italic; }
-        input[type="password"] {
-            width: 100%;
-            padding: 16px 18px;
-            border: 3px solid #4a7c2a;
-            border-bottom: 3px solid #3e2723;
-            border-radius: 12px;
-            font-size: 16px;
-            margin-bottom: 20px;
-            font-family: inherit;
-            background: #fff;
-            transition: all 0.3s;
-            box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
-        }
-        @media (min-width: 768px) {
-            input[type="password"] { padding: 18px 20px; font-size: 18px; }
-        }
-        input[type="password"]:focus {
-            outline: none;
-            border-color: #6b9f3d;
-            border-bottom-color: #8b4513;
-            box-shadow: 0 0 0 4px rgba(74, 124, 42, 0.2), inset 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .login-page h1 { font-size: 32px; text-align: center; margin-bottom: 10px; }
-        @media (min-width: 768px) { .login-page h1 { font-size: 36px; } }
-        .login-page .tagline { color: #5d4037; font-size: 13px; margin-bottom: 28px; text-align: center; }
-        @media (min-width: 768px) { .login-page .tagline { font-size: 14px; margin-bottom: 30px; } }
-        .login-page button {
-            width: 100%;
-            min-height: 44px;
-            padding: 14px 18px;
-            font-size: 17px;
-            border: none;
-            border-radius: 12px;
-            background: linear-gradient(180deg, #2d5016 0%, #4a7c2a 100%);
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(26, 18, 12, 0.4);
-            -webkit-touch-callout: none;
-            user-select: none;
-        }
-        @media (min-width: 768px) { .login-page button { font-size: 18px; } }
-        .login-page button:active { box-shadow: 0 2px 8px rgba(45, 80, 22, 0.4); transform: scale(0.98); }
-        @media (hover: hover) { .login-page button:hover { box-shadow: 0 6px 16px rgba(45, 80, 22, 0.5); } }
-        .error-msg { color: #8b4513; text-align: center; margin-top: 10px; font-size: 14px; }
-        @supports (padding: env(safe-area-inset-bottom)) {
-            body { padding-top: max(12px, env(safe-area-inset-top)); padding-bottom: max(12px, env(safe-area-inset-bottom)); padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1C2A1F">
+<title>Prick'n'Print Login</title>
+<style>
+)HTML";
+    static const char LOGIN_BODY[] PROGMEM = R"HTML(
+  body { display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .login { width: 100%; max-width: 360px; }
+  .login h1 { font-size: 1.4rem; color: var(--text); margin-bottom: 2px; }
+  .login .sub { color: var(--text-faint); font-size: 0.85rem; margin-bottom: 20px; }
+  .login input { width: 100%; margin-bottom: 12px; }
+  .login .btn { width: 100%; min-height: 46px; font-size: 1rem; }
+  .error-msg { color: var(--danger); font-size: 0.85rem; margin-top: 12px; text-align: center; }
+</style>
 </head>
-<body class="login-page">
-    <div class="login-container">
-        <div class="logo">
-            <span class="logo-icon">🌵💌</span>
-            <h1>Print-n-Prick</h1>
-            <p class="tagline">Smart Cactus Care & Thermal Printing</p>
-        </div>
-        <form method="POST" action="/login" enctype="application/x-www-form-urlencoded">
-            <input type="password" name="password" placeholder="🔒 Enter password..." required autofocus autocomplete="current-password">
-            <button type="submit">Login</button>
-        </form>
-        )HTML" + errorMsg + R"HTML(
-    </div>
+<body>
+  <form class="card login" method="POST" action="/login" enctype="application/x-www-form-urlencoded">
+    <h1>Prick'n'Print</h1>
+    <p class="sub">Sign in to your display</p>
+    <input type="password" name="password" placeholder="Password" required autofocus autocomplete="current-password">
+    <button type="submit" class="btn btn-primary">Log in</button>
+)HTML";
+    static const char LOGIN_ERROR[] PROGMEM = R"HTML(    <p class="error-msg">Incorrect password</p>
+)HTML";
+    static const char LOGIN_TAIL[] PROGMEM = R"HTML(  </form>
 </body>
 </html>
 )HTML";
-    
-    server.send(200, "text/html", loginPage);
+    sendHtmlParts(server, {LOGIN_HEAD, WEB_THEME_CSS, LOGIN_BODY, server.hasArg("error") ? LOGIN_ERROR : "", LOGIN_TAIL});
 }
 
 void handleLogout() {
-    authToken = "";
-    authTokenExpiry = 0;
+    endSession(requestCookieToken());
+    endSession(server.arg("token"));
     server.sendHeader("Set-Cookie", "auth=; Path=/; Max-Age=0");
     server.sendHeader("Location", "/login");
     server.send(302, "text/plain", "");
@@ -2013,8 +1623,7 @@ void handleApiLogin() {
     
     if (password == webPassword) {
         loginFailCount = 0;
-        authToken = generateAuthToken();
-        authTokenExpiry = millis() + AUTH_TOKEN_DURATION;
+        String authToken = createSession();
 
         String cookieHeader = "auth=" + authToken + "; Path=/; Max-Age=3600; SameSite=Lax";
         server.sendHeader("Set-Cookie", cookieHeader);
@@ -2047,20 +1656,42 @@ void handleGetStatus() {
         doc["moisture"] = lastSensorData.moisturePercent;
         doc["sanitizer"] = lastSensorData.sanitizerLevel;
         doc["irSensor"] = lastSensorData.irDetected;
-        doc["light"] = lastSensorData.lightPercent;
         doc["ledBrightness"] = lastSensorData.ledBrightness;
+        doc["ledLevel"] = lastSensorData.ledLevel;
         doc["dispensing"] = lastSensorData.isDispensing;
         doc["autoDispense"] = lastSensorData.autoDispense;
-        doc["autoBrightness"] = lastSensorData.autoBrightness;
+        doc["ledSchedule"] = lastSensorData.ledSchedule;
+        char t[12];
+        formatMinute(lastSensorData.ledOnMinute, t, sizeof(t));
+        doc["ledOn"] = String(t);
+        formatMinute(lastSensorData.ledOffMinute, t, sizeof(t));
+        doc["ledOff"] = String(t);
         doc["pumpRunning"] = lastSensorData.pumpRunning;
     } else {
         doc["moisture"] = 0; doc["sanitizer"] = 0; doc["irSensor"] = false;
-        doc["light"] = 0; doc["ledBrightness"] = 0; doc["dispensing"] = false;
-        doc["autoDispense"] = false; doc["autoBrightness"] = false;
+        doc["ledBrightness"] = 0; doc["dispensing"] = false;
+        doc["autoDispense"] = false; doc["ledSchedule"] = false;
         doc["pumpRunning"] = false;
     }
     String s; serializeJson(doc, s);
     server.send(200, "application/json", s);
+}
+
+// LED control from the web dashboard: {"level": 1-100} or {"on": true/false}. Main owns the state.
+void handleLedControl() {
+    if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+    DynamicJsonDocument doc(128);
+    if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}"); return; }
+    if (doc.containsKey("level")) {
+        int lvl = doc["level"].as<int>();
+        if (lvl < 1 || lvl > 100) { server.send(400, "application/json", "{\"success\":false,\"error\":\"level must be 1-100\"}"); return; }
+        enqueueSettingCommand(CMD_SET_LED_BRIGHTNESS, (uint8_t)lvl, 0);
+    } else if (doc.containsKey("on")) {
+        enqueueSettingCommand(CMD_SET_LED_STATE, doc["on"].as<bool>() ? 1 : 0, 0);
+    } else {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"need level or on\"}"); return;
+    }
+    server.send(200, "application/json", espNowInitialized ? JSON_SUCCESS : "{\"success\":false,\"error\":\"ESP-NOW not available\"}");
 }
 
 void handleResetSanitizer() {
@@ -2255,7 +1886,7 @@ void handleTestSendMessage() {
     bool ok = sendPrintChunked(text, true);
 #if !defined(TZT_HEADLESS)
     lastPrintMessage = text;
-    if (labelMessage) lv_label_set_text(labelMessage, text.c_str());
+    if (currentScreenIndex == SCREEN_MESSAGES) refreshHistoryList();
 #endif
     if (ok)
         server.send(200, "application/json", JSON_SUCCESS);
@@ -2303,7 +1934,6 @@ void handleTestShowImage() {
     if (file.length() == 0) { server.send(404, "application/json", "{\"error\":\"No images on SD. Put files in " IMAGES_DIR "\"}"); return; }
     if (!isSafeFilename(file)) { server.send(400, "application/json", "{\"error\":\"Invalid filename\"}"); return; }
     pendingTestImagePath = String(IMAGES_DIR) + "/" + file;
-    lastDashboardImagePath = pendingTestImagePath;
     server.send(200, "application/json", JSON_SUCCESS);
 #endif
 }
@@ -2314,760 +1944,396 @@ void handleFavicon() {
 
 void handleRoot() {
     if (!isAuthenticated()) { server.sendHeader("Location", "/login"); server.send(302, "text/plain", ""); return; }
-    // Optional: if client sends Accept-Encoding: gzip, serve pre-compressed .gz from SPIFFS/LittleFS for large HTML
-    const char* html = R"HTML(
-<!DOCTYPE html>
+    static const char ROOT_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Prick'n'Print">
-    <meta name="theme-color" content="#1a3d0e">
-    <title>Print-n-Prick</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(74, 124, 42, 0.25); }
-        html { -webkit-text-size-adjust: 100%; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(180deg, #0d1f07 0%, #1a3d0e 35%, #2d5016 70%, #1a3d0e 100%);
-            min-height: 100vh;
-            min-height: 100dvh;
-            margin: 0;
-            padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-            padding-left: max(10px, env(safe-area-inset-left));
-            padding-right: max(10px, env(safe-area-inset-right));
-            padding-top: max(10px, env(safe-area-inset-top));
-            padding-bottom: max(16px, env(safe-area-inset-bottom));
-            color: #333;
-            position: relative;
-            -webkit-font-smoothing: antialiased;
-        }
-        body::before {
-            content: '🌵';
-            position: fixed;
-            font-size: 140px;
-            opacity: 0.04;
-            top: -30px;
-            left: -30px;
-            z-index: 0;
-        }
-        .container {
-            max-width: 480px;
-            margin: 0 auto;
-            background: rgba(255,255,255,0.97);
-            border-radius: 20px;
-            padding: 16px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-            border: 2px solid #4a7c2a;
-            position: relative;
-            z-index: 1;
-        }
-        .header {
-            text-align: center;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 2px solid #4a7c2a;
-        }
-        .header-icon { font-size: 36px; margin-bottom: 4px; display: block; }
-        h1 {
-            color: #2d5016;
-            font-size: 24px;
-            font-weight: 700;
-            margin-bottom: 2px;
-        }
-        .tagline { color: #555; font-size: 13px; }
-        .sensor-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 10px;
-            margin: 14px 0;
-        }
-        .sensor-card {
-            background: linear-gradient(135deg, #fff 0%, #f0f5ec 100%);
-            padding: 14px;
-            border-radius: 14px;
-            text-align: center;
-            border: 2px solid #4a7c2a;
-            min-height: 72px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            -webkit-touch-callout: none;
-            user-select: none;
-        }
-        .sensor-card:active { transform: scale(0.98); opacity: 0.95; }
-        .sensor-icon { font-size: 24px; margin-bottom: 4px; }
-        .sensor-label {
-            font-size: 11px;
-            color: #666;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-        }
-        .sensor-value { font-size: 20px; font-weight: 700; color: #2d5016; }
-        .btn-group {
-            display: flex;
-            gap: 10px;
-            margin: 14px 0;
-            flex-wrap: wrap;
-        }
-        button, .btn {
-            flex: 1;
-            min-width: 0;
-            min-height: 44px;
-            padding: 12px 16px;
-            border: none;
-            border-radius: 12px;
-            background: linear-gradient(180deg, #2d5016 0%, #3a6820 100%);
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-            font-size: 16px;
-            transition: transform 0.15s, box-shadow 0.15s;
-            box-shadow: 0 3px 8px rgba(45, 80, 22, 0.35);
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            -webkit-touch-callout: none;
-            user-select: none;
-        }
-        button:active, .btn:active {
-            transform: scale(0.97);
-            box-shadow: 0 1px 4px rgba(26, 18, 12, 0.3);
-        }
-        .btn-danger { background: linear-gradient(180deg, #8b4513 0%, #a0522d 100%); }
-        .btn-secondary { background: linear-gradient(180deg, #3e2723 0%, #5d4037 100%); }
-        .section {
-            margin: 14px 0;
-            padding: 14px;
-            background: linear-gradient(135deg, #fff 0%, #f8faf6 100%);
-            border-radius: 14px;
-            border: 2px solid #4a7c2a;
-            border-left: 4px solid #3e2723;
-        }
-        .section-title {
-            font-size: 17px;
-            font-weight: 700;
-            color: #2d5016;
-            margin-bottom: 12px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            min-height: 44px;
-            padding: 4px 0;
-        }
-        .collapsible .section-title {
-            cursor: pointer;
-            -webkit-tap-highlight-color: transparent;
-            list-style: none;
-        }
-        .collapsible .section-title::after {
-            content: '▼';
-            font-size: 12px;
-            margin-left: auto;
-            transition: transform 0.2s;
-            color: #4a7c2a;
-        }
-        .collapsible[open] .section-title::after { transform: rotate(-180deg); }
-        .input-group {
-            display: flex;
-            gap: 8px;
-            margin: 10px 0;
-            flex-wrap: wrap;
-        }
-        input[type="text"], input[type="datetime-local"] {
-            flex: 1 1 100%;
-            min-width: 0;
-            min-height: 44px;
-            padding: 12px 14px;
-            border: 2px solid #4a7c2a;
-            border-radius: 10px;
-            font-size: 16px;
-            font-family: inherit;
-            background: #fff;
-        }
-        input[type="text"]:focus, input[type="datetime-local"]:focus {
-            outline: none;
-            border-color: #6b9f3d;
-            box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
-        }
-        .list-container {
-            max-height: 200px;
-            overflow-y: auto;
-            -webkit-overflow-scrolling: touch;
-            background: #fff;
-            padding: 10px;
-            border-radius: 10px;
-            margin: 10px 0;
-            border: 1px solid #c5d4b8;
-            min-height: 60px;
-        }
-        .section.reminders-section .list-container,
-        .section.grocery-section .list-container {
-            max-height: 220px;
-        }
-        .list-item {
-            padding: 12px 10px;
-            margin: 6px 0;
-            background: #f0f5ec;
-            border-radius: 10px;
-            border-left: 4px solid #4a7c2a;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 10px;
-            font-size: 15px;
-            min-height: 48px;
-        }
-        .list-item:nth-child(odd) { border-left-color: #8b4513; }
-        .list-item small { color: #5d4037; font-size: 12px; }
-        .list-item button {
-            min-height: 40px;
-            padding: 10px 14px;
-            font-size: 15px;
-            min-width: 0;
-            flex: 0 0 auto;
-            border-radius: 10px;
-        }
-        .empty-state { text-align: center; color: #777; font-style: italic; padding: 16px; font-size: 14px; }
-        textarea.reminder-msg, textarea.todo-msg {
-            width: 100%;
-            min-height: 100px;
-            padding: 12px 14px;
-            border: 2px solid #4a7c2a;
-            border-radius: 10px;
-            font-size: 16px;
-            font-family: inherit;
-            background: #fff;
-            resize: vertical;
-            box-sizing: border-box;
-        }
-        textarea.reminder-msg:focus, textarea.todo-msg:focus {
-            outline: none;
-            border-color: #6b9f3d;
-            box-shadow: 0 0 0 3px rgba(74, 124, 42, 0.2);
-        }
-        details.collapsible { margin: 10px 0; }
-        details.collapsible .section { margin: 0; border-radius: 14px; }
-        details.collapsible > summary { list-style: none; }
-        details.collapsible > summary::-webkit-details-marker { display: none; }
-        .section-title-wrap { display: flex; align-items: center; width: 100%; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Prick'n'Print">
+<meta name="theme-color" content="#1C2A1F">
+<title>Prick'n'Print</title>
+<style>
+)HTML";
+    static const char ROOT_BODY[] PROGMEM = R"HTML(
+  /* Page layout only - colours and components come from WebTheme.h */
+  .page { max-width: 560px; display: flex; flex-direction: column; gap: 12px; }
+  .tile-grid { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 420px) { .tile-grid { grid-template-columns: 1fr 1fr; } #tLight { grid-column: span 2; } }
+  .tile .sub { font-size: 0.75rem; color: var(--text-faint); margin-top: 6px; }
+  .tile-action { position: absolute; top: 8px; right: 8px; min-height: 28px; padding: 2px 10px; font-size: 0.72rem; }
+  .card h2 { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .card h2 .ico { color: var(--accent-light); width: 1.2em; text-align: center; }
+  .light-row { display: flex; align-items: center; gap: 12px; }
+  .light-row input[type=range] { flex: 1; }
+  .light-row .pct { min-width: 40px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  #printMsg { width: 100%; resize: vertical; margin-bottom: 10px; }
+  #printResult { font-size: 0.85rem; min-height: 1.2em; }
+  #printResult.ok { color: var(--accent-light); }
+  #printResult.bad { color: var(--danger); }
+  details.card { padding: 0; }
+  details.card > summary {
+    display: flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 16px; cursor: pointer; list-style: none;
+    font-weight: 600; color: var(--text);
+  }
+  details.card > summary .ico { color: var(--accent-light); width: 1.2em; text-align: center; }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary::after {
+    content: ""; margin-left: auto; width: 8px; height: 8px; border-right: 2px solid var(--text-faint);
+    border-bottom: 2px solid var(--text-faint); transform: rotate(-45deg); transition: transform 0.15s;
+  }
+  details.card[open] > summary::after { transform: rotate(45deg); }
+  details.card > summary .count { color: var(--text-faint); font-weight: 500; font-size: 0.85rem; }
+  .fold { padding: 0 16px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .fold textarea, .fold input[type=text], .fold input[type=datetime-local] { width: 100%; }
+  .fold textarea { resize: vertical; }
+  .fold .list { max-height: 300px; overflow-y: auto; }
+  .group-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); margin: 6px 4px -4px; }
+  #audioNow { color: var(--accent-light); font-size: 0.85rem; }
+  #audioNow:empty { display: none; }
+</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <span class="header-icon">🌵💌</span>
-            <h1>Print-n-Prick</h1>
-            <p class="tagline">Smart cactus care & thermal printing</p>
-        </div>
-        
-        <div class="sensor-grid">
-            <div class="sensor-card">
-                <div class="sensor-icon">💧</div>
-                <div class="sensor-label">Moisture</div>
-                <div class="sensor-value" id="mo">—</div>
-            </div>
-            <div class="sensor-card">
-                <div class="sensor-icon">🧴</div>
-                <div class="sensor-label">Sanitizer</div>
-                <div class="sensor-value" id="sa">—</div>
-            </div>
-            <div class="sensor-card">
-                <div class="sensor-icon">☀️</div>
-                <div class="sensor-label">Light</div>
-                <div class="sensor-value" id="light">—</div>
-            </div>
-            <div class="sensor-card">
-                <div class="sensor-icon">👁️</div>
-                <div class="sensor-label">IR Motion</div>
-                <div class="sensor-value" id="ir">—</div>
-            </div>
-            <div class="sensor-card">
-                <div class="sensor-icon">💡</div>
-                <div class="sensor-label">LED Level</div>
-                <div class="sensor-value" id="ledLevel">—</div>
-            </div>
-            <div class="sensor-card">
-                <div class="sensor-icon">💧</div>
-                <div class="sensor-label">Pump</div>
-                <div class="sensor-value" id="pump">—</div>
-            </div>
-        </div>
-        
-        <div class="btn-group">
-            <button onclick="resetSanitizer()">🔄 Reset Sanitizer</button>
-            <a href="/logout" class="btn btn-secondary">🚪 Logout</a>
-        </div>
-        
-        <details class="collapsible">
-        <summary class="section-title">⏰ Reminders</summary>
-        <div class="section reminders-section">
-            <div class="input-group">
-                <textarea class="reminder-msg" id="rmMsg" placeholder="📝 Reminder message..." rows="5"></textarea>
-            </div>
-            <div class="input-group" style="flex-wrap: wrap; gap: 8px;">
-                <button type="button" onclick="setQuickReminder(1)" style="min-width: 70px;">Now</button>
-                <button type="button" onclick="setQuickReminder(1440)" style="min-width: 70px;">24 Hr</button>
-                <button type="button" onclick="setQuickReminder(10080)" style="min-width: 70px;">7 days</button>
-            </div>
-            <div class="input-group">
-                <input type="datetime-local" id="rmTm">
-                <button onclick="addRem()" style="min-width: 80px;">Add</button>
-            </div>
-            <div class="list-container" id="rm">
-                <div class="empty-state">No reminders yet</div>
-            </div>
-        </div>
-        </details>
-        
-        <details class="collapsible">
-        <summary class="section-title">🛒 Grocery List</summary>
-        <div class="section grocery-section">
-            <div class="input-group" style="flex-wrap: wrap;">
-                <input type="text" id="glItem" placeholder="🛒 Add item..." style="flex: 1 1 100%; min-width: 100%;">
-            </div>
-            <div class="input-group">
-                <button onclick="addGl()" style="min-width: 80px;">Add</button>
-                <button onclick="printGl()" style="min-width: 100px;">🖨️ Print</button>
-                <button class="btn-danger" onclick="clearGl()" style="min-width: 80px;">Clear</button>
-            </div>
-            <div class="list-container" id="gl">
-                <div class="empty-state">No items yet</div>
-            </div>
-        </div>
-        </details>
-        
-        <details class="collapsible">
-        <summary class="section-title">✅ Todo List</summary>
-        <div class="section grocery-section">
-            <div class="input-group" style="flex-wrap: wrap;">
-                <textarea class="todo-msg" id="tlItem" placeholder="✅ Add task..." rows="2" style="flex: 1 1 100%; min-width: 100%; resize: vertical; box-sizing: border-box;"></textarea>
-            </div>
-            <div class="input-group">
-                <button onclick="addTl()" style="min-width: 80px;">Add</button>
-                <button onclick="printTl()" style="min-width: 100px;">🖨️ Print</button>
-                <button class="btn-danger" onclick="clearTl()" style="min-width: 80px;">Clear</button>
-            </div>
-            <div class="list-container" id="tl">
-                <div class="empty-state">No tasks yet</div>
-            </div>
-        </div>
-        </details>
-        
-        <details class="collapsible">
-        <summary class="section-title">🔧 Hardware Diagnostics</summary>
-        <div class="section">
-            <div style="font-size:12px;color:#777;margin-bottom:10px;">
-                Pump/LED testing and hardware settings (duration, cooldown, calibration, auto-dispense, auto-brightness) now live on the Main ESP32's own test server — see its status IP:8081. Keeping control in one place avoids conflicting settings.
-            </div>
-            <div class="input-group" style="flex-wrap: wrap;">
-                <button type="button" onclick="testSensors()" style="min-width:45%;">📡 Read Sensors</button>
-                <button type="button" onclick="testMessage()" style="min-width:45%;">✉️ Test Message</button>
-            </div>
-            <div id="diagResult" style="margin-top:6px;font-size:14px;min-height:22px;font-weight:600;"></div>
-            <div id="diagSensorDump" style="margin-top:6px;font-size:12px;color:#555;white-space:pre-wrap;"></div>
-        </div>
-        </details>
+<header class="topbar">
+  <div>
+    <h1>Prick'n'Print</h1>
+    <div class="sub" id="greeting">Home</div>
+  </div>
+  <span class="spacer"></span>
+  <span class="status-pill" id="liveStatus"><span class="dot"></span><span id="liveLabel">connecting</span></span>
+  <a href="/logout" class="btn btn-ghost">Log out</a>
+</header>
 
-        <details class="collapsible">
-        <summary class="section-title">📜 Message History</summary>
-        <div class="section">
-            <div class="list-container" id="msgHist" style="max-height:200px;overflow-y:auto;">
-                <div class="empty-state">Loading messages...</div>
-            </div>
-        </div>
-        </details>
-
-        <details class="collapsible">
-        <summary class="section-title">🔊 Audio Files</summary>
-        <div class="section">
-            <div id="audioNow" style="color:#FFD700;font-size:13px;margin-bottom:6px;"></div>
-            <div class="list-container" id="audioFiles" style="max-height:180px;overflow-y:auto;">
-                <div class="empty-state">Loading audio files...</div>
-            </div>
-            <div style="display:flex;gap:8px;margin-top:8px;">
-                <button type="button" class="btn-danger" onclick="audioStop()" style="flex:1;">Stop</button>
-                <button type="button" class="btn-success" onclick="loadAudio()" style="flex:1;">Refresh</button>
-            </div>
-        </div>
-        </details>
-
-        <details class="collapsible">
-        <summary class="section-title">🖼️ Images</summary>
-        <div class="section">
-            <div class="list-container" id="imageFiles" style="max-height:180px;overflow-y:auto;">
-                <div class="empty-state">Loading images...</div>
-            </div>
-            <div style="display:flex;gap:8px;margin-top:8px;">
-                <button type="button" class="btn-success" onclick="loadImages()" style="flex:1;">Refresh</button>
-            </div>
-            <div style="margin-top:8px;font-size:12px;color:#888;">Add via backend /api/images → url, name; TZT downloads to SD.</div>
-        </div>
-        </details>
+<div class="page">
+  <div class="tile-grid">
+    <div class="tile" id="tSa">
+      <div class="label">Sanitizer</div><div class="value" id="sa">&mdash;</div><div class="bar"><i id="saBar"></i></div>
+      <button type="button" class="btn btn-ghost tile-action" onclick="resetSanitizer()" title="Set the level back to 100% after refilling">Refilled</button>
     </div>
-    
-    <script>
-        function q(u) { return fetch(u, {headers: {'Accept': 'application/json'}}).then(r => r.json()); }
-        function po(u, b) { return fetch(u, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b || {})}).then(r => r.json()); }
-        function del(u) { return fetch(u, {method: 'DELETE'}).then(r => r.json()); }
-        
-        function setQuickReminder(minutesFromNow) {
-            var d = new Date();
-            d.setMinutes(d.getMinutes() + minutesFromNow);
-            var y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0');
-            var h = String(d.getHours()).padStart(2, '0'), min = String(d.getMinutes()).padStart(2, '0');
-            document.getElementById('rmTm').value = y + '-' + m + '-' + day + 'T' + h + ':' + min;
-        }
-        
-        function resetSanitizer() {
-            fetch('/api/reset-sanitizer', {method: 'POST'})
-                .then(r => r.json())
-                .then(d => { if (d.success) ref(); });
-        }
-        
-        function ref() {
-            q('/api/status').then(d => {
-                document.getElementById('mo').textContent = typeof d.moisture === 'number' ? d.moisture.toFixed(1) + '%' : (d.moisture || '—');
-                document.getElementById('sa').textContent = typeof d.sanitizer === 'number' ? d.sanitizer.toFixed(1) + '%' : (d.sanitizer || '—');
-                var lightEl = document.getElementById('light');
-                if (lightEl) lightEl.textContent = typeof d.light === 'number' ? d.light.toFixed(1) + '%' : (d.light != null ? d.light : '—');
-                var irEl = document.getElementById('ir');
-                if (irEl) irEl.textContent = d.irSensor ? '✓' : '✗';
-                var ledLevelEl = document.getElementById('ledLevel');
-                if (ledLevelEl) { var p = (typeof d.ledBrightness === 'number') ? Math.round((d.ledBrightness / 255) * 100) : 0; ledLevelEl.textContent = p + '%'; }
-                var pumpEl = document.getElementById('pump');
-                if (pumpEl) pumpEl.textContent = d.dispensing ? 'ON' : 'OFF';
-            });
-        }
-        ref();
-        setInterval(ref, 3000);
-        setInterval(loadReminders, 30000);
+    <div class="tile" id="tMo"><div class="label">Soil moisture</div><div class="value" id="mo">&mdash;</div><div class="bar"><i id="moBar"></i></div></div>
+    <div class="tile" id="tLight"><div class="label">Light</div><div class="value" id="light">&mdash;</div><div class="sub" id="lightSched"></div></div>
+  </div>
 
-        function updateReminderListUI(reminders) {
-            let h = '';
-            if (!reminders || Object.keys(reminders).length === 0) {
-                h = '<div class="empty-state">No reminders yet</div>';
-            } else {
-                for (let k in reminders) {
-                    let r = reminders[k];
-                    h += '<div class="list-item"><div><strong>' + r.message + '</strong><br><small>' + 
-                         new Date((r.scheduledTime || 0) * 1000).toLocaleString() + '</small></div>' +
-                         '<button onclick="delRem(\'' + k + '\')">Delete</button></div>';
-                }
-            }
-            document.getElementById('rm').innerHTML = h;
-        }
-        
-        function loadReminders() {
-            q('/api/reminders').then(d => {
-                updateReminderListUI(d);
-            });
-        }
-        
-        function updateGroceryListUI(items) {
-            let h = '';
-            if (!items || items.length === 0) {
-                h = '<div class="empty-state">No items yet</div>';
-            } else {
-                items.forEach((it, i) => {
-                    h += '<div class="list-item"><div>' + it + '</div><button onclick="delGl(' + i + ')">Delete</button></div>';
-                });
-            }
-            document.getElementById('gl').innerHTML = h;
-        }
-        
-        function loadGroceries() {
-            q('/api/groceries').then(arr => {
-                updateGroceryListUI(Array.isArray(arr) ? arr : []);
-            });
-        }
-        
-        function updateTodoListUI(items) {
-            let h = '';
-            if (!items || items.length === 0) {
-                h = '<div class="empty-state">No tasks yet</div>';
-            } else {
-                items.forEach((it, i) => {
-                    h += '<div class="list-item"><div>' + it + '</div><button onclick="delTl(' + i + ')">Delete</button></div>';
-                });
-            }
-            document.getElementById('tl').innerHTML = h;
-        }
-        
-        function loadTodos() {
-            q('/api/todos').then(arr => {
-                updateTodoListUI(Array.isArray(arr) ? arr : []);
-            });
-        }
-        
-        function addRem() {
-            let m = document.getElementById('rmMsg').value;
-            let t = document.getElementById('rmTm').value;
-            if (!m || !t) return;
-            let scheduledTime = Math.floor(new Date(t).getTime() / 1000);
-            // Optimistic update: add to UI immediately with temp ID
-            let tempId = 'temp_' + Date.now();
-            let currentReminders = {};
-            // Get existing reminders from current UI state
-            document.querySelectorAll('#rm .list-item').forEach(el => {
-                let btn = el.querySelector('button');
-                if (btn) {
-                    let onclick = btn.getAttribute('onclick');
-                    let idMatch = onclick ? onclick.match(/delRem\('([^']+)'\)/) : null;
-                    if (idMatch) {
-                        let reminderId = idMatch[1];
-                        if (!reminderId.startsWith('temp_')) {  // Don't duplicate temp entries
-                            let msg = el.querySelector('strong').textContent;
-                            let timeText = el.querySelector('small').textContent;
-                            // Parse time from text or use scheduledTime
-                            currentReminders[reminderId] = {
-                                message: msg,
-                                scheduledTime: scheduledTime  // Will be corrected from server
-                            };
-                        }
-                    }
-                }
-            });
-            // Add new reminder optimistically
-            currentReminders[tempId] = {
-                message: m,
-                scheduledTime: scheduledTime
-            };
-            updateReminderListUI(currentReminders);
-            document.getElementById('rmMsg').value = '';
-            document.getElementById('rmTm').value = '';
-            // Sync with server in background
-            po('/api/reminders', {message: m, scheduledTime: scheduledTime}).then(d => {
-                if (d.success && d.id) {
-                    // Replace temp ID with real ID from server
-                    delete currentReminders[tempId];
-                    currentReminders[d.id] = {
-                        message: m,
-                        scheduledTime: scheduledTime
-                    };
-                    updateReminderListUI(currentReminders);
-                } else {
-                    loadReminders();
-                }
-            });
-        }
-        
-        function delRem(id) {
-            if (!confirm('🗑️ Delete this reminder?')) return;
-            let itemToRemove = document.querySelector('#rm .list-item button[onclick*="' + id + '"]');
-            if (itemToRemove) {
-                itemToRemove.closest('.list-item').remove();
-                if (document.querySelectorAll('#rm .list-item').length === 0) {
-                    document.getElementById('rm').innerHTML = '<div class="empty-state">No reminders yet</div>';
-                }
-            }
-            del('/api/reminders/' + id).then(d => {
-                if (!d.success) loadReminders();
-            });
-        }
-        
-        function addGl() {
-            let it = document.getElementById('glItem').value;
-            if (!it) return;
-            // Optimistic update: add to UI immediately
-            let currentItems = [];
-            document.querySelectorAll('#gl .list-item').forEach(el => {
-                let text = el.querySelector('div').textContent.trim();
-                if (text) currentItems.push(text);
-            });
-            currentItems.push(it);
-            updateGroceryListUI(currentItems);
-            document.getElementById('glItem').value = '';
-            // Sync with server in background
-            po('/api/groceries', {item: it}).then(d => {
-                if (!d.success) {
-                    currentItems.pop();
-                    updateGroceryListUI(currentItems);
-                }
-            });
-        }
-        
-        function delGl(i) {
-            // Optimistic update: remove from UI immediately
-            let currentItems = [];
-            document.querySelectorAll('#gl .list-item').forEach((el, idx) => {
-                if (idx !== i) {
-                    let text = el.querySelector('div').textContent.trim();
-                    if (text) currentItems.push(text);
-                }
-            });
-            updateGroceryListUI(currentItems);
-            // Sync with server in background
-            del('/api/groceries/' + i).then(d => {
-                if (!d.success) loadGroceries();
-            });
-        }
-        
-        function printGl() {
-            if (!confirm('🖨️ Send grocery list to printer?')) return;
-            po('/api/groceries/print').then(d => { if (d.success) loadGroceries(); });
-        }
-        
-        function clearGl() {
-            if (!confirm('🗑️ Clear all groceries?')) return;
-            updateGroceryListUI([]);
-            del('/api/groceries').then(d => {
-                if (!d.success) loadGroceries();
-            });
-        }
-        
-        function addTl() {
-            let it = document.getElementById('tlItem').value.trim();
-            if (!it) return;
-            let currentItems = [];
-            document.querySelectorAll('#tl .list-item').forEach(el => {
-                let text = el.querySelector('div').textContent.trim();
-                if (text) currentItems.push(text);
-            });
-            currentItems.push(it);
-            updateTodoListUI(currentItems);
-            document.getElementById('tlItem').value = '';
-            po('/api/todos', {item: it}).then(d => {
-                if (!d.success) {
-                    currentItems.pop();
-                    updateTodoListUI(currentItems);
-                }
-            });
-        }
-        
-        function delTl(i) {
-            let currentItems = [];
-            document.querySelectorAll('#tl .list-item').forEach((el, idx) => {
-                if (idx !== i) {
-                    let text = el.querySelector('div').textContent.trim();
-                    if (text) currentItems.push(text);
-                }
-            });
-            updateTodoListUI(currentItems);
-            del('/api/todos/' + i).then(d => {
-                if (!d.success) loadTodos();
-            });
-        }
-        
-        function printTl() {
-            if (!confirm('🖨️ Send todo list to printer?')) return;
-            po('/api/todos/print').then(d => { if (d.success) loadTodos(); });
-        }
-        
-        function clearTl() {
-            if (!confirm('🗑️ Clear all todos?')) return;
-            updateTodoListUI([]);
-            del('/api/todos').then(d => {
-                if (!d.success) loadTodos();
-            });
-        }
-        
-        function showDiagResult(ok, text) {
-            var el = document.getElementById('diagResult');
-            el.style.color = ok ? '#2d5016' : '#8b4513';
-            el.textContent = (ok ? '✅ ' : '❌ ') + text;
-        }
-        function runDiag(btn, url, body, sentText, failText) {
-            var prevLabel = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = '⏳ Testing...';
-            document.getElementById('diagResult').textContent = '';
-            var req = body === undefined ? po(url) : po(url, body);
-            req.then(d => {
-                if (d.success) showDiagResult(true, sentText);
-                else showDiagResult(false, (d.error || failText));
-            }).catch(() => showDiagResult(false, failText))
-              .finally(() => { btn.disabled = false; btn.textContent = prevLabel; });
-        }
-        function testMessage() { runDiag(event.target, '/api/test/send-message', {}, 'Test message sent to printer', 'Could not send test message'); }
-        function testSensors() {
-            var btn = event.target;
-            var prevLabel = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = '⏳ Reading...';
-            document.getElementById('diagSensorDump').textContent = '';
-            q('/api/status').then(d => {
-                showDiagResult(d.sensorsValid, d.sensorsValid ? 'Sensor snapshot read' : 'No sensor data yet (main board offline?)');
-                document.getElementById('diagSensorDump').textContent =
-                    'Firmware: ' + d.firmware + '\n' +
-                    'Moisture: ' + d.moisture + '%\n' +
-                    'Sanitizer: ' + d.sanitizer + '%\n' +
-                    'Light: ' + d.light + '%\n' +
-                    'IR detected: ' + d.irSensor + '\n' +
-                    'LED brightness: ' + d.ledBrightness + '\n' +
-                    'Pump running: ' + d.pumpRunning + '\n' +
-                    'Dispensing: ' + d.dispensing;
-            }).catch(() => showDiagResult(false, 'Could not read sensors'))
-              .finally(() => { btn.disabled = false; btn.textContent = prevLabel; });
-        }
+  <div class="card">
+    <h2><span class="ico">&#9728;</span>Light</h2>
+    <div class="light-row">
+      <label class="switch" title="Light on/off"><input type="checkbox" id="ledSwitch" onchange="ledTouch=Date.now();po('/api/led',{on:this.checked})"><span></span></label>
+      <input type="range" id="ledLevelRange" min="1" max="100" value="10" aria-label="Brightness"
+             oninput="ledTouch=Date.now();el('ledLevelPct').textContent=this.value+'%'"
+             onchange="ledTouch=Date.now();po('/api/led',{level:parseInt(this.value)})">
+      <span class="pct" id="ledLevelPct">&mdash;</span>
+    </div>
+  </div>
 
-        function loadMessages() {
-            q('/api/messages').then(d => {
-                var c = document.getElementById('msgHist');
-                if (!d.messages || d.messages.length === 0) { c.innerHTML = '<div class="empty-state">No messages saved yet</div>'; return; }
-                c.innerHTML = '';
-                d.messages.forEach(m => {
-                    var el = document.createElement('div');
-                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);font-size:13px;color:#e0e0e0;';
-                    var ts = m.ts > 1600000000 ? new Date(m.ts * 1000).toLocaleString() + ' - ' : '';
-                    el.textContent = ts + m.preview;
-                    c.appendChild(el);
-                });
-            }).catch(function() { document.getElementById('msgHist').innerHTML = '<div class="empty-state">SD card not available</div>'; });
-        }
+  <div class="card">
+    <h2><span class="ico">&#9998;</span>Print a message</h2>
+    <textarea id="printMsg" rows="3" placeholder="Type a note to print and save"></textarea>
+    <div class="btn-row">
+      <span id="printResult" style="flex:1"></span>
+      <button type="button" class="btn btn-primary" id="printBtn" onclick="printMessage()">Print</button>
+    </div>
+  </div>
 
-        function loadAudio() {
-            q('/api/audio').then(d => {
-                var c = document.getElementById('audioFiles');
-                var now = document.getElementById('audioNow');
-                if (d.playing && d.current) now.textContent = 'Now playing: ' + d.current;
-                else now.textContent = '';
-                if (!d.files || d.files.length === 0) { c.innerHTML = '<div class="empty-state">No audio files on SD</div>'; return; }
-                c.innerHTML = '';
-                d.files.forEach(f => {
-                    var el = document.createElement('div');
-                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;';
-                    el.innerHTML = '<span style="color:#e0e0e0;font-size:13px;">' + f + '</span><button onclick="audioPlay(\'' + f.replace(/'/g,"\\'") + '\')" style="padding:4px 12px;border:none;border-radius:4px;background:#4a7c2a;color:#fff;cursor:pointer;">Play</button>';
-                    c.appendChild(el);
-                });
-            }).catch(function() { document.getElementById('audioFiles').innerHTML = '<div class="empty-state">SD card not available</div>'; });
-        }
+  <div class="group-label">On the display</div>
 
-        function audioPlay(f) { po('/api/audio/play', {file: f}).then(function() { setTimeout(loadAudio, 500); }); }
-        function audioStop() { po('/api/audio/stop').then(function() { setTimeout(loadAudio, 500); }); }
+  <details class="card" open>
+    <summary><span class="ico">&#9993;</span>Messages<span class="count" id="msgCount"></span></summary>
+    <div class="fold"><div class="list" id="msgHist"></div></div>
+  </details>
 
-        function loadImages() {
-            q('/api/images').then(d => {
-                var c = document.getElementById('imageFiles');
-                if (!d.files || d.files.length === 0) { c.innerHTML = '<div class="empty-state">No images on SD</div>'; return; }
-                c.innerHTML = '';
-                d.files.forEach(f => {
-                    var el = document.createElement('div');
-                    el.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);font-size:13px;color:#e0e0e0;';
-                    el.textContent = f;
-                    c.appendChild(el);
-                });
-            }).catch(function() { document.getElementById('imageFiles').innerHTML = '<div class="empty-state">SD card not available</div>'; });
-        }
+  <details class="card">
+    <summary><span class="ico">&#9835;</span>Sounds<span class="count" id="auCount"></span></summary>
+    <div class="fold">
+      <div id="audioNow"></div>
+      <div class="list" id="audioFiles"></div>
+      <div class="btn-row"><button type="button" class="btn btn-danger grow" onclick="audioStop()">Stop</button></div>
+    </div>
+  </details>
 
-        loadReminders();
-        loadGroceries();
-        loadTodos();
-        loadMessages();
-        loadAudio();
-        loadImages();
-        setQuickReminder(0);  // Pre-fill reminder date/time with current so it's not empty
-    </script>
+  <details class="card">
+    <summary><span class="ico">&#9635;</span>Pictures<span class="count" id="imCount"></span></summary>
+    <div class="fold"><div class="list" id="imageFiles"></div></div>
+  </details>
+
+  <div class="group-label">Lists</div>
+
+  <details class="card">
+    <summary><span class="ico">&#9200;</span>Reminders<span class="count" id="rmCount"></span></summary>
+    <div class="fold">
+      <textarea id="rmMsg" placeholder="Reminder message" rows="3"></textarea>
+      <div class="btn-row">
+        <button type="button" class="btn" onclick="setQuickReminder(60)">In 1 h</button>
+        <button type="button" class="btn" onclick="setQuickReminder(1440)">Tomorrow</button>
+        <button type="button" class="btn" onclick="setQuickReminder(10080)">Next week</button>
+      </div>
+      <div class="btn-row">
+        <input type="datetime-local" id="rmTm" style="flex:1;width:auto">
+        <button type="button" class="btn btn-primary" onclick="addRem()">Add</button>
+      </div>
+      <div class="list" id="rm"></div>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary><span class="ico">&#10003;</span>Grocery list<span class="count" id="glCount"></span></summary>
+    <div class="fold">
+      <div class="btn-row">
+        <input type="text" id="glItem" placeholder="Add item" style="flex:1;width:auto" onkeydown="if(event.key==='Enter')addGl()">
+        <button type="button" class="btn btn-primary" onclick="addGl()">Add</button>
+      </div>
+      <div class="list" id="gl"></div>
+      <div class="btn-row">
+        <button type="button" class="btn grow" onclick="printGl()">Print</button>
+        <button type="button" class="btn btn-danger" onclick="clearGl()">Clear</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary><span class="ico">&#9744;</span>To-do list<span class="count" id="tlCount"></span></summary>
+    <div class="fold">
+      <div class="btn-row">
+        <input type="text" id="tlItem" placeholder="Add task" style="flex:1;width:auto" onkeydown="if(event.key==='Enter')addTl()">
+        <button type="button" class="btn btn-primary" onclick="addTl()">Add</button>
+      </div>
+      <div class="list" id="tl"></div>
+      <div class="btn-row">
+        <button type="button" class="btn grow" onclick="printTl()">Print</button>
+        <button type="button" class="btn btn-danger" onclick="clearTl()">Clear</button>
+      </div>
+    </div>
+  </details>
+</div>
+
+<script>
+function el(id) { return document.getElementById(id); }
+// Session expired (or device rebooted): go back to login instead of silently showing stale data
+function chk(r) { if (r.status === 401) { location.href = '/login'; throw new Error('unauthorized'); } return r.json(); }
+function q(u) { return fetch(u, {headers: {'Accept': 'application/json'}}).then(chk); }
+function po(u, b) { return fetch(u, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b || {})}).then(chk); }
+function del(u) { return fetch(u, {method: 'DELETE'}).then(chk); }
+
+// Build list rows with textContent - message text and file names come from outside (Pi, iOS Shortcuts)
+function row(text, meta, actions) {
+  var r = document.createElement('div'); r.className = 'list-row';
+  var t = document.createElement('div'); t.className = 'text'; t.textContent = text;
+  if (meta) { var m = document.createElement('div'); m.className = 'meta'; m.textContent = meta; t.appendChild(m); }
+  r.appendChild(t);
+  if (actions && actions.length) {
+    var a = document.createElement('div'); a.className = 'actions';
+    actions.forEach(function(x) {
+      var b = document.createElement('button'); b.type = 'button';
+      b.className = 'btn' + (x.cls ? ' ' + x.cls : ''); b.textContent = x.label; b.onclick = x.fn;
+      a.appendChild(b);
+    });
+    r.appendChild(a);
+  }
+  return r;
+}
+function fill(id, rows, emptyText) {
+  var c = el(id); c.replaceChildren();
+  if (!rows.length) { var e = document.createElement('div'); e.className = 'empty'; e.textContent = emptyText; c.appendChild(e); return; }
+  rows.forEach(function(r) { c.appendChild(r); });
+}
+function count(id, n) { el(id).textContent = n ? n : ''; }
+
+(function() {
+  var h = new Date().getHours();
+  el('greeting').textContent = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+})();
+
+function setQuickReminder(minutesFromNow) {
+  var d = new Date(); d.setMinutes(d.getMinutes() + minutesFromNow);
+  var p = function(n) { return String(n).padStart(2, '0'); };
+  el('rmTm').value = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function resetSanitizer() {
+  if (!confirm('Refilled the sanitizer? This sets the level back to 100%.')) return;
+  po('/api/reset-sanitizer').then(function(d) { if (d.success) ref(); });
+}
+
+// ---- Live status ----
+var refBusy = false;
+var ledTouch = 0;  // ignore Main's echo briefly after a local light change
+function liveStatus(text, state) {
+  el('liveStatus').className = 'status-pill ' + state;
+  el('liveLabel').textContent = text;
+}
+// Same tiers as the screen: warn below warnLow, critical below critLow
+function tier(v, warnLow, critLow) { return v < critLow ? 'bad' : v < warnLow ? 'warn' : ''; }
+function level(id, v, warnLow, critLow) {
+  var ok = typeof v === 'number';
+  var t = ok ? tier(v, warnLow, critLow) : '';
+  el(id).textContent = ok ? v.toFixed(0) + '%' : '—';
+  el(id).className = 'value' + (t ? ' ' + t : '');
+  el(id + 'Bar').style.width = ok ? Math.max(0, Math.min(100, v)) + '%' : '0';
+  el(id + 'Bar').className = t;
+  el(id === 'mo' ? 'tMo' : 'tSa').classList.toggle('attention', t === 'bad');
+}
+function ref() {
+  if (refBusy) return;  // device is single-threaded; don't stack requests while one is pending
+  refBusy = true;
+  q('/api/status').then(function(d) {
+    var v = d.sensorsValid;
+    if (!v) liveStatus('main board offline', 'warn');
+    else liveStatus('live', 'ok');
+    level('mo', v ? d.moisture : null, 40, 20);
+    level('sa', v ? d.sanitizer : null, 50, 20);
+    var on = v && d.ledBrightness > 0;
+    el('light').textContent = !v ? '—' : on ? 'On ' + d.ledLevel + '%' : 'Off';
+    el('light').className = 'value ' + (on ? 'on' : 'off');
+    el('lightSched').textContent = v && d.ledSchedule ? 'Auto ' + d.ledOn + ' – ' + d.ledOff : '';
+    if (v && Date.now() - ledTouch > 4000) {
+      el('ledSwitch').checked = on;
+      var rng = el('ledLevelRange');
+      if (d.ledLevel && document.activeElement !== rng) { rng.value = d.ledLevel; el('ledLevelPct').textContent = d.ledLevel + '%'; }
+    }
+  }).catch(function() {
+    liveStatus('display not responding', 'bad');
+  }).finally(function() { refBusy = false; });
+}
+
+// ---- Print a message ----
+function printMessage() {
+  var text = el('printMsg').value.trim(), btn = el('printBtn'), res = el('printResult');
+  if (!text) { el('printMsg').focus(); return; }
+  btn.disabled = true; res.className = ''; res.textContent = 'Printing…';
+  po('/api/test/send-message', {text: text}).then(function(d) {
+    res.className = d.success ? 'ok' : 'bad';
+    res.textContent = d.success ? 'Printed' : (d.error || 'Could not print');
+    if (d.success) { el('printMsg').value = ''; loadMessages(); }
+  }).catch(function() {
+    res.className = 'bad'; res.textContent = 'Could not reach the printer';
+  }).finally(function() { btn.disabled = false; });
+}
+
+// ---- Reminders (id -> {message, scheduledTime}) ----
+var reminders = {};
+function drawReminders() {
+  var ids = Object.keys(reminders).sort(function(a, b) { return (reminders[a].scheduledTime || 0) - (reminders[b].scheduledTime || 0); });
+  fill('rm', ids.map(function(k) {
+    var r = reminders[k];
+    return row(r.message, new Date((r.scheduledTime || 0) * 1000).toLocaleString(), [{label: 'Delete', cls: 'btn-danger', fn: function() { delRem(k); }}]);
+  }), 'No reminders yet');
+  count('rmCount', ids.length);
+}
+function loadReminders() { q('/api/reminders').then(function(d) { reminders = d || {}; drawReminders(); }); }
+function addRem() {
+  var m = el('rmMsg').value.trim(), t = el('rmTm').value;
+  if (!m || !t) return;
+  var at = Math.floor(new Date(t).getTime() / 1000), tempId = 'temp_' + Date.now();
+  reminders[tempId] = {message: m, scheduledTime: at};  // optimistic; swapped for the server id below
+  drawReminders();
+  el('rmMsg').value = '';
+  po('/api/reminders', {message: m, scheduledTime: at}).then(function(d) {
+    delete reminders[tempId];
+    if (d.success && d.id) { reminders[d.id] = {message: m, scheduledTime: at}; drawReminders(); }
+    else loadReminders();
+  }).catch(loadReminders);
+}
+function delRem(id) {
+  if (!confirm('Delete this reminder?')) return;
+  delete reminders[id]; drawReminders();
+  if (id.indexOf('temp_') === 0) return;
+  del('/api/reminders/' + encodeURIComponent(id)).then(function(d) { if (!d.success) loadReminders(); });
+}
+
+// ---- Groceries / todos: same shape, index-addressed on the device ----
+function itemList(name, listId, countId, inputId, emptyText) {
+  var api = '/api/' + name, items = [];
+  function draw() {
+    fill(listId, items.map(function(it, i) { return row(it, '', [{label: 'Delete', cls: 'btn-danger', fn: function() { remove(i); }}]); }), emptyText);
+    count(countId, items.length);
+  }
+  function load() { q(api).then(function(a) { items = Array.isArray(a) ? a : []; draw(); }); }
+  function add() {
+    var it = el(inputId).value.trim();
+    if (!it) return;
+    items.push(it); draw(); el(inputId).value = '';
+    po(api, {item: it}).then(function(d) { if (!d.success) load(); }).catch(load);
+  }
+  function remove(i) {
+    items.splice(i, 1); draw();
+    del(api + '/' + i).then(function(d) { if (!d.success) load(); }).catch(load);
+  }
+  function print(what) {
+    if (!confirm('Send the ' + what + ' to the printer?')) return;
+    po(api + '/print').then(function(d) { if (d.success) load(); });
+  }
+  function clear(what) {
+    if (!confirm('Clear the whole ' + what + '?')) return;
+    items = []; draw();
+    del(api).then(function(d) { if (!d.success) load(); }).catch(load);
+  }
+  return {load: load, add: add, print: print, clear: clear};
+}
+var groceries = itemList('groceries', 'gl', 'glCount', 'glItem', 'Nothing on the list');
+var todos = itemList('todos', 'tl', 'tlCount', 'tlItem', 'Nothing to do');
+function addGl() { groceries.add(); }
+function printGl() { groceries.print('grocery list'); }
+function clearGl() { groceries.clear('grocery list'); }
+function addTl() { todos.add(); }
+function printTl() { todos.print('to-do list'); }
+function clearTl() { todos.clear('to-do list'); }
+
+// ---- SD card: messages, sounds, pictures (same three sections as the screen) ----
+function sdError(id, countId) { return function() { fill(id, [], 'No SD card in the display'); count(countId, 0); }; }
+function loadMessages() {
+  q('/api/messages').then(function(d) {
+    var msgs = d.messages || [];
+    fill('msgHist', msgs.map(function(m) {
+      return row(m.preview, m.ts > 1600000000 ? new Date(m.ts * 1000).toLocaleString() : '');
+    }), 'No messages yet');
+    count('msgCount', msgs.length);
+  }).catch(sdError('msgHist', 'msgCount'));
+}
+function loadAudio() {
+  q('/api/audio').then(function(d) {
+    var files = d.files || [];
+    el('audioNow').textContent = d.playing && d.current ? 'Playing ' + d.current.split('/').pop() : '';
+    fill('audioFiles', files.map(function(f) {
+      return row(f, '', [{label: 'Play', cls: 'btn-primary', fn: function() { audioPlay(f); }}]);
+    }), 'No sounds yet');
+    count('auCount', files.length);
+  }).catch(sdError('audioFiles', 'auCount'));
+}
+function audioPlay(f) { po('/api/audio/play', {file: f}).then(function() { setTimeout(loadAudio, 500); }); }
+function audioStop() { po('/api/audio/stop').then(function() { setTimeout(loadAudio, 500); }); }
+function loadImages() {
+  q('/api/images').then(function(d) {
+    var files = d.files || [];
+    fill('imageFiles', files.map(function(f) {
+      return row(f, '', [{label: 'Show', cls: 'btn-primary', fn: function() { po('/api/test/show-image', {file: f}); }}]);
+    }), 'No pictures yet');
+    count('imCount', files.length);
+  }).catch(sdError('imageFiles', 'imCount'));
+}
+
+ref();
+setInterval(ref, 3000);
+setInterval(loadReminders, 30000);
+setInterval(loadMessages, 15000);  // new messages arrive from the Pi without a page reload
+setInterval(loadAudio, 10000);     // keeps "Playing ..." current
+setInterval(loadImages, 60000);
+loadReminders();
+groceries.load();
+todos.load();
+loadMessages();
+loadAudio();
+loadImages();
+setQuickReminder(60);
+</script>
 </body>
-</html>)HTML";
-    server.send(200, "text/html", html);
+</html>
+)HTML";
+    sendHtmlParts(server, {ROOT_HEAD, WEB_THEME_CSS, ROOT_BODY});
 }
 
 void setupWebServer() {
+    // WebServer only retains headers registered here; without this the auth cookie is invisible
+    static const char* headerKeys[] = {"Cookie"};
+    server.collectHeaders(headerKeys, 1);
     server.on("/login", HTTP_GET, handleLogin);
     server.on("/login", HTTP_POST, handleLogin);
     server.on("/logout", HTTP_GET, handleLogout);
@@ -3077,6 +2343,7 @@ void setupWebServer() {
     server.on("/api/login", HTTP_GET, handleApiLogin);  // Shortcut-friendly login endpoint
     server.on("/api/status", HTTP_GET, handleGetStatus);
     server.on("/api/reset-sanitizer", HTTP_POST, handleResetSanitizer);
+    server.on("/api/led", HTTP_POST, handleLedControl);
     
     // Hardware pump/LED control, tests, and settings now live only on the Main ESP32's
     // TestServer (port 8081) - see TestServer.h. Keeps a single source of truth so the TZT
@@ -3316,7 +2583,7 @@ void setup() {
     otaService->initialize("TZT-Display");
     #endif
 
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    configTzTime(TIMEZONE_POSIX, NTP_SERVER);  // POSIX TZ handles CST/CDT switch automatically
 
     esp_task_wdt_reset();  // Feed WDT before backend init
     Logger::setLevel(LOG_LEVEL_INFO);
@@ -3363,7 +2630,11 @@ void setup() {
     disp_drv.ver_res = TZT_SCREEN_HEIGHT;
     disp_drv.draw_buf = &draw_buf;
     disp_drv.flush_cb = lvgl_flush_cb;
-    lv_disp_drv_register(&disp_drv);
+    lv_disp_t* disp = lv_disp_drv_register(&disp_drv);
+    // Dark default theme seeded with the FI primary/accent, so any widget part not styled
+    // explicitly (scrollbars, focus outlines, list text) still matches UiTheme.h
+    lv_disp_set_theme(disp, lv_theme_default_init(disp, uiColor(UI_BORDER), uiColor(UI_ACCENT),
+                                                  true, LV_FONT_DEFAULT));
     // Touch input (XPT2046, TOUCH_CS 33 — uses getTouchRaw() + affine calibration from config_tzt.h)
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
@@ -3449,6 +2720,13 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    // Main sends a heartbeat every 10 s; after 3 missed ones, stop showing its last values as live
+    unsigned long lastRx = lastSensorDataReceiveTime;  // read before millis(): the WiFi task may update it meanwhile
+    if (lastSensorDataValid && millis() - lastRx > SENSOR_DATA_STALE_MS) {
+        lastSensorDataValid = false;
+        sensorDataNeedsPanelUpdate = true;
+        Logger::warn("ESP-NOW", "No data from Main for " + String(SENSOR_DATA_STALE_MS / 1000) + " s - marked offline");
+    }
     if (otaService) otaService->handle();
     server.handleClient();
 
@@ -3458,7 +2736,7 @@ void loop() {
         if (millis() >= splashReadyAt) {
             createControlPanel();
             updateControlPanelStatus();
-            lv_scr_load(screen1);
+            lv_scr_load(launcherScreen);
             splashVisible = false;
         }
         delay(2);
@@ -3468,13 +2746,11 @@ void loop() {
     if (pendingTestImagePath.length() > 0) {
         String path = pendingTestImagePath;
         pendingTestImagePath = "";
-        displayFlushing = true;
-        drawSdJpegToTft(path.c_str());
-        displayFlushing = false;
-        hideNavBar();
+        currentImagePath = path;  // viewer redraw below keeps it on screen (LVGL repaints the black bg on load)
+        hideStatusBar();
         lv_scr_load(imageViewerScreen);
     }
-    if (labelMoisture) {
+    if (launcherScreen) {
         if (sensorDataNeedsPanelUpdate) {
             sensorDataNeedsPanelUpdate = false;
             lastPanelUpdate = millis();
@@ -3519,7 +2795,7 @@ void loop() {
     if (millis() - lastLoopLog >= 2000) {
         lastLoopLog = millis();
         Serial.printf("[Loop] tick | sensorValid=%d panelAge=%lums\n",
-            lastSensorDataValid ? 1 : 0, labelMoisture ? (unsigned long)(millis() - lastPanelUpdate) : 0);
+            lastSensorDataValid ? 1 : 0, launcherScreen ? (unsigned long)(millis() - lastPanelUpdate) : 0);
     }
 #endif
 #endif
@@ -3676,7 +2952,7 @@ void loop() {
     }
     
     if (backend && (millis() - lastCmd >= backendPollInterval)) {
-        lastCmd = millis() + (unsigned long)random(0, 2000);
+        lastCmd = millis() - (unsigned long)random(0, 2000);  // Jitter backwards: a future lastCmd underflows the elapsed check and polls every loop
         DynamicJsonDocument cmds(2048);
         bool pollOk = backend->pollCommands(cmds);
         if (!pollOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi)");
@@ -3704,9 +2980,7 @@ void loop() {
                     sdCard.saveMessage(data, source);
 #if !defined(TZT_HEADLESS)
                     lastPrintMessage = data;
-                    if (labelMessage) {
-                        lv_label_set_text(labelMessage, lastPrintMessage.c_str());
-                    }
+                    if (currentScreenIndex == SCREEN_MESSAGES) refreshHistoryList();
 #endif
                 }
                 else if (typ == "download_audio") {
@@ -3714,16 +2988,12 @@ void loop() {
                     String name = c["name"] | "";
                     if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         if (audioSvc.downloadToSD(url, name)) {
-                            lastDashboardAudioName = name;
-                            if (dashboardAudioNameLabel) lv_label_set_text(dashboardAudioNameLabel, name.c_str());
                             String path = String(AUDIO_DIR) + "/" + name;
                             audioSvc.playFile(path);
                         }
                     }
                 }
                 else if (typ == "play_audio" && data.length() > 0 && isSafeFilename(data)) {
-                    lastDashboardAudioName = data;
-                    if (dashboardAudioNameLabel) lv_label_set_text(dashboardAudioNameLabel, data.c_str());
                     String path = String(AUDIO_DIR) + "/" + data;
                     audioSvc.playFile(path);
                 }
@@ -3754,7 +3024,6 @@ void loop() {
 #if !defined(TZT_HEADLESS)
                         if (ok) {
                             pendingTestImagePath = path;
-                            lastDashboardImagePath = path;
                         }
 #endif
                     }
@@ -3764,7 +3033,6 @@ void loop() {
                     String showPath = String(IMAGES_MEDIA_DIR) + "/" + data;
                     if (!SD.exists(showPath)) showPath = String(IMAGES_DIR) + "/" + data;
                     pendingTestImagePath = showPath;
-                    lastDashboardImagePath = showPath;
 #endif
                 }
                 String cmdPath = "/commands/" + String(kv.key().c_str()) + ".json";
@@ -3873,27 +3141,14 @@ void loop() {
             displayFlushing = false;
         }
     }
-    // Dashboard Photo tab: draw latest image when that tab is active
-    static unsigned long lastDashboardPhotoRedraw = 0;
-    if (dashboardPhotoScreen && lv_scr_act() == dashboardPhotoScreen && lastDashboardImagePath.length() > 0) {
-        unsigned long now = millis();
-        if (now - lastDashboardPhotoRedraw >= 500) {
-            lastDashboardPhotoRedraw = now;
-            displayFlushing = true;
-            drawSdJpegToTft(lastDashboardImagePath.c_str(), TZT_SCREEN_HEIGHT);
-            displayFlushing = false;
-        }
+    // Idle: untouched for 2 min anywhere but the launcher -> back to the launcher
+    if (launcherScreen && lv_scr_act() != launcherScreen &&
+        (unsigned long)(millis() - lastDashboardTouchTime) > DASHBOARD_IDLE_RETURN_MS) {
+        lastDashboardTouchTime = millis();
+        returnToLauncher();
     }
-    // Dashboard: auto-rotate Home/Sensors/Media every 5s when untouched for 2 min.
-    // Never auto-advance into or out of Settings (tab index 3) - only cycle 0..2.
-    if (dashboardPhotoScreen && currentScreenIndex >= 0 && currentScreenIndex < 3 &&
-        (unsigned long)(millis() - lastDashboardTouchTime) > DASHBOARD_TOUCH_PAUSE_MS &&
-        (unsigned long)(millis() - lastDashboardAutoAdvance) >= DASHBOARD_AUTO_ADVANCE_MS) {
-        lastDashboardAutoAdvance = millis();
-        goToScreenIndex((currentScreenIndex + 1) % 3);
-    }
-    // Keep audio header/Stop button in sync when playback ends naturally
-    if (audioListScreen && lv_scr_act() == audioListScreen) updateAudioHeaderState();
+    // Keep the now-playing bar in sync when playback ends naturally
+    if (soundsScreen && lv_scr_act() == soundsScreen) updateNowPlaying();
 #endif
     delay(0);  // Yield only — no fixed delay so LVGL gets more CPU for smoother GUI
 }

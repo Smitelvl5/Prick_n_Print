@@ -46,7 +46,9 @@
  *=========================*/
 
 /*1: use custom malloc/free, 0: use the built-in `lv_mem_alloc()` and `lv_mem_free()`*/
-#define LV_MEM_CUSTOM 0
+/*1: LVGL allocates from the ESP32 heap. The fixed 32K pool ran out once the themed UI
+ *(UiTheme.h) was built, and an LVGL malloc failure hung loop() - web server and OTA included.*/
+#define LV_MEM_CUSTOM 1
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
     #define LV_MEM_SIZE (32U * 1024U)          /*[bytes] - reduced for ESP32 DRAM (was 48K)*/
@@ -271,8 +273,8 @@
 #define LV_USE_ASSERT_OBJ           0   /*Check the object's type and existence (e.g. not deleted). (Slow)*/
 
 /*Add a custom handler when assert happens e.g. to restart the MCU*/
-#define LV_ASSERT_HANDLER_INCLUDE <stdint.h>
-#define LV_ASSERT_HANDLER while(1);   /*Halt by default*/
+#define LV_ASSERT_HANDLER_INCLUDE <esp_system.h>
+#define LV_ASSERT_HANDLER esp_restart();   /*Reboot instead of halting: a hung loop() also stops the web server and OTA*/
 
 /*-------------
  * Others
@@ -373,7 +375,7 @@
 #define LV_FONT_MONTSERRAT_26 0
 #define LV_FONT_MONTSERRAT_28 0
 #define LV_FONT_MONTSERRAT_30 0
-#define LV_FONT_MONTSERRAT_32 0
+#define LV_FONT_MONTSERRAT_32 1  // TZT launcher button icons
 #define LV_FONT_MONTSERRAT_34 0
 #define LV_FONT_MONTSERRAT_36 0
 #define LV_FONT_MONTSERRAT_38 0

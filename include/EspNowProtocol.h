@@ -20,16 +20,16 @@
 #define CMD_DISPENSE_START          0x02
 #define CMD_DISPENSE_STOP           0x03
 #define CMD_RESET_SANITIZER         0x04
-#define CMD_SET_LED_BRIGHTNESS      0x05
-#define CMD_SET_LED_STATE           0x06
-#define CMD_SET_AUTO_BRIGHTNESS     0x07
+#define CMD_SET_LED_BRIGHTNESS      0x05  // param1 = brightness level 1-100% (saved; applied now if LED is on)
+#define CMD_SET_LED_STATE           0x06  // param1 = 1 on (at saved level), 0 off; holds until next schedule switch
+#define CMD_SET_LED_SCHEDULE        0x07  // param1 = 1 on, 0 off (night schedule controls LED)
 #define CMD_TEST_PRINTER            0x08
 #define CMD_TEST_PUMP               0x09
 #define CMD_TEST_LED                0x0A
 #define CMD_SET_PUMP_DURATION       0x0B  // param1 = duration ms/100 (0-255 = 0-25.5s)
 #define CMD_SET_PUMP_COOLDOWN       0x0C  // param1 = cooldown ms/100 (0-255 = 0-25.5s)
 #define CMD_SET_AUTO_DISPENSE       0x0D  // param1 = 1 on, 0 off (sensor control for pump)
-#define CMD_SET_LIGHT_CALIBRATION   0x0E  // param1 = 0 record current light as min (turn off), 1 as max (turn on); Main reads sensor
+#define CMD_SET_LED_SCHEDULE_TIME   0x0E  // param1 = 0 on-time, 1 off-time; param2 = quarter-hour of day (0-95, e.g. 67 = 4:45 PM)
 #define CMD_PRINT_CHUNK             0x0F  // param1 = chunk index (0-based), param2 = total chunks; message = chunk payload; Main reassembles and prints
 #define CMD_PRINT_CHUNK_START       0x10  // param2 = total chunks; TZT sends this first so Main pauses sensor before chunk 0
 
@@ -42,13 +42,15 @@ struct SensorDataPacket {
     float moisturePercent;     // 0-100
     float sanitizerLevel;      // 0-100
     bool irDetected;           // true/false
-    float lightPercent;        // 0-100
-    uint8_t ledBrightness;     // 0-255
+    uint16_t ledOnMinute;      // LED schedule on-time, minutes since local midnight
+    uint16_t ledOffMinute;     // LED schedule off-time, minutes since local midnight
+    uint8_t ledBrightness;     // 0-255 current PWM output (0 = off)
+    uint8_t ledLevel;          // 1-100 saved brightness level used when the LED is on
     bool isDispensing;         // true/false
     bool pumpRunning;          // true/false
     uint8_t sequenceNumber;    // For detecting lost packets
     bool autoDispense;         // true = IR sensor controls pump
-    bool autoBrightness;       // true = light sensor controls LED
+    bool ledSchedule;          // true = night schedule controls LED
     uint8_t checksum;          // Simple checksum for data integrity
 };
 #pragma pack(pop)
@@ -114,14 +116,14 @@ inline const char* espNowCommandName(uint8_t cmd) {
         case CMD_RESET_SANITIZER: return "RESET_SANITIZER";
         case CMD_SET_LED_BRIGHTNESS: return "SET_LED_BRIGHTNESS";
         case CMD_SET_LED_STATE: return "SET_LED_STATE";
-        case CMD_SET_AUTO_BRIGHTNESS: return "SET_AUTO_BRIGHTNESS";
+        case CMD_SET_LED_SCHEDULE: return "SET_LED_SCHEDULE";
         case CMD_TEST_PRINTER: return "TEST_PRINTER";
         case CMD_TEST_PUMP: return "TEST_PUMP";
         case CMD_TEST_LED: return "TEST_LED";
         case CMD_SET_PUMP_DURATION: return "SET_PUMP_DURATION";
         case CMD_SET_PUMP_COOLDOWN: return "SET_PUMP_COOLDOWN";
         case CMD_SET_AUTO_DISPENSE: return "SET_AUTO_DISPENSE";
-        case CMD_SET_LIGHT_CALIBRATION: return "SET_LIGHT_CALIBRATION";
+        case CMD_SET_LED_SCHEDULE_TIME: return "SET_LED_SCHEDULE_TIME";
         default: return "CMD_?";
     }
 }

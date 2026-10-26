@@ -94,14 +94,14 @@
 // Same LAN: use Pi's local IP e.g. "http://192.168.1.146:5000" (Flask) or "http://192.168.1.146" (nginx)
 // Include :5000 if running Flask directly; omit if nginx proxies port 80.
 #ifndef BACKEND_URL
-#define BACKEND_URL "http://192.168.1.146:5000"
+#define BACKEND_URL "http://192.168.1.185:5000"
 #endif
 #define BACKEND_TIMEOUT 10000
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"
-#define GMT_OFFSET_SEC -21600        // UTC-6 (Central Standard Time)
-#define DAYLIGHT_OFFSET_SEC 3600     // +1 hour during Daylight Saving Time
+// POSIX TZ: CST (UTC-6), CDT from 2nd Sun of March to 1st Sun of November - switches DST automatically
+#define TIMEZONE_POSIX "CST6CDT,M3.2.0,M11.1.0"
 
 // Weather API Settings (using coordinates)
 // WEATHER_API_KEY, WEATHER_LATITUDE, WEATHER_LONGITUDE now come from secrets.h

@@ -6,6 +6,7 @@
 #include "HardwareAbstraction.h"
 #include "PrinterService.h"
 #include "ApiSecurity.h"
+#include "EspNowService.h"
 
 // Bench-test HTTP server (port 8081) - exercise any hardware component from a
 // browser/curl without the serial monitor. One handler class per component
@@ -19,7 +20,8 @@ class TestServer {
 public:
     // autoDispense points at main.cpp's autoDispenseEnabled flag - settings live here since this is
     // now the single place hardware config is read/changed (avoids the old TZT-dashboard/serial-menu split).
-    TestServer(HardwareAbstraction* hw, PrinterService* printer, bool* autoDispense);
+    // espNow (optional) feeds the link counters shown under System on the bench page.
+    TestServer(HardwareAbstraction* hw, PrinterService* printer, bool* autoDispense, EspNowService* espNow = nullptr);
 
     void begin();
     void handleClient() { server_.handleClient(); }
@@ -37,6 +39,7 @@ private:
     HardwareAbstraction* hardware_;
     PrinterService* printerService_;
     bool* autoDispenseEnabled_;
+    EspNowService* espNow_;
     ApiSecurity security_;
 
     // Non-blocking test-pulse state (mirrors ESP-NOW TEST_PUMP/TEST_LED behavior)
@@ -53,6 +56,7 @@ private:
 
     void handleRoot();
     void handleStatus();
+    void handleSystem();  // firmware, uptime, memory, WiFi, ESP-NOW link (read-only, open like /status)
 
     void handlePrinterTest();
     void handlePrinterRaw();
@@ -67,8 +71,9 @@ private:
     void handleSetPumpDuration();
     void handleSetPumpCooldown();
     void handleSetAutoDispense();
-    void handleSetAutoBrightness();
-    void handleSetLightCalibration();
+    void handleSetLedSchedule();
+    void handleSetLedScheduleTimes();
+    void handleSetLedLevel();
 };
 
 #endif // TEST_SERVER_H

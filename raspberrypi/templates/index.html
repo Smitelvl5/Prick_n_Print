@@ -3,368 +3,79 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Prick_n_Print — Console</title>
+  <title>Prick'n'Print Console</title>
+  <meta name="theme-color" content="#1C2A1F">
+  <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
   <style>
-    @font-face {
-      font-family: 'JetBrains Mono';
-      font-weight: 400 700;
-      font-display: swap;
-      src: local('JetBrains Mono'), local('JetBrainsMono-Regular');
-    }
-
-    :root {
-      --bg: #0b0d10;
-      --surface: #14171c;
-      --surface-2: #1b1f26;
-      --surface-hover: #20242c;
-      --border: #262b33;
-      --border-strong: #333a45;
-      --text: #e7e9ec;
-      --text-muted: #8b93a1;
-      --text-faint: #565e6b;
-      --accent: #4f8cff;
-      --accent-hover: #6b9dff;
-      --accent-dim: rgba(79, 140, 255, 0.14);
-      --ok: #3ddc84;
-      --ok-dim: rgba(61, 220, 132, 0.14);
-      --warn: #f5a623;
-      --danger: #ff5470;
-      --danger-hover: #ff7089;
-      --danger-dim: rgba(255, 84, 112, 0.14);
-      --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-      --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Consolas, monospace;
-    }
-
-    :root[data-theme="light"] {
-      --bg: #f4f5f7;
-      --surface: #ffffff;
-      --surface-2: #eef0f3;
-      --surface-hover: #e6e9ed;
-      --border: #dde1e7;
-      --border-strong: #c7ccd4;
-      --text: #14171c;
-      --text-muted: #5a6270;
-      --text-faint: #96a0ae;
-      --accent: #2f6fe4;
-      --accent-hover: #1f5bd0;
-      --accent-dim: rgba(47, 111, 228, 0.1);
-      --ok: #17a866;
-      --ok-dim: rgba(23, 168, 102, 0.12);
-      --warn: #b3730a;
-      --danger: #e0304f;
-      --danger-hover: #c8253f;
-      --danger-dim: rgba(224, 48, 79, 0.1);
-      --shadow: 0 8px 24px rgba(20, 23, 28, 0.08);
-    }
-
-    @media (prefers-color-scheme: light) {
-      :root:not([data-theme="dark"]) {
-        --bg: #f4f5f7;
-        --surface: #ffffff;
-        --surface-2: #eef0f3;
-        --surface-hover: #e6e9ed;
-        --border: #dde1e7;
-        --border-strong: #c7ccd4;
-        --text: #14171c;
-        --text-muted: #5a6270;
-        --text-faint: #96a0ae;
-        --accent: #2f6fe4;
-        --accent-hover: #1f5bd0;
-        --accent-dim: rgba(47, 111, 228, 0.1);
-        --ok: #17a866;
-        --ok-dim: rgba(23, 168, 102, 0.12);
-        --warn: #b3730a;
-        --danger: #e0304f;
-        --danger-hover: #c8253f;
-        --danger-dim: rgba(224, 48, 79, 0.1);
-        --shadow: 0 8px 24px rgba(20, 23, 28, 0.08);
-      }
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html { color-scheme: dark light; }
-    :root[data-theme="light"] { color-scheme: light; }
-    :root[data-theme="dark"] { color-scheme: dark; }
-
-    body {
-      font-family: var(--font-ui);
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      line-height: 1.5;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    a { color: var(--accent); }
-
-    .container { max-width: 1040px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
-
-    .masthead {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 1rem;
-      flex-wrap: wrap;
-      margin-bottom: 1.75rem;
-      padding-bottom: 1.25rem;
-      border-bottom: 1px solid var(--border);
-    }
-    .masthead-id { display: flex; align-items: baseline; gap: 0.65rem; }
-    .masthead h1 {
-      font-size: 1.25rem;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-    }
-    .masthead .unit {
-      font-family: var(--font-mono);
-      font-size: 0.7rem;
-      color: var(--text-faint);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .masthead .subtitle {
-      color: var(--text-muted);
-      font-size: 0.8125rem;
-    }
-
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      padding: 0.3rem 0.7rem;
-      border-radius: 999px;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      font-family: var(--font-mono);
-    }
-    .status-pill .dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: var(--text-faint);
-      flex-shrink: 0;
-    }
-    .status-pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
-    .status-pill.ok .dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-dim); }
-    .status-pill.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
-    .status-pill.bad .dot { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-dim); }
-
-    .tabs {
-      display: flex;
-      gap: 0.25rem;
-      margin-bottom: 1.5rem;
-      border-bottom: 1px solid var(--border);
-    }
+    /* Page layout only - colours and components come from static/theme.css */
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
     .tabs button {
-      padding: 0.65rem 1rem;
-      background: none;
-      border: none;
-      color: var(--text-muted);
-      font: inherit;
-      font-size: 0.875rem;
-      font-weight: 500;
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-      transition: color 0.15s;
+      padding: 10px 16px; background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px;
+      color: var(--text-muted); font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer;
     }
     .tabs button:hover { color: var(--text); }
-    .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
-    .tab-panel { display: none; }
-    .tab-panel.active { display: block; }
+    .tabs button.active { color: var(--accent-light); border-bottom-color: var(--accent); }
+    .tab-panel, .hist-panel { display: none; }
+    .tab-panel.active, .hist-panel.active { display: block; }
 
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1.5rem;
-    }
-    .card h2 {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-      margin-bottom: 1rem;
-    }
-    .card .card-note {
-      color: var(--text-muted);
-      font-size: 0.8125rem;
-      margin-bottom: 1rem;
-    }
-
-    .hist-panel { display: none; }
-    .hist-panel.active { display: block; }
-    .history-tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    /* Segmented control - same as the screen's Photo/Audio toggle: active gets the primary fill */
+    .history-tabs { display: inline-flex; gap: 6px; margin-bottom: 14px; }
     .history-tabs button {
-      padding: 0.4rem 0.85rem;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      font: inherit;
-      font-size: 0.8125rem;
-      font-weight: 500;
-      border-radius: 999px;
-      cursor: pointer;
-      transition: border-color 0.15s, color 0.15s, background 0.15s;
+      min-height: 36px; padding: 6px 16px; border: none; border-radius: var(--radius-sm);
+      background: var(--button); color: var(--text); font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer;
     }
-    .history-tabs button:hover { border-color: var(--border-strong); color: var(--text); }
-    .history-tabs button.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+    .history-tabs button:hover { background: var(--fi-selection); }
+    .history-tabs button.active { background: var(--accent); color: var(--fi-title); }
 
-    .hist-actions {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      flex-wrap: wrap;
-      margin-bottom: 1rem;
-      padding-bottom: 1rem;
-      border-bottom: 1px solid var(--border);
-    }
+    .hist-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
     .hist-actions .spacer { flex: 1; }
-    .hist-actions .field-label {
-      color: var(--text-faint);
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .hist-actions select {
-      padding: 0.4rem 0.65rem;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text);
-      font: inherit;
-      font-size: 0.8125rem;
-    }
+    .hist-actions .field-label { color: var(--text-faint); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .hist-actions select { min-height: 36px; padding: 4px 10px; font-size: 0.85rem; }
+    .hist-actions .btn { min-height: 36px; padding: 6px 12px; font-size: 0.8rem; }
 
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.4rem;
-      padding: 0.5rem 1rem;
-      font: inherit;
-      font-size: 0.8125rem;
-      font-weight: 500;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.05s;
-      white-space: nowrap;
-    }
-    .btn:active { transform: scale(0.97); }
-    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-primary:hover { background: var(--accent-hover); }
-    .btn-ghost { background: transparent; color: var(--text-muted); border-color: var(--border); }
-    .btn-ghost:hover { background: var(--surface-hover); color: var(--text); border-color: var(--border-strong); }
-    .btn-danger { background: transparent; color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
-    .btn-danger:hover { background: var(--danger-dim); border-color: var(--danger); }
-    .btn-danger.solid { background: var(--danger); color: #fff; border-color: var(--danger); }
-    .btn-danger.solid:hover { background: var(--danger-hover); }
-    .btn.confirming {
-      background: var(--danger) !important;
-      color: #fff !important;
-      border-color: var(--danger) !important;
-      animation: pulse 0.9s ease-in-out infinite;
-    }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
-
-    .history-list { max-height: 460px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; }
+    /* Rows reuse the theme's list-row card */
+    .history-list { max-height: 520px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
     .history-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      padding: 0.75rem 0.9rem;
-      background: var(--surface-2);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      font-size: 0.875rem;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      min-height: 52px; padding: 10px 12px 10px 14px; background: var(--surface); border-radius: var(--radius-sm); font-size: 0.9rem;
     }
-    .history-item .text { word-break: break-word; }
-    .history-item .meta {
-      color: var(--text-faint);
-      font-size: 0.75rem;
-      font-family: var(--font-mono);
-      margin-top: 0.2rem;
-    }
-    .history-item .actions { display: flex; gap: 0.5rem; flex-shrink: 0; }
+    .card .history-item { background: var(--surface-2); }
+    .history-item .text { overflow-wrap: anywhere; }
+    .history-item .meta { color: var(--text-faint); font-size: 0.75rem; font-family: var(--font-mono); margin-top: 2px; }
+    .history-item .actions { display: flex; gap: 6px; flex-shrink: 0; }
+    .history-item .btn { min-height: 34px; padding: 6px 12px; font-size: 0.8rem; }
 
-    .empty {
-      color: var(--text-faint);
-      font-size: 0.8125rem;
-      padding: 2.5rem 1rem;
-      text-align: center;
-      border: 1px dashed var(--border);
-      border-radius: 8px;
-    }
-
-    .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.85rem; }
-    .img-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-    .img-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--bg); }
-    .img-card .info {
-      padding: 0.5rem 0.6rem;
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .img-card .img-actions { padding: 0 0.6rem 0.6rem; display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .img-card { background: var(--surface); border-radius: var(--radius); overflow: hidden; }
+    .img-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--surface-2); }
+    .img-card .info { padding: 8px 10px 4px; font-size: 0.78rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .img-card .img-actions { padding: 4px 10px 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .img-card .btn { min-height: 32px; padding: 4px 10px; font-size: 0.78rem; }
     .img-grid .empty { grid-column: 1 / -1; }
 
-    .device-row {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
-    .device-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex-shrink: 0; box-shadow: 0 0 0 3px var(--ok-dim); }
+    .card-note { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 14px; }
+    .device-row { display: flex; align-items: center; gap: 12px; }
+    .device-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-light); flex-shrink: 0; box-shadow: 0 0 0 3px var(--accent-dim); }
     .device-dot.stale { background: var(--text-faint); box-shadow: none; }
-    .device-name { font-weight: 500; }
+    .device-name { font-weight: 600; }
     .device-id { font-family: var(--font-mono); color: var(--text-faint); font-size: 0.75rem; }
 
-    .toast {
-      position: fixed;
-      bottom: 1.5rem;
-      right: 1.5rem;
-      padding: 0.7rem 1.1rem;
-      background: var(--surface);
-      border: 1px solid var(--ok);
-      border-radius: 8px;
-      color: var(--ok);
-      font-size: 0.8125rem;
-      font-weight: 500;
-      box-shadow: var(--shadow);
-      z-index: 1000;
-      animation: slideIn 0.25s ease;
+    @media (max-width: 560px) {
+      .hist-actions .spacer { flex-basis: 100%; height: 0; }
+      .history-item { flex-wrap: wrap; }
     }
-    .toast.err { border-color: var(--danger); color: var(--danger); }
-    @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-
-    @media (prefers-reduced-motion: reduce) {
-      .toast, .btn.confirming { animation: none; }
-    }
-
-    ::-webkit-scrollbar { width: 10px; height: 10px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="masthead">
-      <div>
-        <div class="masthead-id">
-          <h1>Prick_n_Print</h1>
-          <span class="unit">console</span>
-        </div>
-        <p class="subtitle">Delivery log and connected devices — send from iOS Shortcuts</p>
-      </div>
-      <span class="status-pill" id="connPill"><span class="dot"></span><span id="connLabel">connecting</span></span>
+  <header class="topbar">
+    <div>
+      <h1>Prick'n'Print</h1>
+      <div class="sub">Console · send from iOS Shortcuts</div>
     </div>
-
+    <span class="spacer"></span>
+    <span class="status-pill" id="connPill"><span class="dot"></span><span id="connLabel">connecting</span></span>
+  </header>
+  <div class="page">
     <div class="tabs">
       <button type="button" class="tab-btn active" data-tab="history">History</button>
       <button type="button" class="tab-btn" data-tab="devices">Devices</button>

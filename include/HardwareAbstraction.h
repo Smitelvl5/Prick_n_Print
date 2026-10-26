@@ -18,12 +18,13 @@ private:
     // Sensor readings
     float moisturePercent;
     bool irDetected;
-    float lightPercent;
     uint8_t ledBrightness;
-    // Light calibration for auto-brightness: min = "turn off" level, max = "turn on" level (< 0 = not set)
-    float lightCalibMinPercent;
-    float lightCalibMaxPercent;
-    bool autoBrightnessEnabled;  // Flag to enable/disable automatic brightness control
+    // LED night schedule: on at ledOnMinute, off at ledOffMinute (minutes since local midnight)
+    bool ledScheduleEnabled;
+    uint16_t ledOnMinute;
+    uint16_t ledOffMinute;
+    int8_t ledScheduleLastWindow;  // -1 = not yet applied; 0/1 = last in-window state acted on
+    uint8_t ledLevelPct;           // brightness used whenever the LED turns on (1-100%)
     
     // PWM ramp-up state (1V per second)
     bool rampActive;
@@ -41,7 +42,14 @@ private:
     // Runtime config (0 = use config.h defaults)
     unsigned long maxDispenseDurationMs_;
     unsigned long dispenseCooldownMs_;
-    
+
+    // Persist sanitizer level + dispense count to NVS so they survive reboots
+    void loadSanitizerState();
+    void saveSanitizerState();
+    // Persist LED schedule (enabled + on/off times) to NVS
+    void loadLedSchedule();
+    void saveLedSchedule();
+
 public:
     HardwareAbstraction();
     ~HardwareAbstraction();
@@ -67,20 +75,25 @@ public:
     // Sensor Reading
     float readMoistureSensor();
     bool readIRSensor();
-    float readLightSensor();
     float getMoisturePercent() const { return moisturePercent; }
     bool isIRDetected() const { return irDetected; }
-    float getLightPercent() const { return lightPercent; }
-    /** Set current light level as calibration min (dark / LED off) or max (bright / LED on). */
-    void setLightCalibrationMin(float lightPercent);
-    void setLightCalibrationMax(float lightPercent);
     
-    // LED Brightness Control (inverse of light level)
-    void updateLEDBrightness();
+    // LED Control: night schedule switches the LED at the on/off times; manual changes
+    // hold until the next scheduled switch
     void setLEDBrightness(uint8_t brightness);  // 0-255 (with soft ramp-up)
-    void setAutoBrightness(bool enabled);  // Enable/disable automatic brightness control
-    bool isAutoBrightnessEnabled() const { return autoBrightnessEnabled; }
     uint8_t getLEDBrightness() const { return ledBrightness; }
+    void updateLEDSchedule();                    // call from loop; acts only when the window changes
+    void reapplyLEDSchedule();                   // force LED to match the schedule now (e.g. after a test pulse)
+    void setLedScheduleEnabled(bool enabled);
+    bool isLedScheduleEnabled() const { return ledScheduleEnabled; }
+    bool setLedScheduleTimes(uint16_t onMinute, uint16_t offMinute);  // false if out of range
+    uint16_t getLedOnMinute() const { return ledOnMinute; }
+    uint16_t getLedOffMinute() const { return ledOffMinute; }
+    static String formatMinute(uint16_t minute);  // e.g. 1005 -> "4:45 PM"
+    // Brightness level (1-100%) used by the schedule and manual "on"; applied immediately if the LED is on
+    void setLedLevel(uint8_t pct);
+    uint8_t getLedLevel() const { return ledLevelPct; }
+    uint8_t getLedOnPwm() const;  // ledLevelPct -> 0-255 with perceptual (gamma 2) curve
     void updateLEDRamp();  // Update PWM ramp-up (call in main loop)
     
     // Sanitizer Management

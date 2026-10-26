@@ -10,7 +10,6 @@
 #define THERMAL_RX_PIN 16      // RX2 - Thermal printer RX (ESP32 RX → Printer TX)
 #define IR_SENSOR_PIN 32       // Infrared sensor (motion detection)
 #define MOISTURE_SENSOR_PIN 34 // Moisture sensor (analog input, input-only pin)
-#define LIGHT_SENSOR_PIN 35    // LM393 Light Sensor Module (analog input, input-only pin)
 #define LED_PWM_PIN 27         // 12V LED PWM control via MOSFET (moved from GPIO 5 to avoid strapping pin)
 
 // ============================================================================
@@ -24,8 +23,7 @@
 // ============================================================================
 
 #define SENSOR_CHECK_INTERVAL 2000     // Check sensors every 2 seconds (for status/ESP-NOW; HTTP doesn't need to be fast)
-#define LED_UPDATE_INTERVAL 5000       // Fallback; overridden by SENSOR_ACTUATOR_INTERVAL_MS when auto-brightness is on
-#define SENSOR_ACTUATOR_INTERVAL_MS 50  // Fast path: light sensor → LED (and sensor cache for actuator use). Keeps sensor→actuator response ~50ms.
+#define LED_SCHEDULE_CHECK_INTERVAL_MS 1000  // How often the LED night schedule checks the clock
 #define WIFI_STATUS_CHECK_INTERVAL_MS 5000  // Onboard LED / WiFi status (non-actuator; can be slower to save loop work)
 
 // ============================================================================
@@ -44,6 +42,13 @@
 #define LED_MIN_PWM_VALUE 0             // PWM for 6.5V (min brightness when on)
 #define LED_MAX_PWM_VALUE 255           // PWM for 12V (full duty cycle)
 
+// LED night schedule (minutes since local midnight). Defaults cover Memphis winter darkness:
+// earliest sunset ~4:48 PM (early Dec), latest sunrise ~7:09 AM (early Jan).
+// Changeable at runtime from the test server (:8081) and saved to NVS.
+#define LED_SCHEDULE_ON_MINUTE  (16 * 60 + 45)  // 4:45 PM
+#define LED_SCHEDULE_OFF_MINUTE (7 * 60 + 15)   // 7:15 AM
+#define LED_DEFAULT_LEVEL_PCT 10                // Brightness (1-100%) used when the LED turns on; saved to NVS
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -57,8 +62,8 @@
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"
-#define GMT_OFFSET_SEC -21600        // UTC-6 (Central Standard Time)
-#define DAYLIGHT_OFFSET_SEC 3600     // +1 hour during Daylight Saving Time
+// POSIX TZ: CST (UTC-6), CDT from 2nd Sun of March to 1st Sun of November - switches DST automatically
+#define TIMEZONE_POSIX "CST6CDT,M3.2.0,M11.1.0"
 
 // Weather API Settings (using coordinates)
 // WEATHER_API_KEY, WEATHER_LATITUDE, WEATHER_LONGITUDE now come from secrets.h
@@ -71,6 +76,11 @@
 // Sanitizer Dispensing Settings
 #define DISPENSE_COOLDOWN_MS 3000        // Cooldown period: 3 seconds between dispenses (3000ms)
 #define MAX_DISPENSE_DURATION_MS 2000   // Maximum dispense duration: 2 seconds (prevents continuous dumping)
+
+// Sanitizer level tracking: level drops by (pump run time x flow rate) / capacity.
+// Calibrate flow: run the pump for 10 s into a measuring cup, divide ml by 10.
+#define SANITIZER_CAPACITY_ML 250.0f    // Full reservoir volume (ml)
+#define PUMP_FLOW_ML_PER_SEC 1.0f       // Pump output (ml/s) - measure and update
 
 // Web Server Authentication
 // WEB_PASSWORD now comes from secrets.h
@@ -91,6 +101,7 @@
 #define ESP_NOW_CHANNEL 6
 
 // ESP-NOW transmission interval (milliseconds)
-#define ESP_NOW_SEND_INTERVAL 10000  // Send sensor data every 10 seconds (reduces traffic and TZT/Main collisions; GUI still feels responsive)
+#define ESP_NOW_SEND_INTERVAL 10000  // Heartbeat: full sensor packet every 10 s even when nothing changed
+#define ESP_NOW_MIN_SEND_GAP_MS 250  // State changes (LED, pump, IR, levels) go out immediately, but no closer together than this
 
 #endif // CONFIG_H 

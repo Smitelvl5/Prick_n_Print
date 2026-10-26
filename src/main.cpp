@@ -91,8 +91,6 @@ static String getWeatherOneLine();
 
 // Time configuration
 const char* ntpServer = NTP_SERVER;
-const long gmtOffset_sec = GMT_OFFSET_SEC;
-const int daylightOffset_sec = DAYLIGHT_OFFSET_SEC;
 
 void setup() {
     // CRITICAL: Set unused strapping pins to correct state IMMEDIATELY - before Serial.begin
@@ -187,7 +185,7 @@ void setup() {
     #endif
     Logger::info("Main", "OTA update service initialized");
 
-    testServer = new TestServer(hardware, printerService, &autoDispenseEnabled);
+    testServer = new TestServer(hardware, printerService, &autoDispenseEnabled, espNowService);
     testServer->begin();
 
     Logger::info("Main", "Setup complete!");
@@ -221,6 +219,7 @@ void loop() {
             espNowTestType = 0;
         } else if (espNowTestType == 2 && elapsed >= espNowTestDurationMs) {
             hardware->setLEDBrightness(0);
+            hardware->reapplyLEDSchedule();  // restore scheduled state after the test pulse
             espNowTestType = 0;
         }
     }
@@ -256,28 +255,19 @@ void loop() {
         lastLEDUpdate = millis();
     }
     
-    // Fast path: sensor â†’ actuator (light â†’ LED). Only when auto-brightness on (saves CPU when manual).
-    static unsigned long lastActuatorUpdate = 0;
-    if (hardware->isAutoBrightnessEnabled() && (millis() - lastActuatorUpdate >= SENSOR_ACTUATOR_INTERVAL_MS)) {
-        hardware->readLightSensor();   // Keep light cache fresh for LED
-        hardware->updateLEDBrightness();
-        lastActuatorUpdate = millis();
+    // LED night schedule: check the clock once a second (switches only at the on/off times)
+    static unsigned long lastScheduleCheck = 0;
+    if (millis() - lastScheduleCheck >= LED_SCHEDULE_CHECK_INTERVAL_MS) {
+        hardware->updateLEDSchedule();
+        lastScheduleCheck = millis();
     }
     
     // Slow path: sensors for status/ESP-NOW (moisture, IR cache). HTTP/display don't need fast updates.
     static unsigned long lastSensorCheck = 0;
     if (millis() - lastSensorCheck > SENSOR_CHECK_INTERVAL) {
         hardware->readMoistureSensor();
-        hardware->readIRSensor();      // Cache for ESP-NOW; IRâ†’pump trigger uses digitalRead every loop
-        hardware->readLightSensor();   // Keep cache in sync for ESP-NOW payload
+        hardware->readIRSensor();      // Cache for ESP-NOW; IR->pump trigger uses digitalRead every loop
         lastSensorCheck = millis();
-    }
-    
-    // If auto-brightness off, still apply manual LED updates at slow interval (e.g. after web command)
-    static unsigned long lastLEDBrightnessUpdate = 0;
-    if (!hardware->isAutoBrightnessEnabled() && (millis() - lastLEDBrightnessUpdate > LED_UPDATE_INTERVAL)) {
-        hardware->updateLEDBrightness();
-        lastLEDBrightnessUpdate = millis();
     }
     
     // Update LED PWM ramp-up (1V per second) - call frequently for smooth ramping
@@ -351,32 +341,33 @@ void loop() {
             espNowService->sendSensorData();
             espNowService->clearRetryState();
         }
-        // Wait at least 3 seconds after ESP-NOW init before sending.
-        // Skip during chunked print (first chunk received â†’ pause until print done + 500ms).
-        // Skip if CHUNK_ACK queue has pending (so ACKs drain first; avoids NO_MEM).
-        // Skip if a send is still in flight to avoid ESP-NOW NO_MEM (TX queue full).
-        else if ((millis() - espNowInitTime) >= 3000 && (millis() - lastEspNowSend >= ESP_NOW_SEND_INTERVAL) && !espNowService->hasSendInFlight()
-                 && !espNowService->hasPendingChunkAck()
-                 && printChunkTotal == 0 && !pendingChunkPrintReady && (sensorPauseUntil == 0 || millis() >= sensorPauseUntil)) {
-            // Cached sensor values (fast path updates light/LED every 50ms when auto-brightness on)
-            float lightPercent = hardware->getLightPercent();
-            uint8_t ledBrightness = hardware->getLEDBrightness();
-            
-            // Send synchronized values - LED brightness calculated from same light sensor reading
-            // This ensures TZT display shows matching values that correspond to hardware test
-            espNowService->updateSensorData(
+        // Sensor packet: every ESP_NOW_SEND_INTERVAL as a heartbeat, or as soon as the display would show
+        // something different (LED switched, pump started...), at most every ESP_NOW_MIN_SEND_GAP_MS.
+        // Wait 3 s after ESP-NOW init; skip during a chunked print (paused until print done + 500 ms),
+        // while CHUNK_ACKs are queued (they drain first), and while a send is in flight (avoids NO_MEM).
+        else {
+            espNowService->updateSensorData(  // cached values only - cheap enough for every pass
                 hardware->getMoisturePercent(),
                 hardware->getSanitizerLevel(),
                 hardware->isIRDetected(),
-                lightPercent,  // Use cached light sensor value
-                ledBrightness,  // Use LED brightness (calculated from same light reading)
+                hardware->getLedOnMinute(),
+                hardware->getLedOffMinute(),
+                hardware->getLEDBrightness(),
+                hardware->getLedLevel(),
                 hardware->isDispensing(),
                 hardware->isPumpRunning(),
                 autoDispenseEnabled,
-                hardware->isAutoBrightnessEnabled()
+                hardware->isLedScheduleEnabled()
             );
-            espNowService->sendSensorData();
-            lastEspNowSend = millis();
+            unsigned long sinceSend = millis() - lastEspNowSend;
+            bool due = sinceSend >= ESP_NOW_SEND_INTERVAL ||
+                       (espNowService->hasUnsentChange() && sinceSend >= ESP_NOW_MIN_SEND_GAP_MS);
+            if (due && (millis() - espNowInitTime) >= 3000 && !espNowService->hasSendInFlight()
+                && !espNowService->hasPendingChunkAck()
+                && printChunkTotal == 0 && !pendingChunkPrintReady && (sensorPauseUntil == 0 || millis() >= sensorPauseUntil)) {
+                espNowService->sendSensorData();
+                lastEspNowSend = millis();
+            }
         }
     }
     
@@ -407,7 +398,7 @@ void loop() {
         }
     }
 
-    delay(1);  // Short delay for sensorâ†’actuator responsiveness (IRâ†’pump, lightâ†’LED). HTTP latency not a priority.
+    delay(1);  // Short delay for sensor->actuator responsiveness (IR->pump). HTTP latency not a priority.
 }
 
 void setupWiFi() {
@@ -471,8 +462,8 @@ void setupWiFi() {
 }
 
 void setupTime() {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Logger::info("Time", "NTP time server configured");
+    configTzTime(TIMEZONE_POSIX, ntpServer);  // POSIX TZ handles CST/CDT switch automatically
+    Logger::info("Time", "NTP time server configured (" TIMEZONE_POSIX ")");
 }
 
 // Strip to printable ASCII only so thermal printer (CP437) shows readable text
@@ -562,9 +553,9 @@ static uint32_t lastSettingKey = 0;
 static unsigned long lastSettingTime = 0;
 
 static bool isSettingCommandType(uint8_t type) {
-    return (type == CMD_SET_LED_BRIGHTNESS || type == CMD_SET_LED_STATE || type == CMD_SET_AUTO_BRIGHTNESS
+    return (type == CMD_SET_LED_BRIGHTNESS || type == CMD_SET_LED_STATE || type == CMD_SET_LED_SCHEDULE
          || type == CMD_SET_PUMP_DURATION || type == CMD_SET_PUMP_COOLDOWN || type == CMD_SET_AUTO_DISPENSE
-         || type == CMD_SET_LIGHT_CALIBRATION);
+         || type == CMD_SET_LED_SCHEDULE_TIME);
 }
 
 void handleEspNowCommand(CommandPacket* cmd) {
@@ -647,27 +638,27 @@ void handleEspNowCommand(CommandPacket* cmd) {
             }
             break;
         case CMD_SET_LED_BRIGHTNESS:
-            if (hardware->getLEDBrightness() != cmd->param1) {
-                hardware->setLEDBrightness(cmd->param1);
-                if (cmd->param1 == 0) hardware->setAutoBrightness(false);  // User turned off LED
-                Serial.println("âœ… Executed: SET_LED_BRIGHTNESS=" + String(cmd->param1));
+            // param1 = level 1-100%: saved, and applied right away if the LED is on
+            if (cmd->param1 >= 1 && cmd->param1 <= 100 && hardware->getLedLevel() != cmd->param1) {
+                hardware->setLedLevel(cmd->param1);
+                Serial.println("Executed: SET_LED_BRIGHTNESS=" + String(cmd->param1) + "%");
             }
             break;
         case CMD_SET_LED_STATE: {
+            // Manual on/off holds until the next scheduled switch
             bool wantOn = (cmd->param1 != 0);
             bool currentlyOn = (hardware->getLEDBrightness() > 0);
             if (wantOn != currentlyOn) {
-                hardware->setLEDBrightness(wantOn ? 255 : 0);
-                if (!wantOn) hardware->setAutoBrightness(false);
-                Serial.println("âœ… Executed: SET_LED_STATE=" + String(cmd->param1 ? 1 : 0));
+                hardware->setLEDBrightness(wantOn ? hardware->getLedOnPwm() : 0);
+                Serial.println("Executed: SET_LED_STATE=" + String(wantOn ? 1 : 0));
             }
             break;
         }
-        case CMD_SET_AUTO_BRIGHTNESS: {
+        case CMD_SET_LED_SCHEDULE: {
             bool wantOn = (cmd->param1 != 0);
-            if (hardware->isAutoBrightnessEnabled() != wantOn) {
-                hardware->setAutoBrightness(wantOn);
-                Serial.println("âœ… Executed: SET_AUTO_BRIGHTNESS=" + String(cmd->param1 ? 1 : 0));
+            if (hardware->isLedScheduleEnabled() != wantOn) {
+                hardware->setLedScheduleEnabled(wantOn);
+                Serial.println("Executed: SET_LED_SCHEDULE=" + String(wantOn ? 1 : 0));
             }
             break;
         }
@@ -719,18 +710,15 @@ void handleEspNowCommand(CommandPacket* cmd) {
             }
             break;
         }
-        case CMD_SET_LIGHT_CALIBRATION: {
-            bool isMax = (cmd->param1 != 0);  // 0 = record min (turn off), 1 = record max (turn on)
-            hardware->readLightSensor();
-            float pct = hardware->getLightPercent();
-            if (isMax)
-                hardware->setLightCalibrationMax(pct);
-            else
-                hardware->setLightCalibrationMin(pct);
-            // Apply new calibration to LED immediately (uses cached lightPercent)
-            if (hardware->isAutoBrightnessEnabled())
-                hardware->updateLEDBrightness();
-            Serial.println("âœ… Executed: SET_LIGHT_CALIBRATION " + String(isMax ? "max" : "min") + " (light=" + String(pct, 1) + "%)");
+        case CMD_SET_LED_SCHEDULE_TIME: {
+            // param1: 0 = on-time, 1 = off-time; param2: quarter-hour of day (0-95)
+            if (cmd->param2 > 95) break;
+            uint16_t minute = (uint16_t)cmd->param2 * 15;
+            uint16_t on = cmd->param1 == 0 ? minute : hardware->getLedOnMinute();
+            uint16_t off = cmd->param1 == 0 ? hardware->getLedOffMinute() : minute;
+            if (hardware->setLedScheduleTimes(on, off))
+                Serial.println("Executed: SET_LED_SCHEDULE_TIME " + String(cmd->param1 == 0 ? "on=" : "off=") +
+                               HardwareAbstraction::formatMinute(minute));
             break;
         }
         default:

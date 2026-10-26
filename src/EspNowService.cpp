@@ -133,8 +133,11 @@ void EspNowService::onDataSent(const uint8_t* mac_addr, esp_now_send_status_t st
     if (status == ESP_NOW_SEND_SUCCESS) {
         lastSendFailed = false;
         sendPendingSince = 0;
+        statSentOk++;
+        statLastSendOkMs = millis();
     } else {
         lastSendFailed = true;
+        statSentFail++;
     }
 }
 
@@ -168,6 +171,15 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
             if (len >= sizeof(CommandPacket)) {
                 CommandPacket* cmd = (CommandPacket*)data;
                 if (verifyChecksum((uint8_t*)cmd, sizeof(CommandPacket))) {
+                    bool duplicate = lastCmdSeqMs != 0 && cmd->sequenceNumber == lastCmdSeq &&
+                                     memcmp(mac_addr, lastCmdMac, 6) == 0 && millis() - lastCmdSeqMs < 3000;
+                    lastCmdSeq = cmd->sequenceNumber;
+                    memcpy(lastCmdMac, mac_addr, 6);
+                    lastCmdSeqMs = millis();
+                    if (!duplicate) {
+                        statCommandsReceived++;
+                        statLastCommandMs = millis();
+                    }
                     if (cmd->commandType == CMD_PRINT_CHUNK) {
                         // Never send CHUNK_ACK from callback (avoids NO_MEM). Queue and send from loop only.
                         uint8_t nextTail = (chunkAckQueueTail + 1) % CHUNK_ACK_QUEUE_SIZE;
@@ -177,7 +189,7 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
                             chunkAckQueueTail = nextTail;
                         }
                     }
-                    handleCommand(cmd);
+                    if (!duplicate) handleCommand(cmd);
                     if (cmd->commandType != CMD_PRINT_CHUNK) {
                         AckPacket ack;
                         memset(&ack, 0, sizeof(ack));
@@ -245,12 +257,14 @@ bool EspNowService::sendSensorData() {
     packet.moisturePercent = lastSensorData.moisturePercent;
     packet.sanitizerLevel = lastSensorData.sanitizerLevel;
     packet.irDetected = lastSensorData.irDetected;
-    packet.lightPercent = lastSensorData.lightPercent;
+    packet.ledOnMinute = lastSensorData.ledOnMinute;
+    packet.ledOffMinute = lastSensorData.ledOffMinute;
     packet.ledBrightness = lastSensorData.ledBrightness;
+    packet.ledLevel = lastSensorData.ledLevel;
     packet.isDispensing = lastSensorData.isDispensing;
     packet.pumpRunning = lastSensorData.pumpRunning;
     packet.autoDispense = lastSensorData.autoDispense;
-    packet.autoBrightness = lastSensorData.autoBrightness;
+    packet.ledSchedule = lastSensorData.ledSchedule;
     packet.sequenceNumber = sequenceNumber++;
     packet.checksum = calculateChecksum((uint8_t*)&packet, sizeof(SensorDataPacket));
     
@@ -258,6 +272,9 @@ bool EspNowService::sendSensorData() {
     
     if (result == ESP_OK) {
         sendPendingSince = millis();
+        lastSentData = lastSensorData;
+        hasSentData = true;
+        dataDirty = false;
         return true;
     } else {
         // Decode error code for better debugging
@@ -277,17 +294,34 @@ bool EspNowService::sendSensorData() {
     }
 }
 
-void EspNowService::updateSensorData(float moisture, float sanitizer, bool ir, float light,
-                                     uint8_t led, bool dispensing, bool pump, bool autoDispense, bool autoBrightness) {
+void EspNowService::updateSensorData(float moisture, float sanitizer, bool ir, uint16_t ledOnMinute, uint16_t ledOffMinute,
+                                     uint8_t led, uint8_t ledLevel, bool dispensing, bool pump, bool autoDispense, bool ledSchedule) {
     lastSensorData.moisturePercent = moisture;
     lastSensorData.sanitizerLevel = sanitizer;
     lastSensorData.irDetected = ir;
-    lastSensorData.lightPercent = light;
+    lastSensorData.ledOnMinute = ledOnMinute;
+    lastSensorData.ledOffMinute = ledOffMinute;
     lastSensorData.ledBrightness = led;
+    lastSensorData.ledLevel = ledLevel;
     lastSensorData.isDispensing = dispensing;
     lastSensorData.pumpRunning = pump;
     lastSensorData.autoDispense = autoDispense;
-    lastSensorData.autoBrightness = autoBrightness;
+    lastSensorData.ledSchedule = ledSchedule;
+    if (differsFromLastSent()) dataDirty = true;
+}
+
+// A change the display would show. Levels must move a whole percent (ADC noise otherwise sends every
+// reading), and the LED counts only on/off: its PWM ramps for seconds after every switch.
+bool EspNowService::differsFromLastSent() const {
+    if (!hasSentData) return true;
+    const SensorDataCache& a = lastSensorData;
+    const SensorDataCache& b = lastSentData;
+    return fabsf(a.moisturePercent - b.moisturePercent) >= 1.0f ||
+           fabsf(a.sanitizerLevel - b.sanitizerLevel) >= 1.0f ||
+           a.ledOnMinute != b.ledOnMinute || a.ledOffMinute != b.ledOffMinute ||
+           (a.ledBrightness > 0) != (b.ledBrightness > 0) || a.ledLevel != b.ledLevel ||
+           a.irDetected != b.irDetected || a.isDispensing != b.isDispensing || a.pumpRunning != b.pumpRunning ||
+           a.autoDispense != b.autoDispense || a.ledSchedule != b.ledSchedule;
 }
 
 void EspNowService::handleCommand(CommandPacket* cmd) {

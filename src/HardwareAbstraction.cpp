@@ -1,17 +1,29 @@
 #include "HardwareAbstraction.h"
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
 
 const char* HardwareAbstraction::TAG = "HAL";
 
-// Sentinel for "calibration not set" (valid calibration is 0-100)
-static const float LIGHT_CALIB_NOT_SET = -1.0f;
+// NVS namespace/keys for sanitizer tracking
+static const char* SANITIZER_NVS_NS = "sanitizer";
+static const char* SANITIZER_NVS_LEVEL = "level";
+static const char* SANITIZER_NVS_COUNT = "dispenses";
+
+// NVS namespace/keys for the LED night schedule
+static const char* LED_NVS_NS = "ledsched";
+static const char* LED_NVS_ENABLED = "enabled";
+static const char* LED_NVS_ON = "on";
+static const char* LED_NVS_OFF = "off";
+static const char* LED_NVS_LEVEL = "level";
 
 HardwareAbstraction::HardwareAbstraction() 
     : printerSerial(nullptr), pumpState(false),
-      moisturePercent(0.0), irDetected(false), lightPercent(0.0),
-      ledBrightness(0), lightCalibMinPercent(LIGHT_CALIB_NOT_SET), lightCalibMaxPercent(LIGHT_CALIB_NOT_SET),
+      moisturePercent(0.0), irDetected(false),
+      ledBrightness(0), ledScheduleEnabled(true), ledOnMinute(LED_SCHEDULE_ON_MINUTE),
+      ledOffMinute(LED_SCHEDULE_OFF_MINUTE), ledScheduleLastWindow(-1), ledLevelPct(LED_DEFAULT_LEVEL_PCT),
       sanitizerLevel(0.0), totalDispenses(0), lastDispenseTime(0), dispenseStartTime(0),
-      dispensing(false), autoBrightnessEnabled(true),
+      dispensing(false),
       maxDispenseDurationMs_(0), dispenseCooldownMs_(0),
       rampActive(false), rampStartPWM(0), rampTargetPWM(0), currentPWM(0), rampStartTime(0) {
 }
@@ -36,16 +48,20 @@ bool HardwareAbstraction::initialize() {
         return false;
     }
     
-    // Initialize sanitizer level (will be calibrated later)
-    sanitizerLevel = random(30, 95);
-    Logger::info(TAG, "Sanitizer level initialized: " + String(sanitizerLevel, 1) + "%");
+    // Restore sanitizer level from NVS (100% on first boot)
+    loadSanitizerState();
+    Logger::info(TAG, "Sanitizer level restored: " + String(sanitizerLevel, 1) + "% (" + String(totalDispenses) + " dispenses)");
+    
+    // Restore LED schedule from NVS (config.h defaults on first boot)
+    loadLedSchedule();
+    Logger::info(TAG, "LED schedule: " + String(ledScheduleEnabled ? "on " : "off ") +
+                 formatMinute(ledOnMinute) + " - " + formatMinute(ledOffMinute) + ", level " + String(ledLevelPct) + "%");
     
     // Read initial sensor values
     readMoistureSensor();
     readIRSensor();
-    readLightSensor();
     
-    // Explicitly set LED to OFF on startup (before any auto-brightness)
+    // Explicitly set LED to OFF on startup (schedule turns it on once NTP time is known)
     ledcWrite(LED_PWM_CHANNEL, 0);
     currentPWM = 0;
     ledBrightness = 0;
@@ -62,7 +78,7 @@ bool HardwareAbstraction::initializePins() {
     
     pinMode(SANITIZER_PUMP_PIN, OUTPUT);  // GPIO 26 - MOSFET Gate for pump control
     pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
-    
+
     // Configure LED PWM (for 12V LED via MOSFET)
     pinMode(LED_PWM_PIN, OUTPUT);
     digitalWrite(LED_PWM_PIN, LOW);  // Start with LED off
@@ -211,7 +227,10 @@ bool HardwareAbstraction::stopPump() {
     if (verifiedOff) {
         totalDispenses++;
         unsigned long duration = lastDispenseTime - dispenseStartTime;
-        Logger::info(TAG, "✅ Pump stopped (duration: " + String(duration) + "ms, total dispenses: " + String(totalDispenses) + ")");
+        float usedMl = (duration / 1000.0f) * PUMP_FLOW_ML_PER_SEC;
+        updateSanitizerLevel(usedMl / SANITIZER_CAPACITY_ML * 100.0f);
+        saveSanitizerState();
+        Logger::info(TAG, "✅ Pump stopped (duration: " + String(duration) + "ms, used: " + String(usedMl, 1) + "ml, level: " + String(sanitizerLevel, 1) + "%, total dispenses: " + String(totalDispenses) + ")");
     }
 
     return verifiedOff;
@@ -265,71 +284,87 @@ bool HardwareAbstraction::readIRSensor() {
     return irDetected;
 }
 
-float HardwareAbstraction::readLightSensor() {
-    int rawValue = analogRead(LIGHT_SENSOR_PIN);
-    // LM393 AO: higher raw in darkness, lower in bright light
-    // Invert so 0% = dark, 100% = bright (matches display/auto-brightness logic)
-    lightPercent = 100.0 - ((float)rawValue * 100.0 / 4095.0);
-    
-    if (lightPercent < 0) lightPercent = 0;
-    if (lightPercent > 100) lightPercent = 100;
-    
-    Logger::verbose(TAG, "Light sensor: " + String(lightPercent, 1) + "% (raw: " + String(rawValue) + ")");
-    return lightPercent;
+String HardwareAbstraction::formatMinute(uint16_t minute) {
+    int h = (minute / 60) % 24, m = minute % 60;
+    int h12 = h % 12 == 0 ? 12 : h % 12;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d:%02d %s", h12, m, h < 12 ? "AM" : "PM");
+    return String(buf);
 }
 
-void HardwareAbstraction::setLightCalibrationMin(float pct) {
-    if (pct < 0) pct = 0;
+void HardwareAbstraction::updateLEDSchedule() {
+    if (!ledScheduleEnabled) return;
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return;  // no NTP time yet - leave LED as is
+    uint16_t now = t.tm_hour * 60 + t.tm_min;
+    // Window wraps midnight when on > off (e.g. 4:45 PM -> 7:15 AM)
+    bool inWindow = (ledOnMinute <= ledOffMinute)
+        ? (now >= ledOnMinute && now < ledOffMinute)
+        : (now >= ledOnMinute || now < ledOffMinute);
+    // Edge-triggered: only switch when the window changes, so a manual on/off holds until the next switch time
+    if ((int8_t)inWindow == ledScheduleLastWindow) return;
+    ledScheduleLastWindow = inWindow;
+    Logger::info(TAG, String("LED schedule: ") + (inWindow ? "on" : "off") + " at " + formatMinute(now));
+    setLEDBrightness(inWindow ? getLedOnPwm() : 0);
+}
+
+uint8_t HardwareAbstraction::getLedOnPwm() const {
+    // Eyes perceive brightness roughly as the square of duty cycle, so 50% on the slider looks about half as bright
+    float f = ledLevelPct / 100.0f;
+    int pwm = (int)(f * f * 255.0f + 0.5f);
+    return (uint8_t)(pwm < 1 ? 1 : pwm);
+}
+
+void HardwareAbstraction::setLedLevel(uint8_t pct) {
+    if (pct < 1) pct = 1;
     if (pct > 100) pct = 100;
-    lightCalibMinPercent = pct;
-    Logger::info(TAG, "Light calibration MIN set to " + String(pct, 1) + "%");
+    ledLevelPct = pct;
+    saveLedSchedule();
+    Logger::info(TAG, "LED level set to " + String(pct) + "%");
+    if (ledBrightness > 0) setLEDBrightness(getLedOnPwm());  // live update while on
 }
 
-void HardwareAbstraction::setLightCalibrationMax(float pct) {
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    lightCalibMaxPercent = pct;
-    Logger::info(TAG, "Light calibration MAX set to " + String(pct, 1) + "%");
+void HardwareAbstraction::reapplyLEDSchedule() {
+    ledScheduleLastWindow = -1;
+    updateLEDSchedule();
 }
 
-void HardwareAbstraction::updateLEDBrightness() {
-    // Only update if auto-brightness is enabled
-    if (!autoBrightnessEnabled) {
-        Logger::verbose(TAG, "Auto-brightness disabled, skipping update");
-        return;
-    }
-    
-    // Use cached light sensor value (already read by main loop)
-    // This ensures LED brightness matches the light sensor reading sent to TZT
-    // DO NOT call readLightSensor() here - use the cached value instead
-    
-    // Map light to 0-100% using calibrated min/max if both set; otherwise use raw 0-100
-    float lightNorm = lightPercent;
-    bool useCalib = (lightCalibMinPercent >= 0 && lightCalibMaxPercent >= 0 && lightCalibMaxPercent > lightCalibMinPercent);
-    if (useCalib) {
-        float range = lightCalibMaxPercent - lightCalibMinPercent;
-        lightNorm = (lightPercent - lightCalibMinPercent) / range * 100.0f;
-        if (lightNorm < 0) lightNorm = 0;
-        if (lightNorm > 100) lightNorm = 100;
-    }
-    
-    // Inverse relationship: dark = bright LED, bright = dim LED
-    // lightNorm: 0% = dark, 100% = bright
-    // LED brightness: 0 = off, 1-255 = 6.5V-12V range (mapped in setLEDBrightness)
-    float inverseLight = 100.0f - lightNorm;
-    uint8_t brightness = (uint8_t)((inverseLight / 100.0f) * 255.0f);
-    
-    // Ensure minimum brightness is 1 (not 0) so LED actually turns on at lowest setting
-    if (brightness == 0 && inverseLight > 0) {
-        brightness = 1;
-    }
-    
-    setLEDBrightness(brightness);
+void HardwareAbstraction::setLedScheduleEnabled(bool enabled) {
+    ledScheduleEnabled = enabled;
+    saveLedSchedule();
+    Logger::info(TAG, "LED schedule " + String(enabled ? "enabled" : "disabled"));
+    if (enabled) reapplyLEDSchedule();
 }
 
-void HardwareAbstraction::setAutoBrightness(bool enabled) {
-    autoBrightnessEnabled = enabled;
-    Logger::info(TAG, "Auto-brightness " + String(enabled ? "enabled" : "disabled"));
+bool HardwareAbstraction::setLedScheduleTimes(uint16_t onMinute, uint16_t offMinute) {
+    if (onMinute >= 1440 || offMinute >= 1440 || onMinute == offMinute) return false;
+    ledOnMinute = onMinute;
+    ledOffMinute = offMinute;
+    saveLedSchedule();
+    Logger::info(TAG, "LED schedule times: " + formatMinute(onMinute) + " - " + formatMinute(offMinute));
+    reapplyLEDSchedule();
+    return true;
+}
+
+void HardwareAbstraction::loadLedSchedule() {
+    Preferences prefs;
+    prefs.begin(LED_NVS_NS, true);
+    ledScheduleEnabled = prefs.getBool(LED_NVS_ENABLED, true);
+    ledOnMinute = prefs.getUShort(LED_NVS_ON, LED_SCHEDULE_ON_MINUTE);
+    ledOffMinute = prefs.getUShort(LED_NVS_OFF, LED_SCHEDULE_OFF_MINUTE);
+    ledLevelPct = prefs.getUChar(LED_NVS_LEVEL, LED_DEFAULT_LEVEL_PCT);
+    if (ledLevelPct < 1 || ledLevelPct > 100) ledLevelPct = LED_DEFAULT_LEVEL_PCT;
+    prefs.end();
+}
+
+void HardwareAbstraction::saveLedSchedule() {
+    Preferences prefs;
+    prefs.begin(LED_NVS_NS, false);
+    prefs.putBool(LED_NVS_ENABLED, ledScheduleEnabled);
+    prefs.putUShort(LED_NVS_ON, ledOnMinute);
+    prefs.putUShort(LED_NVS_OFF, ledOffMinute);
+    prefs.putUChar(LED_NVS_LEVEL, ledLevelPct);
+    prefs.end();
 }
 
 void HardwareAbstraction::setLEDBrightness(uint8_t brightness) {
@@ -337,8 +372,6 @@ void HardwareAbstraction::setLEDBrightness(uint8_t brightness) {
     if (brightness > 255) brightness = 255;
     
     // Off = 0V immediately (no ramp). On = 6.5V–12V with optional ramp.
-    // Do NOT disable auto-brightness here — that would stop LED from responding when room gets dark again.
-    // Call setAutoBrightness(false) from command handler when user explicitly turns LED off.
     if (brightness == 0) {
         ledcWrite(LED_PWM_CHANNEL, 0);
         currentPWM = 0;
@@ -443,7 +476,24 @@ void HardwareAbstraction::updateSanitizerLevel(float amount) {
 void HardwareAbstraction::resetSanitizer() {
     sanitizerLevel = 100.0;
     totalDispenses = 0;
+    saveSanitizerState();
     Logger::info(TAG, "Sanitizer reset to 100%");
+}
+
+void HardwareAbstraction::loadSanitizerState() {
+    Preferences prefs;
+    prefs.begin(SANITIZER_NVS_NS, true);
+    sanitizerLevel = prefs.getFloat(SANITIZER_NVS_LEVEL, 100.0f);
+    totalDispenses = prefs.getInt(SANITIZER_NVS_COUNT, 0);
+    prefs.end();
+}
+
+void HardwareAbstraction::saveSanitizerState() {
+    Preferences prefs;
+    prefs.begin(SANITIZER_NVS_NS, false);
+    prefs.putFloat(SANITIZER_NVS_LEVEL, sanitizerLevel);
+    prefs.putInt(SANITIZER_NVS_COUNT, totalDispenses);
+    prefs.end();
 }
 
 bool HardwareAbstraction::printerWrite(const uint8_t* data, size_t length) {
@@ -502,7 +552,8 @@ void HardwareAbstraction::printDiagnostics() const {
     
     Logger::info(TAG, "IR Sensor: " + String(irDetected ? "DETECTED" : "CLEAR"));
     Logger::info(TAG, "Moisture: " + String(moisturePercent, 1) + "%");
-    Logger::info(TAG, "Light Level: " + String(lightPercent, 1) + "%");
+    Logger::info(TAG, "LED Schedule: " + String(ledScheduleEnabled ? "on " : "off ") +
+                 formatMinute(ledOnMinute) + " - " + formatMinute(ledOffMinute));
     Logger::info(TAG, "Sanitizer Level: " + String(sanitizerLevel, 1) + "%");
     Logger::info(TAG, "Total Dispenses: " + String(totalDispenses));
     Logger::info(TAG, "Printer: " + String(printerAvailable() ? "READY" : "NOT AVAILABLE"));
@@ -516,7 +567,10 @@ String HardwareAbstraction::getStatusJSON() const {
     doc["dispensing"] = dispensing;
     doc["irSensor"] = irDetected;
     doc["moisture"] = String(moisturePercent, 1);
-    doc["light"] = String(lightPercent, 1);
+    doc["ledLevel"] = ledLevelPct;
+    doc["ledSchedule"] = ledScheduleEnabled;
+    doc["ledOn"] = formatMinute(ledOnMinute);
+    doc["ledOff"] = formatMinute(ledOffMinute);
     doc["sanitizer"] = String(sanitizerLevel, 1);
     doc["dispenses"] = totalDispenses;
     doc["printer"] = printerAvailable();

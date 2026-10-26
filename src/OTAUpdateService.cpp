@@ -5,6 +5,8 @@
 #include "OTAUpdateService.h"
 #include "Logger.h"
 #include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <esp_task_wdt.h>
 
 const char* OTAUpdateService::TAG = "OTA";
 
@@ -30,6 +32,10 @@ bool OTAUpdateService::initialize(const String& deviceHostname, const String& ot
     ArduinoOTA.onEnd(onEnd);
     ArduinoOTA.onProgress(onProgress);
     ArduinoOTA.onError(onError);
+
+    // Both boards are mains-powered. Modem sleep (the ESP32 default) adds 100-300 ms per round trip,
+    // which stretches a 1.6 MB upload past the loop watchdog and kills it partway.
+    WiFi.setSleep(false);
 
     ArduinoOTA.begin();
     Logger::info(TAG, "OTA ready - hostname: " + hostname);
@@ -67,6 +73,9 @@ void OTAUpdateService::onEnd() {
 }
 
 void OTAUpdateService::onProgress(unsigned int progress, unsigned int total) {
+    // The whole upload runs inside ArduinoOTA.handle() on the loop task, which the task watchdog
+    // watches (60 s on the TZT); feed it per chunk or a slow upload reboots the board mid-flash.
+    esp_task_wdt_reset();
     static unsigned long lastLog = 0;
     if (millis() - lastLog > 500) {
         Logger::debug(TAG, "OTA progress: " + String((progress * 100) / total) + "%");
