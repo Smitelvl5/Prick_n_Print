@@ -90,13 +90,15 @@
 // ============================================================================
 // BACKEND: HTTP Web Server (TZT Display)
 // ============================================================================
-// Pi server URL (no trailing slash). TZT polls /api/commands, /api/audio, /api/images.
+// Pi server URL (no trailing slash). TZT polls /api/commands (audio/image uploads arrive as download commands).
 // Same LAN: use Pi's local IP e.g. "http://192.168.1.146:5000" (Flask) or "http://192.168.1.146" (nginx)
 // Include :5000 if running Flask directly; omit if nginx proxies port 80.
 #ifndef BACKEND_URL
 #define BACKEND_URL "http://192.168.1.185:5000"
 #endif
-#define BACKEND_TIMEOUT 10000
+// Connect + read timeout per request (ms). The Pi is on the LAN, so a short one keeps an
+// unreachable Pi from freezing the TZT screen while the loop waits on HTTP.
+#define BACKEND_TIMEOUT 3000
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"

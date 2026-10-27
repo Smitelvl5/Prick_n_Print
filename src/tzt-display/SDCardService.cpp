@@ -1,5 +1,6 @@
 #include "SDCardService.h"
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <time.h>
 
 static const SavedMessage EMPTY_MSG = {0, 0, "(empty)", ""};
@@ -36,6 +37,41 @@ bool SDCardService::begin() {
 
 void SDCardService::ensureDir(const char* path) {
     if (!SD.exists(path)) SD.mkdir(path);
+}
+
+bool SDCardService::downloadToFile(const String& url, const String& path) {
+    if (!mounted) return false;
+    if (SD.exists(path)) return true;
+    int slash = path.lastIndexOf('/');
+    if (slash > 0) ensureDir(path.substring(0, slash).c_str());
+
+    HTTPClient http;
+    if (!http.begin(url)) return false;
+    http.setTimeout(15000);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        Serial.println("[SD] Download HTTP " + String(code) + ": " + url);
+        http.end();
+        return false;
+    }
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.println("[SD] Cannot create file: " + path);
+        http.end();
+        return false;
+    }
+    // writeToStream reads until Content-Length (or chunked end) is reached, not just until the
+    // receive buffer is momentarily empty, so slow transfers aren't cut short
+    int expected = http.getSize();
+    int written = http.writeToStream(&f);
+    f.close();
+    http.end();
+    if (written <= 0 || (expected > 0 && written != expected)) {
+        Serial.println("[SD] Download incomplete (" + String(written) + "/" + String(expected) + "): " + path);
+        SD.remove(path);
+        return false;
+    }
+    return true;
 }
 
 // ── Messages ────────────────────────────────────────────────────

@@ -21,7 +21,6 @@ public:
     void setVolume(float gain);   // 0.0 .. 1.0
     float getVolume() const { return volume; }
 
-    bool downloadToSD(const String& url, const String& filename);
 
 private:
     bool initialized = false;

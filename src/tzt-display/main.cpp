@@ -8,7 +8,6 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #if !defined(TZT_HEADLESS)
@@ -117,7 +116,8 @@ static void refreshImageList();
 static void imageFileCb(lv_event_t* e);
 static void imageBackCb(lv_event_t* e);
 static void drawSdJpegToTft(const char* path, int maxY = 240);
-static String currentImagePath;  // set when image viewer is open so we redraw JPEG each frame
+static String currentImagePath;  // set when image viewer is open; JPEG is drawn over LVGL's black screen
+static volatile bool imageViewerNeedsDraw = false;  // LVGL flushed (painted over the JPEG) or a new image was picked
 static unsigned long lastPanelUpdate = 0;
 static uint32_t lastSensorHash = 0;
 static void createControlPanel();
@@ -359,32 +359,8 @@ void onDataSentStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
         if (millis() - lastFailLog > 15000) {
             lastFailLog = millis();
             Logger::warn("ESP-NOW", "send failed status=" + String((int)status));
-            if (!esp_now_is_peer_exist(mac_addr)) {
-                Logger::info("ESP-NOW", "Re-adding peer...");
-                // Try to re-add peer immediately
-                esp_now_peer_info_t peerInfo;
-                memset(&peerInfo, 0, sizeof(peerInfo));
-                memcpy(peerInfo.peer_addr, mac_addr, 6);
-                peerInfo.ifidx = WIFI_IF_STA;
-                uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-                peerInfo.channel = wifiChannel;
-                peerInfo.encrypt = false;
-
-                esp_err_t addResult = esp_now_add_peer(&peerInfo);
-                if (addResult != ESP_OK) Logger::error("ESP-NOW", "Re-add peer failed: " + String((int)addResult));
-            } else {
-                esp_now_peer_info_t peerInfo;
-                if (esp_now_get_peer(mac_addr, &peerInfo) == ESP_OK) {
-                    uint8_t currentChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-                    if (peerInfo.channel != currentChannel || peerInfo.ifidx != WIFI_IF_STA) {
-                        esp_now_del_peer(mac_addr);
-                        delay(50);
-                        peerInfo.channel = currentChannel;
-                        peerInfo.ifidx = WIFI_IF_STA;
-                        esp_now_add_peer(&peerInfo);
-                    }
-                }
-            }
+            esp_err_t peerResult = espNowEnsurePeer(mac_addr, espNowPeerChannel(ESP_NOW_CHANNEL));
+            if (peerResult != ESP_OK) Logger::error("ESP-NOW", "Re-add peer failed: " + String(esp_err_to_name(peerResult)));
         }
     }
 }
@@ -488,88 +464,14 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
     // other, and unicast ESP-NOW frames are retried by the radio. The old "wait for Main's quiet window"
     // delays blocked the loop (screen, web, OTA) for up to ~10 s per command.
 
-    // Verify peer exists and channel is correct before sending
-    bool peerExists = esp_now_is_peer_exist(mainESP32Mac);
-    uint8_t currentChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-    
-    // Get peer info to check channel and interface
-    esp_now_peer_info_t existingPeerInfo;
-    bool needsReconfig = false;
-    String reconfigReason = "";
-    
-    if (peerExists) {
-        if (esp_now_get_peer(mainESP32Mac, &existingPeerInfo) == ESP_OK) {
-            if (existingPeerInfo.channel != currentChannel) {
-                needsReconfig = true;
-                reconfigReason = "channel mismatch (peer.ch=" + String(existingPeerInfo.channel) + " current.ch=" + String(currentChannel) + ")";
-            }
-            if (existingPeerInfo.ifidx != WIFI_IF_STA) {
-                needsReconfig = true;
-                reconfigReason = "interface mismatch (peer.ifidx=" + String(existingPeerInfo.ifidx) + " expected=" + String(WIFI_IF_STA) + ")";
-            }
-        } else {
-            // Can't get peer info - might be corrupted, re-add it
-            needsReconfig = true;
-            reconfigReason = "cannot get peer info";
-        }
-    } else {
-        needsReconfig = true;
-        reconfigReason = "peer not found";
-    }
-    
-    // Re-add peer if missing or misconfigured
-    if (needsReconfig) {
-        Logger::info("ESP-NOW", "Re-configuring peer - " + reconfigReason);
-        
-        // Remove existing peer first
-        if (peerExists) {
-            esp_now_del_peer(mainESP32Mac);
-            delay(50);
-        }
-        
-        // Add peer with current channel and correct interface
-        esp_now_peer_info_t peerInfo;
-        memset(&peerInfo, 0, sizeof(peerInfo));
-        memcpy(peerInfo.peer_addr, mainESP32Mac, 6);
-        peerInfo.ifidx = WIFI_IF_STA;  // Must match WiFi mode
-        peerInfo.channel = currentChannel;  // Use current WiFi channel
-        peerInfo.encrypt = false;
-        
-        esp_err_t addResult = esp_now_add_peer(&peerInfo);
-        if (addResult != ESP_OK) {
-            String errStr = "";
-            switch(addResult) {
-                case ESP_ERR_ESPNOW_NOT_INIT: errStr = "NOT_INIT"; break;
-                case ESP_ERR_ESPNOW_ARG: errStr = "ARG"; break;
-                case ESP_ERR_ESPNOW_FULL: errStr = "FULL"; break;
-                case ESP_ERR_ESPNOW_NO_MEM: errStr = "NO_MEM"; break;
-                case ESP_ERR_ESPNOW_EXIST: errStr = "EXIST"; break;
-                default: errStr = "UNKNOWN(" + String((int)addResult) + ")"; break;
-            }
-            Logger::error("ESP-NOW", "Failed to re-add peer: " + errStr);
-            return false;
-        }
-        delay(100);  // Wait for peer to be fully registered
+    if (!espNowMacIsSet(mainESP32Mac)) return false;
 
-        // Verify it was added correctly
-        if (!esp_now_is_peer_exist(mainESP32Mac)) {
-            Logger::error("ESP-NOW", "Peer re-added but verification failed");
-            return false;
-        }
-
-        // Double-check the configuration
-        if (esp_now_get_peer(mainESP32Mac, &peerInfo) == ESP_OK) {
-            if (peerInfo.channel == currentChannel && peerInfo.ifidx == WIFI_IF_STA) {
-                Logger::info("ESP-NOW", "peer re-configured successfully (ch=" + String(currentChannel) + " ifidx=" + String(WIFI_IF_STA) + ")");
-            } else {
-                Logger::warn("ESP-NOW", "peer re-added but config mismatch (ch=" + String(peerInfo.channel) + "/" + String(currentChannel) + " ifidx=" + String(peerInfo.ifidx) + "/" + String(WIFI_IF_STA) + ")");
-            }
-        }
+    // Make sure the peer exists on the current WiFi channel (re-added if missing or the channel moved)
+    esp_err_t peerResult = espNowEnsurePeer(mainESP32Mac, espNowPeerChannel(ESP_NOW_CHANNEL));
+    if (peerResult != ESP_OK) {
+        Logger::error("ESP-NOW", "Failed to re-add peer: " + String(esp_err_to_name(peerResult)));
+        return false;
     }
-    
-    bool macSet = false;
-    for (int i = 0; i < 6; i++) { if (mainESP32Mac[i] != 0) { macSet = true; break; } }
-    if (!macSet) return false;
     
     CommandPacket packet;
     memset(&packet, 0, sizeof(packet));  // Zero-initialize to avoid garbage in padding/checksum
@@ -602,17 +504,7 @@ bool sendCommandViaESPNow(uint8_t commandType, uint8_t param1, uint8_t param2, c
     {
         esp_err_t result = esp_now_send(mainESP32Mac, (uint8_t*)&packet, sizeof(CommandPacket));
         if (result != ESP_OK) {
-            String errStr = "";
-            switch(result) {
-                case ESP_ERR_ESPNOW_NOT_INIT: errStr = "NOT_INIT"; break;
-                case ESP_ERR_ESPNOW_ARG: errStr = "ARG"; break;
-                case ESP_ERR_ESPNOW_INTERNAL: errStr = "INTERNAL"; break;
-                case ESP_ERR_ESPNOW_NO_MEM: errStr = "NO_MEM"; break;
-                case ESP_ERR_ESPNOW_NOT_FOUND: errStr = "NOT_FOUND"; break;
-                case ESP_ERR_ESPNOW_IF: errStr = "IF (interface mismatch)"; break;
-                default: errStr = "UNKNOWN(" + String((int)result) + ")"; break;
-            }
-            Logger::warn("ESP-NOW", "send failed: " + errStr);
+            Logger::warn("ESP-NOW", "send failed: " + String(esp_err_to_name(result)));
             return false;
         }
     }
@@ -700,6 +592,7 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     tft.pushPixels((uint16_t*)color_map, w * h);
     tft.endWrite();
     displayFlushing = false;
+    imageViewerNeedsDraw = true;  // whatever LVGL just drew may cover the viewer's JPEG
     lv_disp_flush_ready(drv);
 }
 
@@ -1468,6 +1361,7 @@ static void imageFileCb(lv_event_t* e) {
 #if !defined(TZT_HEADLESS)
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
         currentImagePath = path;
+        imageViewerNeedsDraw = true;
         hideStatusBar();
         lv_scr_load(imageViewerScreen);
     } else {
@@ -2476,7 +2370,11 @@ void setupWebServer() {
             server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
             return;
         }
-        bool ok = audioSvc.downloadToSD(url, name);
+        if (!isSafeFilename(name)) {
+            server.send(400, "application/json", "{\"error\":\"Invalid filename\"}");
+            return;
+        }
+        bool ok = sdCard.downloadToFile(url, String(AUDIO_DIR) + "/" + name);
         server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
     });
 
@@ -2511,31 +2409,39 @@ void setupWebServer() {
             server.send(400, "application/json", "{\"error\":\"Invalid filename\"}");
             return;
         }
-        String path = String(IMAGES_MEDIA_DIR) + "/" + name;
-        if (SD.exists(path)) { server.send(200, "application/json", JSON_SUCCESS); return; }
-        HTTPClient http;
-        http.begin(url);
-        http.setTimeout(15000);
-        bool ok = false;
-        if (http.GET() == HTTP_CODE_OK) {
-            File f = SD.open(path, FILE_WRITE);
-            if (f) {
-                WiFiClient* stream = http.getStreamPtr();
-                uint8_t buf[1024];
-                int total = 0;
-                while (http.connected() && stream->available()) {
-                    int n = stream->readBytes(buf, sizeof(buf));
-                    if (n > 0) { f.write(buf, n); total += n; }
-                }
-                f.close();
-                ok = (total > 0);
-            }
-        }
-        http.end();
+        bool ok = sdCard.downloadToFile(url, String(IMAGES_MEDIA_DIR) + "/" + name);
         server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
     });
 
     server.begin();
+}
+
+// Tell the Pi an upload is on the SD card so it isn't offered again (kind: "audio" or "images")
+static void markMediaDownloaded(const char* kind, const String& id) {
+    if (backend && id.length() > 0)
+        backend->put("/" + String(kind) + "/" + id + "/downloaded.json", "true");
+}
+
+// Download any audio/image uploads the Pi still lists as not downloaded. Uploads normally arrive as
+// download commands on the regular poll; this catches older ones and downloads that failed.
+#define MEDIA_BACKLOG_SYNC_MS (30UL * 60UL * 1000UL)
+static void syncMediaBacklog() {
+    struct { const char* kind; const char* dir; } media[] = { {"audio", AUDIO_DIR}, {"images", IMAGES_MEDIA_DIR} };
+    for (auto& m : media) {
+        String resp;
+        if (!backend->get("/" + String(m.kind) + ".json", resp) || resp.length() <= 4 || resp == "null") continue;
+        DynamicJsonDocument doc(4096);
+        if (deserializeJson(doc, resp) != DeserializationError::Ok) continue;
+        for (JsonPair kv : doc.as<JsonObject>()) {
+            JsonObject entry = kv.value();
+            String url = entry["url"] | "";
+            String name = entry["name"] | "";
+            if (url.length() == 0 || name.length() == 0 || (entry["downloaded"] | false) || !isSafeFilename(name)) continue;
+            if (sdCard.downloadToFile(url, String(m.dir) + "/" + name))
+                markMediaDownloaded(m.kind, kv.key().c_str());
+            esp_task_wdt_reset();
+        }
+    }
 }
 
 void setup() {
@@ -2588,8 +2494,8 @@ void setup() {
     esp_task_wdt_reset();  // Feed WDT before backend init
     Logger::setLevel(LOG_LEVEL_INFO);
     backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT, BACKEND_API_KEY);
-    backend->setRetryPolicy(3, 1000);
-    backend->setRateLimit(60);
+    backend->setRetryPolicy(2, 250);  // worst case ~2 x BACKEND_TIMEOUT per call when the Pi is down
+    backend->setDeviceIdentity("tzt-display", "TZT Display");  // Pi marks us seen on every poll
     reminderService = new ReminderService(backend);
     // Load reminders from SD first (primary persistence)
     if (sdCard.isReady()) {
@@ -2648,16 +2554,7 @@ void setup() {
 
     esp_task_wdt_reset();  // Feed WDT before ESP-NOW and web server
     
-    // Check if MAC address is configured
-    bool macSet = false;
-    for (int i = 0; i < 6; i++) {
-        if (mainESP32Mac[i] != 0) {
-            macSet = true;
-            break;
-        }
-    }
-    
-    if (macSet) {
+    if (espNowMacIsSet(mainESP32Mac)) {
         // Wait a bit for WiFi to fully stabilize before initializing ESP-NOW
         delay(500);
         
@@ -2670,41 +2567,12 @@ void setup() {
             esp_now_register_send_cb(onDataSentStatic);
             esp_now_register_recv_cb(onDataRecvStatic);
             
-            // Add peer (Main ESP32): zero struct so ifidx is not garbage (fixes "Peer interface is invalid")
-            esp_now_peer_info_t peerInfo;
-            memset(&peerInfo, 0, sizeof(peerInfo));
-            memcpy(peerInfo.peer_addr, mainESP32Mac, 6);
-            peerInfo.ifidx = WIFI_IF_STA;
-            // Use explicit WiFi channel (ESP-IDF example uses explicit channel, not 0)
-            // Get current WiFi channel, fallback to ESP_NOW_CHANNEL if not connected
-            uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-            peerInfo.channel = wifiChannel;
-            peerInfo.encrypt = false;
-            
-            // Remove peer if it already exists (in case of re-initialization)
-            esp_now_del_peer(mainESP32Mac);
-            delay(50);
-            
-            esp_err_t addPeerResult = esp_now_add_peer(&peerInfo);
+            // Add peer (Main ESP32) on an explicit channel (ESP-IDF example uses explicit channel, not 0)
+            esp_err_t addPeerResult = espNowEnsurePeer(mainESP32Mac, espNowPeerChannel(ESP_NOW_CHANNEL));
             if (addPeerResult == ESP_OK) {
-                // Verify peer was added successfully
-                delay(100);  // Small delay for peer to be fully registered
-                if (esp_now_is_peer_exist(mainESP32Mac)) {
-                    espNowInitialized = true;
-                } else {
-                    Logger::warn("ESP-NOW", "peer verify failed");
-                }
+                espNowInitialized = true;
             } else {
-                String errStr = "";
-                switch(addPeerResult) {
-                    case ESP_ERR_ESPNOW_NOT_INIT: errStr = "NOT_INIT"; break;
-                    case ESP_ERR_ESPNOW_ARG: errStr = "ARG"; break;
-                    case ESP_ERR_ESPNOW_FULL: errStr = "FULL"; break;
-                    case ESP_ERR_ESPNOW_NO_MEM: errStr = "NO_MEM"; break;
-                    case ESP_ERR_ESPNOW_EXIST: errStr = "EXIST"; break;
-                    default: errStr = "UNKNOWN(" + String((int)addPeerResult) + ")"; break;
-                }
-                Logger::warn("ESP-NOW", "failed to add peer: " + errStr);
+                Logger::warn("ESP-NOW", "failed to add peer: " + String(esp_err_to_name(addPeerResult)));
             }
         } else {
             Logger::warn("ESP-NOW", "initialization failed: " + String((int)initResult));
@@ -2747,6 +2615,7 @@ void loop() {
         String path = pendingTestImagePath;
         pendingTestImagePath = "";
         currentImagePath = path;  // viewer redraw below keeps it on screen (LVGL repaints the black bg on load)
+        imageViewerNeedsDraw = true;
         hideStatusBar();
         lv_scr_load(imageViewerScreen);
     }
@@ -2874,47 +2743,9 @@ void loop() {
         unsigned long now = millis();
         if (now - lastPeerCheck > 5000) {  // Check every 5s when failing
             lastPeerCheck = now;
-            
-            bool macSet = false;
-            for (int i = 0; i < 6; i++) { if (mainESP32Mac[i] != 0) { macSet = true; break; } }
-            
-            if (macSet) {
-                uint8_t currentChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-                
-                if (!esp_now_is_peer_exist(mainESP32Mac)) {
-                    // Peer lost - re-add it
-                    esp_now_peer_info_t peerInfo;
-                    memset(&peerInfo, 0, sizeof(peerInfo));
-                    memcpy(peerInfo.peer_addr, mainESP32Mac, 6);
-                    peerInfo.ifidx = WIFI_IF_STA;
-                    peerInfo.channel = currentChannel;
-                    peerInfo.encrypt = false;
-                    
-                    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-                        // Peer re-added (no log to reduce clutter)
-                    }
-                } else {
-                    // Verify channel matches
-                    esp_now_peer_info_t peerInfo;
-                    if (esp_now_get_peer(mainESP32Mac, &peerInfo) == ESP_OK) {
-                        if (peerInfo.channel != currentChannel) {
-                            // Channel changed - update peer
-                            uint8_t oldChannel = peerInfo.channel;
-                            esp_now_del_peer(mainESP32Mac);
-                            delay(50);
-                            // Recreate peer info with new channel
-                            memset(&peerInfo, 0, sizeof(peerInfo));
-                            memcpy(peerInfo.peer_addr, mainESP32Mac, 6);
-                            peerInfo.ifidx = WIFI_IF_STA;
-                            peerInfo.channel = currentChannel;
-                            peerInfo.encrypt = false;
-                            if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-                                // Channel updated (no log to reduce clutter)
-                            }
-                        }
-                    }
-                }
-            }
+            // Re-add the peer if it was lost or the WiFi channel moved (no log to reduce clutter)
+            if (espNowMacIsSet(mainESP32Mac))
+                espNowEnsurePeer(mainESP32Mac, espNowPeerChannel(ESP_NOW_CHANNEL));
             consecutiveFailures = 0;  // Reset after running peer verification
         }
     }
@@ -2945,24 +2776,24 @@ void loop() {
     static unsigned long lastCmd = 0;
     static unsigned long backendPollInterval = 30000;
     static unsigned long lastCommandFound = 0;
+    static unsigned long lastMediaSync = 0;
+    static bool mediaSynced = false;
     if (millis() - lastCommandFound < 120000) {
         backendPollInterval = 10000;
     } else {
         backendPollInterval = 30000;
     }
     
-    if (backend && (millis() - lastCmd >= backendPollInterval)) {
+    if (backend && WiFi.status() == WL_CONNECTED && (millis() - lastCmd >= backendPollInterval)) {
         lastCmd = millis() - (unsigned long)random(0, 2000);  // Jitter backwards: a future lastCmd underflows the elapsed check and polls every loop
         DynamicJsonDocument cmds(2048);
         bool pollOk = backend->pollCommands(cmds);
-        if (!pollOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi)");
-        if (pollOk) {
-            static unsigned long lastHeartbeat = 0;
-            if (millis() - lastHeartbeat > 120000) {  // Every 2 min
-                if (backend->sendHeartbeat("tzt-display", "TZT Display")) {
-                    lastHeartbeat = millis();
-                }
-            }
+        if (!pollOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi): " + backend->getLastError());
+        // Backlog sync right after the first good poll, then every 30 min (piggybacks on a poll that worked)
+        if (pollOk && sdCard.isReady() && (!mediaSynced || millis() - lastMediaSync >= MEDIA_BACKLOG_SYNC_MS)) {
+            mediaSynced = true;
+            lastMediaSync = millis();
+            syncMediaBacklog();
         }
         if (pollOk && cmds.size() > 0) {
             Logger::info("Backend", "Commands: " + String(cmds.size()));
@@ -2987,9 +2818,10 @@ void loop() {
                     String url = c["url"] | "";
                     String name = c["name"] | "";
                     if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
-                        if (audioSvc.downloadToSD(url, name)) {
-                            String path = String(AUDIO_DIR) + "/" + name;
-                            audioSvc.playFile(path);
+                        String path = String(AUDIO_DIR) + "/" + name;
+                        if (sdCard.downloadToFile(url, path)) {
+                            markMediaDownloaded("audio", c["media_id"] | "");
+                            if (!(c["silent"] | false)) audioSvc.playFile(path);  // silent = upload, just store it
                         }
                     }
                 }
@@ -3002,30 +2834,12 @@ void loop() {
                     String name = c["name"] | "";
                     if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         String path = String(IMAGES_MEDIA_DIR) + "/" + name;
-                        HTTPClient http;
-                        http.begin(url);
-                        http.setTimeout(15000);
-                        bool ok = false;
-                        if (http.GET() == HTTP_CODE_OK) {
-                            File f = SD.open(path, FILE_WRITE);
-                            if (f) {
-                                WiFiClient* stream = http.getStreamPtr();
-                                uint8_t buf[1024];
-                                int total = 0;
-                                while (http.connected() && stream->available()) {
-                                    int n = stream->readBytes(buf, sizeof(buf));
-                                    if (n > 0) { f.write(buf, n); total += n; }
-                                }
-                                f.close();
-                                ok = (total > 0);
-                            }
-                        }
-                        http.end();
+                        if (sdCard.downloadToFile(url, path)) {
+                            markMediaDownloaded("images", c["media_id"] | "");
 #if !defined(TZT_HEADLESS)
-                        if (ok) {
-                            pendingTestImagePath = path;
-                        }
+                            if (!(c["silent"] | false)) pendingTestImagePath = path;  // silent = upload, just store it
 #endif
+                        }
                     }
                 }
                 else if (typ == "show_image" && data.length() > 0 && isSafeFilename(data)) {
@@ -3039,7 +2853,7 @@ void loop() {
                 if (!backend->deleteData(cmdPath)) {
                     Logger::warn("Backend", "DELETE failed for " + String(kv.key().c_str()) + ": " + backend->getLastError());
                 }
-                delay(300);  // brief pause between DELETEs so server/connection can handle
+                esp_task_wdt_reset();  // a batch of downloads + DELETEs can take a while
             }
         }
     }
@@ -3058,88 +2872,17 @@ void loop() {
         });
     }
 
-    // Audio: poll backend /audio for new entries, download to SD
-    static unsigned long lastAudioPoll = 0;
-    if (backend && sdCard.isReady() && (millis() - lastAudioPoll >= 60000)) {
-        lastAudioPoll = millis();
-        String resp;
-        if (backend->get("/audio.json", resp) && resp.length() > 4 && resp != "null") {
-            DynamicJsonDocument adoc(2048);
-            if (deserializeJson(adoc, resp) == DeserializationError::Ok) {
-                for (JsonPair kv : adoc.as<JsonObject>()) {
-                    JsonObject entry = kv.value();
-                    String url = entry["url"] | "";
-                    String name = entry["name"] | "";
-                    bool downloaded = entry["downloaded"] | false;
-                    if (url.length() > 0 && name.length() > 0 && !downloaded && isSafeFilename(name)) {
-                        if (audioSvc.downloadToSD(url, name)) {
-                            backend->put("/audio/" + String(kv.key().c_str()) + "/downloaded.json", "true");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Images: poll backend /images for new entries, download to SD
-    static unsigned long lastImagesPoll = 0;
-    if (backend && sdCard.isReady() && (millis() - lastImagesPoll >= 60000)) {
-        lastImagesPoll = millis();
-        String resp;
-        if (backend->get("/images.json", resp) && resp.length() > 4 && resp != "null") {
-            DynamicJsonDocument idoc(2048);
-            if (deserializeJson(idoc, resp) == DeserializationError::Ok) {
-                for (JsonPair kv : idoc.as<JsonObject>()) {
-                    JsonObject entry = kv.value();
-                    String url = entry["url"] | "";
-                    String name = entry["name"] | "";
-                    bool downloaded = entry["downloaded"] | false;
-                    if (url.length() > 0 && name.length() > 0 && !downloaded && isSafeFilename(name)) {
-                        String path = String(IMAGES_MEDIA_DIR) + "/" + name;
-                        if (SD.exists(path)) {
-                            backend->put("/images/" + String(kv.key().c_str()) + "/downloaded.json", "true");
-                        } else {
-                            HTTPClient http;
-                            http.begin(url);
-                            http.setTimeout(15000);
-                            if (http.GET() == HTTP_CODE_OK) {
-                                File f = SD.open(path, FILE_WRITE);
-                                if (f) {
-                                    WiFiClient* stream = http.getStreamPtr();
-                                    uint8_t buf[1024];
-                                    int total = 0;
-                                    while (http.connected() && stream->available()) {
-                                        int n = stream->readBytes(buf, sizeof(buf));
-                                        if (n > 0) { f.write(buf, n); total += n; }
-                                    }
-                                    f.close();
-                                    if (total > 0)
-                                        backend->put("/images/" + String(kv.key().c_str()) + "/downloaded.json", "true");
-                                }
-                            }
-                            http.end();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     audioSvc.loop();
 
 #if !defined(TZT_HEADLESS)
     lv_timer_handler();
-    // Redraw JPEG when image viewer is active so it stays visible (LVGL would overwrite with screen bg).
-    // Throttle to every 200ms to avoid GUI lag (full decode+push every frame was too heavy).
-    static unsigned long lastImageViewerRedraw = 0;
-    if (imageViewerScreen && lv_scr_act() == imageViewerScreen && currentImagePath.length() > 0) {
-        unsigned long now = millis();
-        if (now - lastImageViewerRedraw >= 200) {
-            lastImageViewerRedraw = now;
-            displayFlushing = true;
-            drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
-            displayFlushing = false;
-        }
+    // Draw the JPEG only after LVGL has painted over it (screen load, invalidation) or a new image was
+    // picked - a static viewer costs nothing, instead of a full SD decode + push 5x per second.
+    if (imageViewerNeedsDraw && imageViewerScreen && lv_scr_act() == imageViewerScreen && currentImagePath.length() > 0) {
+        imageViewerNeedsDraw = false;
+        displayFlushing = true;
+        drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
+        displayFlushing = false;
     }
     // Idle: untouched for 2 min anywhere but the launcher -> back to the launcher
     if (launcherScreen && lv_scr_act() != launcherScreen &&

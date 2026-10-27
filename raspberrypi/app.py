@@ -55,6 +55,14 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 for d in (IMAGES_DIR, AUDIO_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# Device "last seen" times change on every TZT poll, so they live in a small file on tmpfs (RAM)
+# instead of data.json, which is fsync'd to the SD card. Lost on reboot, which is fine for last-seen.
+RUNTIME_DIR = Path(
+    os.environ.get("PRICK_N_PRINT_RUNTIME_DIR")
+    or ("/dev/shm" if os.path.isdir("/dev/shm") else BASE_DIR)
+)
+DEVICES_FILE = RUNTIME_DIR / "prick_n_print_devices.json"
+
 
 def require_api_key(fn):
     """Guards state-changing routes. ESP32 devices and the web UI send X-API-Key."""
@@ -103,7 +111,7 @@ def save_data(data):
         try:
             tmp = DATA_FILE.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, DATA_FILE)  # Atomic; unlike Path.rename(), also overwrites on Windows
@@ -114,7 +122,7 @@ def save_data(data):
 
 def get_data():
     data = load_data()
-    for key in ("commands", "audio", "images", "reminders", "config", "messages", "devices"):
+    for key in ("commands", "audio", "images", "reminders", "config", "messages"):
         if key not in data:
             data[key] = {} if key != "messages" else []
     return data
@@ -122,6 +130,48 @@ def get_data():
 
 def _base_url():
     return request.url_root.rstrip("/")
+
+
+def _now():
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def load_devices():
+    try:
+        with open(DEVICES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def touch_device(device_id, name):
+    devices = load_devices()
+    devices[device_id] = {"name": name, "last_seen": _now()}
+    tmp = DEVICES_FILE.with_suffix(f".{os.getpid()}.tmp")  # per-process: gunicorn workers write concurrently
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(devices, f)
+    os.replace(tmp, DEVICES_FILE)
+
+
+def _add_media(data, kind, url, name):
+    """Record an upload (kind: "audio" | "images") and queue a silent download command for it,
+    so the TZT fetches it on its next commands poll instead of polling /api/audio and /api/images.
+    The command shares the media id, so deleting the media can drop its pending download too."""
+    mid = str(uuid.uuid4())[:8]
+    now = _now()
+    data[kind][mid] = {"url": url, "name": name, "downloaded": False, "at": now}
+    data["commands"][mid] = {
+        "type": "download_audio" if kind == "audio" else "download_image",
+        "url": url, "name": name, "media_id": mid, "silent": True, "at": now,
+    }
+    return mid
+
+
+def _drop_download_commands(data, command_type):
+    data["commands"] = {
+        k: v for k, v in data["commands"].items()
+        if not (v.get("type") == command_type and v.get("media_id"))
+    }
 
 
 @app.after_request
@@ -173,8 +223,7 @@ def get_history():
     ]
     images = _sort_by_date(images)[:50]
     audio = _sort_by_date(audio)[:50]
-    devices = data.get("devices", {})
-    return jsonify({"messages": msgs, "images": images, "audio": audio, "devices": devices})
+    return jsonify({"messages": msgs, "images": images, "audio": audio, "devices": load_devices()})
 
 
 @app.route("/api/history/<hist_type>", methods=["DELETE"])
@@ -205,6 +254,7 @@ def delete_history(hist_type):
                     pass
         if data.get("images"):
             data["images"] = {}
+            _drop_download_commands(data, "download_image")
             changed = True
     if hist_type in ("audio", "all"):
         for v in list(data.get("audio", {}).values()):
@@ -216,6 +266,7 @@ def delete_history(hist_type):
                     pass
         if data.get("audio"):
             data["audio"] = {}
+            _drop_download_commands(data, "download_audio")
             changed = True
     if changed:
         save_data(data)
@@ -226,6 +277,10 @@ def delete_history(hist_type):
 @app.route("/api/commands", methods=["GET"])
 @require_api_key
 def get_commands():
+    # Devices send X-Device-Id on every poll, which doubles as their heartbeat
+    device_id = request.headers.get("X-Device-Id", "").strip()
+    if device_id:
+        touch_device(device_id, request.headers.get("X-Device-Name", "").strip() or device_id)
     data = get_data()
     return jsonify(data["commands"])
 
@@ -245,7 +300,7 @@ def post_command():
         return jsonify({"error": "JSON body required"}), 400
     items = body if isinstance(body, list) else [body]
     ids = []
-    now = datetime.utcnow().isoformat() + "Z"
+    now = _now()
     for item in items:
         if isinstance(item, str):
             try:
@@ -352,11 +407,7 @@ def post_audio():
                 safe = safe_upload_name(name, AUDIO_EXTENSIONS, name)
                 path = AUDIO_DIR / safe
                 path.write_bytes(raw)
-                url = f"{_base_url()}/uploads/audio/{safe}"
-                data["audio"][str(uuid.uuid4())[:8]] = {
-                    "url": url, "name": safe, "downloaded": False,
-                    "at": datetime.utcnow().isoformat() + "Z"
-                }
+                _add_media(data, "audio", f"{_base_url()}/uploads/audio/{safe}", safe)
                 save_data(data)
                 return jsonify({"id": "ok"}), 201
             return jsonify({"error": "file or JSON url/name required"}), 400
@@ -365,11 +416,7 @@ def post_audio():
         f.save(path)
         url = f"{_base_url()}/uploads/audio/{safe}"
         name = safe
-    cid = str(uuid.uuid4())[:8]
-    data["audio"][cid] = {
-        "url": url, "name": name, "downloaded": False,
-        "at": datetime.utcnow().isoformat() + "Z"
-    }
+    cid = _add_media(data, "audio", url, name)
     save_data(data)
     return jsonify({"id": cid}), 201
 
@@ -430,11 +477,7 @@ def post_image():
                 safe = safe_upload_name(name, IMAGE_EXTENSIONS, name)
                 path = IMAGES_DIR / safe
                 path.write_bytes(raw)
-                url = f"{_base_url()}/uploads/images/{safe}"
-                data["images"][str(uuid.uuid4())[:8]] = {
-                    "url": url, "name": safe, "downloaded": False,
-                    "at": datetime.utcnow().isoformat() + "Z"
-                }
+                _add_media(data, "images", f"{_base_url()}/uploads/images/{safe}", safe)
                 save_data(data)
                 return jsonify({"id": "ok"}), 201
             return jsonify({"error": "file or JSON url/name required"}), 400
@@ -443,11 +486,7 @@ def post_image():
         f.save(path)
         url = f"{_base_url()}/uploads/images/{safe}"
         name = safe
-    cid = str(uuid.uuid4())[:8]
-    data["images"][cid] = {
-        "url": url, "name": name, "downloaded": False,
-        "at": datetime.utcnow().isoformat() + "Z"
-    }
+    cid = _add_media(data, "images", url, name)
     save_data(data)
     return jsonify({"id": cid}), 201
 
@@ -479,6 +518,7 @@ def delete_image(cid):
         except OSError:
             pass
     del data["images"][cid]
+    data["commands"].pop(cid, None)  # not downloaded yet: drop its pending download command
     save_data(data)
     return "", 204
 
@@ -497,6 +537,7 @@ def delete_audio(cid):
         except OSError:
             pass
     del data["audio"][cid]
+    data["commands"].pop(cid, None)  # not downloaded yet: drop its pending download command
     save_data(data)
     return "", 204
 
@@ -505,24 +546,20 @@ def delete_audio(cid):
 @app.route("/api/devices", methods=["GET"])
 @require_api_key
 def get_devices():
-    return jsonify(get_data()["devices"])
+    return jsonify(load_devices())
 
 
 @app.route("/api/devices/heartbeat", methods=["POST"])
 @require_api_key
 def device_heartbeat():
-    """ESP32 can POST {"device_id": "tzt-display", "name": "TZT Display"} to show in web UI."""
+    """ESP32 can POST {"device_id": "tzt-display", "name": "TZT Display"} to show in web UI.
+    (The TZT doesn't need to: it sends X-Device-Id on every /api/commands poll.)"""
     body = request.get_json(force=True, silent=True) or {}
     device_id = body.get("device_id") or request.headers.get("X-Device-Id", "").strip()
     name = body.get("name") or device_id or "Unknown"
     if not device_id:
         return jsonify({"error": "device_id required"}), 400
-    data = get_data()
-    data["devices"][device_id] = {
-        "name": name,
-        "last_seen": datetime.utcnow().isoformat() + "Z",
-    }
-    save_data(data)
+    touch_device(device_id, name)
     return jsonify({"ok": True}), 200
 
 
@@ -573,7 +610,7 @@ def receive_message():
         return jsonify({"error": "No message provided"}), 400
     rec = get_data()
     cid = str(uuid.uuid4())[:8]
-    now = datetime.utcnow().isoformat() + "Z"
+    now = _now()
     rec["messages"].append({"id": cid, "text": msg, "source": "shortcut", "at": now})
     rec["messages"] = rec["messages"][-500:]
     # Also add as command for ESP32 (print)
@@ -593,13 +630,7 @@ def receive_image():
     path = IMAGES_DIR / safe
     f.save(path)
     data = get_data()
-    cid = str(uuid.uuid4())[:8]
-    data["images"][cid] = {
-        "url": f"{_base_url()}/uploads/images/{safe}",
-        "name": safe,
-        "downloaded": False,
-        "at": datetime.utcnow().isoformat() + "Z",
-    }
+    _add_media(data, "images", f"{_base_url()}/uploads/images/{safe}", safe)
     save_data(data)
     return jsonify({"status": "saved", "filename": safe}), 201
 
@@ -615,13 +646,7 @@ def receive_audio():
     path = AUDIO_DIR / safe
     f.save(path)
     data = get_data()
-    cid = str(uuid.uuid4())[:8]
-    data["audio"][cid] = {
-        "url": f"{_base_url()}/uploads/audio/{safe}",
-        "name": safe,
-        "downloaded": False,
-        "at": datetime.utcnow().isoformat() + "Z",
-    }
+    _add_media(data, "audio", f"{_base_url()}/uploads/audio/{safe}", safe)
     save_data(data)
     return jsonify({"status": "saved", "filename": safe}), 201
 

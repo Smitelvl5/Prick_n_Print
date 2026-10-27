@@ -2,6 +2,8 @@
 #define ESP_NOW_PROTOCOL_H
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
 
 // ============================================================================
 // ESP-NOW PROTOCOL DEFINITIONS
@@ -102,6 +104,36 @@ inline uint8_t calculateChecksum(uint8_t* data, size_t len) {
 inline bool verifyChecksum(uint8_t* data, size_t len) {
     uint8_t calculated = calculateChecksum(data, len);
     return calculated == data[len - 1];
+}
+
+// ---- Peer helpers (shared by Main and TZT) ----
+
+// False for an all-zero MAC (address not configured yet in config.h / config_tzt.h)
+inline bool espNowMacIsSet(const uint8_t* mac) {
+    for (int i = 0; i < 6; i++) if (mac[i] != 0) return true;
+    return false;
+}
+
+// Channel a peer must use: the STA's current WiFi channel, or `fallback` (ESP_NOW_CHANNEL) when offline
+inline uint8_t espNowPeerChannel(uint8_t fallback) {
+    return (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? (uint8_t)WiFi.channel() : fallback;
+}
+
+// Make sure `mac` is registered as an unencrypted STA peer on `channel`: no-op when it already is,
+// otherwise (missing, wrong channel or interface) it is (re)added. The struct is zeroed so ifidx etc.
+// are not garbage (fixes "Peer interface is invalid").
+inline esp_err_t espNowEnsurePeer(const uint8_t* mac, uint8_t channel) {
+    esp_now_peer_info_t peer;
+    if (esp_now_get_peer(mac, &peer) == ESP_OK) {
+        if (peer.channel == channel && peer.ifidx == WIFI_IF_STA) return ESP_OK;
+        esp_now_del_peer(mac);
+    }
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, mac, 6);
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = channel;
+    peer.encrypt = false;
+    return esp_now_add_peer(&peer);
 }
 
 // Human-readable name for a CMD_* constant, for logging (shared by Main and TZT

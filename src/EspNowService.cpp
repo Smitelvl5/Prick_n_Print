@@ -45,9 +45,7 @@ bool EspNowService::initialize(const uint8_t* peerMac) {
     }
     
     // Reject all-zero MAC (TZT_DISPLAY_MAC_ADDRESS not set in config.h)
-    bool macSet = false;
-    for (int i = 0; i < 6; i++) { if (peerMac[i] != 0) { macSet = true; break; } }
-    if (!macSet) {
+    if (!espNowMacIsSet(peerMac)) {
         Logger::error("ESP-NOW", "TZT_DISPLAY_MAC_ADDRESS not set (all zeros in config.h). Set it to the TZT MAC from its serial output (e.g. MAC: 6C:C8:40:55:85:98 -> {0x6C,0xC8,0x40,0x55,0x85,0x98}).");
         return false;
     }
@@ -79,47 +77,16 @@ bool EspNowService::initialize(const uint8_t* peerMac) {
     // Register receive callback (C-style function)
     esp_now_register_recv_cb(onDataRecvStatic);
     
-    // Remove peer if it already exists (in case of re-initialization)
-    esp_now_del_peer(peerMac);
-    delay(50);
-    
-    // Add peer: zero the struct so ifidx etc. are not garbage (fixes "Peer interface is invalid")
-    esp_now_peer_info_t peerInfo;
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    memcpy(peerInfo.peer_addr, peerMac, 6);
-    peerInfo.ifidx = WIFI_IF_STA;
-    // Use explicit WiFi channel (ESP-IDF example uses explicit channel, not 0)
-    // Get current WiFi channel, fallback to ESP_NOW_CHANNEL if not connected
-    uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-    peerInfo.channel = wifiChannel;
-    peerInfo.encrypt = false;
-    
-    esp_err_t addPeerResult = esp_now_add_peer(&peerInfo);
+    // Explicit channel (ESP-IDF example uses explicit channel, not 0): current WiFi channel, else ESP_NOW_CHANNEL
+    uint8_t peerChannel = espNowPeerChannel(ESP_NOW_CHANNEL);
+    esp_err_t addPeerResult = espNowEnsurePeer(peerMac, peerChannel);
     if (addPeerResult != ESP_OK) {
-        String errStr = "";
-        switch(addPeerResult) {
-            case ESP_ERR_ESPNOW_NOT_INIT: errStr = "NOT_INIT"; break;
-            case ESP_ERR_ESPNOW_ARG: errStr = "ARG"; break;
-            case ESP_ERR_ESPNOW_FULL: errStr = "FULL (peer list full)"; break;
-            case ESP_ERR_ESPNOW_NO_MEM: errStr = "NO_MEM"; break;
-            case ESP_ERR_ESPNOW_EXIST: errStr = "EXIST (peer already added)"; break;
-            default: errStr = "UNKNOWN(" + String((int)addPeerResult) + ")"; break;
-        }
-        Logger::error("ESP-NOW", "Failed to add peer: " + errStr + " (code=" + String((int)addPeerResult) + ")");
+        Logger::error("ESP-NOW", "Failed to add peer: " + String(esp_err_to_name(addPeerResult)));
         return false;
     }
-    
-    // Small delay for peer to be fully registered
-    delay(100);
-    
-    // Verify peer was added
-    if (!esp_now_is_peer_exist(peerMac)) {
-        Logger::error("ESP-NOW", "Peer added but esp_now_is_peer_exist() returns false!");
-        return false;
-    }
-    
+
     initialized = true;
-    Logger::info("ESP-NOW", "init OK. SSID: " + WiFi.SSID() + " WiFi.ch=" + String(WiFi.channel()) + " peer.ch=" + String(peerInfo.channel) + " (TZT must match)");
+    Logger::info("ESP-NOW", "init OK. SSID: " + WiFi.SSID() + " WiFi.ch=" + String(WiFi.channel()) + " peer.ch=" + String(peerChannel) + " (TZT must match)");
     Logger::info("ESP-NOW", "ESP-NOW initialized successfully");
     Logger::info("ESP-NOW", "Peer MAC: " + EspNowService::macToString(peerMac));
     uint8_t thisMac[6];
@@ -151,21 +118,10 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
             // Main sends this to TZT; ignore if we somehow receive it (loopback/stray)
             break;
         case ESP_NOW_MSG_COMMAND: {
-            // ESP-NOW can receive from devices not in peer list, but for reliable communication,
-            // we should ensure the sender is in our peer list (especially for ACKs/responses)
-            // Check if sender is in peer list, if not, add it
-            if (!esp_now_is_peer_exist(mac_addr)) {
-                esp_now_peer_info_t peerInfo;
-                memset(&peerInfo, 0, sizeof(peerInfo));
-                memcpy(peerInfo.peer_addr, mac_addr, 6);
-                peerInfo.ifidx = WIFI_IF_STA;
-                uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-                peerInfo.channel = wifiChannel;
-                peerInfo.encrypt = false;
-                
-                if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-                    Logger::warn("ESP-NOW", "Failed to add command sender to peer list");
-                }
+            // ESP-NOW can receive from devices not in peer list, but the sender must be a peer
+            // for our ACKs/responses to reach it
+            if (espNowEnsurePeer(mac_addr, espNowPeerChannel(ESP_NOW_CHANNEL)) != ESP_OK) {
+                Logger::warn("ESP-NOW", "Failed to add command sender to peer list");
             }
             
             if (len >= sizeof(CommandPacket)) {
@@ -228,21 +184,8 @@ bool EspNowService::sendSensorData() {
         if (millis() - lastPeerCheckFail > 10000) {  // Log every 10s max
             Logger::warn("ESP-NOW", "Peer not found, attempting to re-add...");
             lastPeerCheckFail = millis();
-            
-            // Try to re-add peer
-            esp_now_peer_info_t peerInfo;
-            memset(&peerInfo, 0, sizeof(peerInfo));
-            memcpy(peerInfo.peer_addr, peerMacAddress, 6);
-            peerInfo.ifidx = WIFI_IF_STA;
-            uint8_t wifiChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : (uint8_t)ESP_NOW_CHANNEL;
-            peerInfo.channel = wifiChannel;
-            peerInfo.encrypt = false;
-            
-            if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-                delay(50);
-                if (esp_now_is_peer_exist(peerMacAddress)) {
-                    Logger::info("ESP-NOW", "Peer re-added successfully");
-                }
+            if (espNowEnsurePeer(peerMacAddress, espNowPeerChannel(ESP_NOW_CHANNEL)) == ESP_OK) {
+                Logger::info("ESP-NOW", "Peer re-added successfully");
             }
         }
         return false;
@@ -277,19 +220,7 @@ bool EspNowService::sendSensorData() {
         dataDirty = false;
         return true;
     } else {
-        // Decode error code for better debugging
-        String errStr = "";
-        switch(result) {
-            case ESP_ERR_ESPNOW_NOT_INIT: errStr = "NOT_INIT"; break;
-            case ESP_ERR_ESPNOW_ARG: errStr = "ARG"; break;
-            case ESP_ERR_ESPNOW_INTERNAL: errStr = "INTERNAL"; break;
-            case ESP_ERR_ESPNOW_NO_MEM: errStr = "NO_MEM"; break;
-            case ESP_ERR_ESPNOW_NOT_FOUND: errStr = "NOT_FOUND (peer not added)"; break;
-            case ESP_ERR_ESPNOW_IF: errStr = "IF (interface mismatch)"; break;
-            // ESP_ERR_ESPNOW_CHAN may not be available in all Arduino ESP32 versions
-            default: errStr = "UNKNOWN(code=" + String((int)result) + ")"; break;
-        }
-        Logger::warn("ESP-NOW", "Failed to send sensor data: " + errStr + " (code=" + String((int)result) + ")");
+        Logger::warn("ESP-NOW", "Failed to send sensor data: " + String(esp_err_to_name(result)));
         return false;
     }
 }

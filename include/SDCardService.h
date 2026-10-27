@@ -48,6 +48,9 @@ public:
     // Image file helpers
     int  listImageFiles(String* outNames, int maxFiles);
 
+    // HTTP GET straight to `path` (no-op if it already exists); partial files are removed on failure
+    bool downloadToFile(const String& url, const String& path);
+
     // Data persistence (config, groceries, todos, reminders)
     bool readFile(const char* path, String& out);
     bool writeFile(const char* path, const String& content);

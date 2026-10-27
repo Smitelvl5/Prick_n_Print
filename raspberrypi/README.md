@@ -51,7 +51,7 @@ See **[IOS_SHORTCUTS.md](IOS_SHORTCUTS.md)** for step-by-step instructions to se
 
 - **Send** – Message, image, and audio upload
 - **History** – Messages (pending commands), images, and audio with **individual delete** per item
-- **Devices** – TZT Display appears when it polls (heartbeat every 2 min). Main ESP32 connects via TZT over ESP-NOW and does not appear here.
+- **Devices** – TZT Display appears when it polls for commands (each poll counts as a heartbeat; last-seen times are kept in RAM and reset when the Pi reboots). Main ESP32 connects via TZT over ESP-NOW and does not appear here.
 
 ### TZT Display connectivity
 

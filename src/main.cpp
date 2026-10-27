@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ESP32 Print-n-Prick - Hardware Controller (Main ESP32)
  * Receives commands from TZT via ESP-NOW; controls printer, pump, sensors, LED.
  * TZT runs web server and HTTP backend, and sends all commands here.
@@ -48,16 +48,24 @@ void cancelEspNowTest() { espNowTestType = 0; }
 // Auto-dispense: when true, IR sensor triggers pump; when false, only manual/ESP-NOW commands do
 static bool autoDispenseEnabled = true;
 
-// Chunked print reassembly (CMD_PRINT_CHUNK) - in scope for loop() sensor pause
+// Print state shared between the ESP-NOW receive callback (WiFi task) and loop() (other core).
+// Fixed buffers instead of Strings (no reallocation while the other side reads), and every access
+// outside the "ready" hand-off below is guarded by printStateMux.
+static portMUX_TYPE printStateMux = portMUX_INITIALIZER_UNLOCKED;
+#define PRINT_MSG_BYTES sizeof(((CommandPacket*)nullptr)->message)
+
+// Chunked print reassembly (CMD_PRINT_CHUNK) - in scope for loop() sensor pause.
+// Once pendingChunkPrintReady is set the callback leaves the buffers alone until loop() has printed them.
 #define PRINT_CHUNK_MAX 64
-static String printChunkParts[PRINT_CHUNK_MAX];
+static char printChunkData[PRINT_CHUNK_MAX][PRINT_MSG_BYTES];  // ~12.8 KB
+static uint8_t printChunkLen[PRINT_CHUNK_MAX];
 static bool printChunkReceived[PRINT_CHUNK_MAX];
-static uint8_t printChunkTotal = 0;
+static volatile uint8_t printChunkTotal = 0;
 static bool printChunkMessageOnly = false; // true = from web (message only); false = from Shortcut (full receipt)
 static unsigned long sensorPauseUntil = 0;  // Pause sensor sends during chunked print; resume after this time
-static unsigned long lastChunkTime = 0;     // Timeout: abort chunked print if no chunk for 15s
-static bool pendingChunkPrintReady = false; // All chunks received; do print from loop after ACK queue drains
-static unsigned long lastChunkPrintDone = 0; // When we last completed a chunked print (ignore duplicate chunks for 3s)
+static volatile unsigned long lastChunkTime = 0;     // Timeout: abort chunked print if no chunk for 15s
+static volatile bool pendingChunkPrintReady = false; // All chunks received; do print from loop after ACK queue drains
+static volatile unsigned long lastChunkPrintDone = 0; // When we last completed a chunked print (ignore duplicate chunks for 3s)
 #define CHUNK_PRINT_COOLDOWN_MS 3000       // Ignore PRINT_CHUNK_START / PRINT_CHUNK(idx==0) within this window after print
 static String lastPrintedChunkMessage;     // Dedupe: skip if TZT retries send same message (ESP-NOW retries)
 static unsigned long lastPrintedChunkTime = 0;
@@ -66,20 +74,42 @@ static unsigned long lastPrintedChunkTime = 0;
 // Deferred simple (non-chunked) print / printer test: CMD_PRINT and CMD_TEST_PRINTER arrive on the
 // ESP-NOW receive callback (WiFi task). Printing + the weather HTTP fetch can block for seconds, so - like
 // chunked printing already does - the actual work is deferred to loop() and only a flag/message is set here.
-static String pendingSimplePrintMessage;
-static bool pendingSimplePrintReady = false;
-static bool pendingSimpleTestPrintReady = false;
+static char pendingSimplePrintBuf[PRINT_MSG_BYTES + 1];
+static volatile bool pendingSimplePrintReady = false;
+static volatile bool pendingSimpleTestPrintReady = false;
 
-// Bounded String construction from CommandPacket::message: the 200-byte buffer isn't guaranteed to be
-// null-terminated, so String(cmd->message) alone can read past the packet (strlen scans until it finds
-// a zero byte, which may be beyond the received data). This copies at most `cap` bytes and terminates.
-static String boundedMessageString(const char* buf, size_t cap) {
-    size_t len = strnlen(buf, cap);
-    char tmp[201];
-    if (len > sizeof(tmp) - 1) len = sizeof(tmp) - 1;
-    memcpy(tmp, buf, len);
-    tmp[len] = '\0';
-    return String(tmp);
+// Caller holds printStateMux
+static void resetChunkState() {
+    memset(printChunkReceived, 0, sizeof(printChunkReceived));
+    printChunkTotal = 0;
+    printChunkMessageOnly = false;
+    lastChunkTime = 0;
+}
+
+// Bounded copy of CommandPacket::message: the 200-byte buffer isn't guaranteed to be null-terminated,
+// so strlen() alone can read past the packet. Returns the copied length (out holds no terminator).
+static size_t copyCommandMessage(char* out, const CommandPacket* cmd) {
+    size_t len = strnlen(cmd->message, PRINT_MSG_BYTES);
+    memcpy(out, cmd->message, len);
+    return len;
+}
+
+// Cached for WEATHER_CACHE_MS: each fetch is a TLS handshake (1-3 s, ~40 KB heap) and weather barely changes
+#define WEATHER_CACHE_MS (15UL * 60UL * 1000UL)
+static String cachedWeatherLine;
+static unsigned long cachedWeatherAt = 0;
+
+static String wifiStatusName(int status) {
+    switch (status) {
+        case WL_IDLE_STATUS: return "IDLE";
+        case WL_NO_SSID_AVAIL: return "NO_SSID_AVAIL";
+        case WL_SCAN_COMPLETED: return "SCAN_COMPLETED";
+        case WL_CONNECTED: return "CONNECTED";
+        case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+        case WL_DISCONNECTED: return "DISCONNECTED";
+        default: return "UNKNOWN(" + String(status) + ")";
+    }
 }
 
 // Function declarations
@@ -233,18 +263,7 @@ void loop() {
         
         // Log WiFi status changes for debugging
         if (wifiStatus != lastWiFiStatus) {
-            String statusStr = "";
-            switch(wifiStatus) {
-                case WL_IDLE_STATUS: statusStr = "IDLE"; break;
-                case WL_NO_SSID_AVAIL: statusStr = "NO_SSID_AVAIL"; break;
-                case WL_SCAN_COMPLETED: statusStr = "SCAN_COMPLETED"; break;
-                case WL_CONNECTED: statusStr = "CONNECTED"; break;
-                case WL_CONNECT_FAILED: statusStr = "CONNECT_FAILED"; break;
-                case WL_CONNECTION_LOST: statusStr = "CONNECTION_LOST"; break;
-                case WL_DISCONNECTED: statusStr = "DISCONNECTED"; break;
-                default: statusStr = "UNKNOWN(" + String(wifiStatus) + ")"; break;
-            }
-            Logger::info("Main", "WiFi Status: " + statusStr + " | LED: " + String(wifiConnected ? "ON" : "OFF"));
+            Logger::info("Main", "WiFi Status: " + wifiStatusName(wifiStatus) + " | LED: " + String(wifiConnected ? "ON" : "OFF"));
             lastWiFiStatus = wifiStatus;
         }
 #if (BOARD_LED_PIN >= 0)
@@ -282,32 +301,33 @@ void loop() {
             espNowInitTime = millis();
         }
         // Timeout: if chunked print started but no chunk received for 15s, abort and resume sensor
-        if (printChunkTotal > 0 && lastChunkTime > 0 && (millis() - lastChunkTime) > 15000) {
-            for (int i = 0; i < PRINT_CHUNK_MAX; i++) {
-                printChunkReceived[i] = false;
-                printChunkParts[i] = "";
+        bool chunkTimedOut = false;
+        if (printChunkTotal > 0 && !pendingChunkPrintReady) {
+            portENTER_CRITICAL(&printStateMux);
+            if (printChunkTotal > 0 && !pendingChunkPrintReady && lastChunkTime > 0 && (millis() - lastChunkTime) > 15000) {
+                resetChunkState();
+                chunkTimedOut = true;
             }
-            printChunkTotal = 0;
-            printChunkMessageOnly = false;
-            lastChunkTime = 0;
-            pendingChunkPrintReady = false;
+            portEXIT_CRITICAL(&printStateMux);
+        }
+        if (chunkTimedOut) {
             sensorPauseUntil = millis() + 500;
         }
         // Deferred print: all chunks received; drain ACK queue from loop then print (never block in recv callback)
         else if (pendingChunkPrintReady && espNowService && !espNowService->hasPendingChunkAck()) {
-            pendingChunkPrintReady = false;
-            String full;
-            for (uint8_t i = 0; i < printChunkTotal; i++) full += printChunkParts[i];
+            // Callback doesn't touch the buffers while pendingChunkPrintReady is set, so no lock to read them
             uint8_t nChunks = printChunkTotal;
-            bool messageOnly = printChunkMessageOnly;  // Use before reset
-            for (int i = 0; i < PRINT_CHUNK_MAX; i++) {
-                printChunkReceived[i] = false;
-                printChunkParts[i] = "";
-            }
-            printChunkTotal = 0;
-            printChunkMessageOnly = false;
-            lastChunkTime = 0;
+            bool messageOnly = printChunkMessageOnly;
+            String full;
+            size_t totalLen = 0;
+            for (uint8_t i = 0; i < nChunks; i++) totalLen += printChunkLen[i];
+            full.reserve(totalLen);
+            for (uint8_t i = 0; i < nChunks; i++) full.concat(printChunkData[i], printChunkLen[i]);
+            portENTER_CRITICAL(&printStateMux);
+            resetChunkState();
             lastChunkPrintDone = millis();  // Cooldown: ignore duplicate chunks for CHUNK_PRINT_COOLDOWN_MS
+            pendingChunkPrintReady = false;
+            portEXIT_CRITICAL(&printStateMux);
             sensorPauseUntil = millis() + 500;
             // Dedupe: TZT retries on ESP-NOW fail can arrive late; skip same message within 45s
             bool isDuplicate = (full.length() > 0 && full == lastPrintedChunkMessage
@@ -325,7 +345,7 @@ void loop() {
                     printerService->setWeather(getWeatherOneLine());
                     printerService->printReceipt(full, true, time(nullptr));
                 }
-                Serial.println("âœ… Printed (" + String(nChunks) + " chunks)");
+                Serial.println("✅ Printed (" + String(nChunks) + " chunks)");
             }
         }
         // Drain CHUNK_ACK queue (never send from callback = no NO_MEM). One ACK per 40ms so prints never stall.
@@ -374,9 +394,12 @@ void loop() {
     // Deferred simple print / printer test (see CMD_PRINT / CMD_TEST_PRINTER in handleEspNowCommand):
     // runs here in loop() instead of the ESP-NOW recv callback, which must never block for seconds.
     if (pendingSimplePrintReady && hardware && printerService) {
+        char msg[sizeof(pendingSimplePrintBuf)];
+        portENTER_CRITICAL(&printStateMux);
+        memcpy(msg, pendingSimplePrintBuf, sizeof(msg));
         pendingSimplePrintReady = false;
-        String full = pendingSimplePrintMessage;
-        pendingSimplePrintMessage = "";
+        portEXIT_CRITICAL(&printStateMux);
+        String full(msg);
         if (full.length() > 0) {
             if (isPreformattedPrint(full)) {
                 printerService->printPreformatted(full, getWeatherOneLine());
@@ -436,22 +459,11 @@ void setupWiFi() {
     Logger::info("WiFi", "Final WiFi status code: " + String(finalStatus));
     
     if (!res) {
-        Logger::error("WiFi", "âŒ Failed to connect to WiFi");
-        String statusStr = "";
-        switch(finalStatus) {
-            case WL_IDLE_STATUS: statusStr = "IDLE"; break;
-            case WL_NO_SSID_AVAIL: statusStr = "NO_SSID_AVAIL"; break;
-            case WL_SCAN_COMPLETED: statusStr = "SCAN_COMPLETED"; break;
-            case WL_CONNECTED: statusStr = "CONNECTED"; break;
-            case WL_CONNECT_FAILED: statusStr = "CONNECT_FAILED"; break;
-            case WL_CONNECTION_LOST: statusStr = "CONNECTION_LOST"; break;
-            case WL_DISCONNECTED: statusStr = "DISCONNECTED"; break;
-            default: statusStr = "UNKNOWN(" + String(finalStatus) + ")"; break;
-        }
-        Logger::error("WiFi", "WiFi status: " + statusStr);
+        Logger::error("WiFi", "❌ Failed to connect to WiFi");
+        Logger::error("WiFi", "WiFi status: " + wifiStatusName(finalStatus));
     } else {
         deviceIP = WiFi.localIP().toString();
-        Logger::info("WiFi", "âœ… Connected successfully!");
+        Logger::info("WiFi", "✅ Connected successfully!");
         Logger::info("WiFi", "IP Address: " + deviceIP);
         Logger::info("WiFi", "RSSI: " + String(WiFi.RSSI()) + " dBm");
         Logger::info("WiFi", "SSID: " + String(WiFi.SSID()));
@@ -481,7 +493,19 @@ static String weatherToPrinterSafe(const String& s) {
 
 // One receipt row (48 chars) for user-sent messages only (not reminder/grocery)
 #define WEATHER_ROW_MAX 48
+static String fetchWeatherOneLine();
 static String getWeatherOneLine() {
+    if (cachedWeatherLine.length() > 0 && millis() - cachedWeatherAt < WEATHER_CACHE_MS)
+        return cachedWeatherLine;
+    String line = fetchWeatherOneLine();
+    if (line.length() > 0) {  // failures aren't cached, so the next print tries again
+        cachedWeatherLine = line;
+        cachedWeatherAt = millis();
+    }
+    return line;
+}
+
+static String fetchWeatherOneLine() {
     if (WiFi.status() != WL_CONNECTED) return "";
     WiFiClientSecure client;
     client.setInsecure();
@@ -576,21 +600,25 @@ void handleEspNowCommand(CommandPacket* cmd) {
         case CMD_PRINT: {
             if (!cmd->message[0]) break;
             // Defer actual printing (+ weather HTTP fetch) to loop() - never block the ESP-NOW recv callback.
-            pendingSimplePrintMessage = boundedMessageString(cmd->message, sizeof(cmd->message));
+            portENTER_CRITICAL(&printStateMux);
+            size_t len = copyCommandMessage(pendingSimplePrintBuf, cmd);
+            pendingSimplePrintBuf[len] = '\0';
             pendingSimplePrintReady = true;
+            portEXIT_CRITICAL(&printStateMux);
             break;
         }
         case CMD_PRINT_CHUNK_START: {
             if (millis() - lastChunkPrintDone < CHUNK_PRINT_COOLDOWN_MS) break; // Ignore duplicate session (TZT resend)
             uint8_t total = cmd->param2;
             if (total == 0 || total > PRINT_CHUNK_MAX) break;
-            printChunkMessageOnly = (cmd->param1 != 0);  // param1: 0 = full receipt, 1 = message only (from web)
-            for (int i = 0; i < PRINT_CHUNK_MAX; i++) {
-                printChunkReceived[i] = false;
-                printChunkParts[i] = "";
+            portENTER_CRITICAL(&printStateMux);
+            if (!pendingChunkPrintReady) {  // previous message still waiting to print: leave it alone
+                resetChunkState();
+                printChunkMessageOnly = (cmd->param1 != 0);  // param1: 0 = full receipt, 1 = message only (from web)
+                printChunkTotal = total;
+                lastChunkTime = millis();
             }
-            printChunkTotal = total;
-            lastChunkTime = millis();
+            portEXIT_CRITICAL(&printStateMux);
             break;
         }
         case CMD_PRINT_CHUNK: {
@@ -599,42 +627,45 @@ void handleEspNowCommand(CommandPacket* cmd) {
             if (total == 0 || total > PRINT_CHUNK_MAX) break;
             if (idx >= total) break;
             if (idx == 0 && (millis() - lastChunkPrintDone < CHUNK_PRINT_COOLDOWN_MS)) break; // Ignore duplicate chunk 0 (TZT resend)
-            if (idx == 0) {
-                for (int i = 0; i < PRINT_CHUNK_MAX; i++) {
-                    printChunkReceived[i] = false;
-                    printChunkParts[i] = "";
+            portENTER_CRITICAL(&printStateMux);
+            if (!pendingChunkPrintReady) {
+                if (idx == 0) {
+                    bool messageOnly = printChunkMessageOnly;  // set by PRINT_CHUNK_START
+                    resetChunkState();
+                    printChunkMessageOnly = messageOnly;
+                    printChunkTotal = total;
                 }
-                printChunkTotal = total;
+                if (idx < printChunkTotal) {
+                    lastChunkTime = millis();
+                    printChunkLen[idx] = (uint8_t)copyCommandMessage(printChunkData[idx], cmd);
+                    printChunkReceived[idx] = true;
+                    bool haveAll = true;
+                    for (uint8_t i = 0; i < printChunkTotal; i++) {
+                        if (!printChunkReceived[i]) { haveAll = false; break; }
+                    }
+                    // Defer print to main loop so we drain CHUNK_ACK queue there (no blocking/send in recv callback)
+                    if (haveAll) pendingChunkPrintReady = true;
+                }
             }
-            lastChunkTime = millis();
-            printChunkParts[idx] = boundedMessageString(cmd->message, sizeof(cmd->message));
-            printChunkReceived[idx] = true;
-            bool haveAll = true;
-            for (uint8_t i = 0; i < printChunkTotal; i++) {
-                if (!printChunkReceived[i]) { haveAll = false; break; }
-            }
-            if (haveAll && printChunkTotal > 0) {
-                // Defer print to main loop so we drain CHUNK_ACK queue there (no blocking/send in recv callback)
-                pendingChunkPrintReady = true;
-            }
+            portEXIT_CRITICAL(&printStateMux);
             break;
         }
         case CMD_DISPENSE_START:
             if (!hardware->isPumpRunning()) {
                 hardware->startPump();
-                Serial.println("âœ… Executed: DISPENSE_START (pump on)");
+                Serial.println("✅ Executed: DISPENSE_START (pump on)");
             }
             break;
         case CMD_DISPENSE_STOP:
             if (hardware->isPumpRunning()) {
                 hardware->stopPump();
-                Serial.println("âœ… Executed: DISPENSE_STOP (pump off)");
+                Serial.println("✅ Executed: DISPENSE_STOP (pump off)");
             }
             break;
         case CMD_RESET_SANITIZER:
             if (hardware->getSanitizerLevel() < 99.0f) {
                 hardware->resetSanitizer();
-                Serial.println("âœ… Executed: RESET_SANITIZER");
+                Serial.println("✅ Executed: RESET_SANITIZER");
             }
             break;
         case CMD_SET_LED_BRIGHTNESS:
@@ -672,7 +703,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             espNowTestStartMs = millis();
             espNowTestDurationMs = TEST_PUMP_DURATION_MS;
             hardware->startPump();
-            Serial.println("âœ… Executed: TEST_PUMP (pump on for " + String(TEST_PUMP_DURATION_MS) + "ms, non-blocking)");
+            Serial.println("✅ Executed: TEST_PUMP (pump on for " + String(TEST_PUMP_DURATION_MS) + "ms, non-blocking)");
             break;
         case CMD_TEST_LED:
             if (testServer) testServer->cancelActiveTest();
@@ -680,25 +711,25 @@ void handleEspNowCommand(CommandPacket* cmd) {
             espNowTestStartMs = millis();
             espNowTestDurationMs = TEST_LED_DURATION_MS;
             hardware->setLEDBrightness(255);
-            Serial.println("âœ… Executed: TEST_LED (LED on for " + String(TEST_LED_DURATION_MS) + "ms, non-blocking)");
+            Serial.println("✅ Executed: TEST_LED (LED on for " + String(TEST_LED_DURATION_MS) + "ms, non-blocking)");
             break;
         case CMD_SET_PUMP_DURATION: {
-            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = duration in 100ms units (0â€“25.5s)
+            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = duration in 100ms units (0–25.5s)
             unsigned long cur = hardware->getMaxDispenseDurationMs();
             unsigned long effectiveCur = (cur > 0) ? cur : MAX_DISPENSE_DURATION_MS;
             if (effectiveCur != ms) {
                 hardware->setMaxDispenseDurationMs(ms);
-                Serial.println("âœ… Executed: SET_PUMP_DURATION=" + String(ms) + "ms");
+                Serial.println("✅ Executed: SET_PUMP_DURATION=" + String(ms) + "ms");
             }
             break;
         }
         case CMD_SET_PUMP_COOLDOWN: {
-            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = cooldown in 100ms units (0â€“25.5s)
+            unsigned long ms = (unsigned long)cmd->param1 * 100;  // param1 = cooldown in 100ms units (0–25.5s)
             unsigned long cur = hardware->getDispenseCooldownMs();
             unsigned long effectiveCur = (cur > 0) ? cur : DISPENSE_COOLDOWN_MS;
             if (effectiveCur != ms) {
                 hardware->setDispenseCooldownMs(ms);
-                Serial.println("âœ… Executed: SET_PUMP_COOLDOWN=" + String(ms) + "ms");
+                Serial.println("✅ Executed: SET_PUMP_COOLDOWN=" + String(ms) + "ms");
             }
             break;
         }
@@ -706,7 +737,7 @@ void handleEspNowCommand(CommandPacket* cmd) {
             bool wantOn = (cmd->param1 != 0);
             if (autoDispenseEnabled != wantOn) {
                 autoDispenseEnabled = wantOn;
-                Serial.println("âœ… Executed: SET_AUTO_DISPENSE=" + String(autoDispenseEnabled ? 1 : 0));
+                Serial.println("✅ Executed: SET_AUTO_DISPENSE=" + String(autoDispenseEnabled ? 1 : 0));
             }
             break;
         }

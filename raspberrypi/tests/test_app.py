@@ -25,6 +25,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "LOCK_FILE", tmp_path / "data.json.lock")
     monkeypatch.setattr(app_module, "IMAGES_DIR", tmp_path / "images")
     monkeypatch.setattr(app_module, "AUDIO_DIR", tmp_path / "audio")
+    monkeypatch.setattr(app_module, "DEVICES_FILE", tmp_path / "devices.json")
     (tmp_path / "images").mkdir()
     (tmp_path / "audio").mkdir()
     app_module.app.config["TESTING"] = True
@@ -219,3 +220,41 @@ def test_device_heartbeat_round_trip(client):
     body = r.get_json()
     assert "tzt-display" in body
     assert body["tzt-display"]["name"] == "TZT"
+
+
+def test_commands_poll_marks_device_seen(client):
+    r = client.get("/api/commands", headers={**AUTH, "X-Device-Id": "tzt-display", "X-Device-Name": "TZT Display"})
+    assert r.status_code == 200
+
+    body = client.get("/api/devices", headers=AUTH).get_json()
+    assert body["tzt-display"]["name"] == "TZT Display"
+    assert body["tzt-display"]["last_seen"]
+
+
+def test_image_upload_queues_silent_download_command(client):
+    r = client.post(
+        "/api/images",
+        data={"file": (io.BytesIO(b"\xff\xd8jpeg"), "cat.jpg")},
+        content_type="multipart/form-data",
+        headers=AUTH,
+    )
+    assert r.status_code == 201
+    mid = r.get_json()["id"]
+
+    cmds = client.get("/api/commands", headers=AUTH).get_json()
+    assert cmds[mid]["type"] == "download_image"
+    assert cmds[mid]["media_id"] == mid
+    assert cmds[mid]["silent"] is True
+    assert cmds[mid]["url"].endswith("/uploads/images/cat.jpg")
+
+
+def test_deleting_media_drops_pending_download_command(client):
+    r = client.post(
+        "/api/audio",
+        data={"file": (io.BytesIO(b"ID3"), "hi.mp3")},
+        content_type="multipart/form-data",
+        headers=AUTH,
+    )
+    mid = r.get_json()["id"]
+    assert client.delete(f"/api/audio/{mid}", headers=AUTH).status_code == 204
+    assert mid not in client.get("/api/commands", headers=AUTH).get_json()

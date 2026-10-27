@@ -18,7 +18,8 @@ public:
     virtual bool pollCommands(DynamicJsonDocument& commands) = 0;
 
     virtual void setRetryPolicy(int count, int delayMs) { (void)count; (void)delayMs; }
-    virtual void setRateLimit(int requestsPerMinute) { (void)requestsPerMinute; }
+    /** Optional: identify this device on every request so the server can track "last seen". */
+    virtual void setDeviceIdentity(const String& id, const String& name) { (void)id; (void)name; }
     virtual bool loadConfig(DynamicJsonDocument& doc) { (void)doc; return false; }
     virtual bool saveConfig(const DynamicJsonDocument& doc) { (void)doc; return false; }
     virtual bool isHealthy() = 0;

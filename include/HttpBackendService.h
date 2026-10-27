@@ -20,10 +20,10 @@ private:
     int retryCount;
     int retryDelay;
     unsigned long lastRequest;
-    unsigned long rateLimitWindow;
-    int initialRequestsAllowed;
+    String deviceId;
+    String deviceName;
 
-    bool isRateLimited();
+    bool beginRequest(HTTPClient& http, const String& url);
     bool executeRequest(HTTPClient& http, const String& method, const String& payload = "");
     String pathToApiPath(const String& path, bool isGet);
 
@@ -32,7 +32,7 @@ public:
     ~HttpBackendService() override;
 
     void setRetryPolicy(int count, int delayMs) override;
-    void setRateLimit(int requestsPerMinute) override;
+    void setDeviceIdentity(const String& id, const String& name) override;
 
     bool get(const String& path, String& response) override;
     bool put(const String& path, const String& data) override;

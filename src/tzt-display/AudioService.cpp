@@ -1,7 +1,6 @@
 #include "AudioService.h"
 #include "SDCardService.h"
 #include <SD.h>
-#include <HTTPClient.h>
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
@@ -91,40 +90,4 @@ void AudioService::loop() {
     if (usingMp3 && mp3Gen) running = mp3Gen->loop();
     else if (wavGen)        running = wavGen->loop();
     if (!running) stop();
-}
-
-bool AudioService::downloadToSD(const String& url, const String& filename) {
-    if (!SD.exists(AUDIO_DIR)) SD.mkdir(AUDIO_DIR);
-
-    String path = String(AUDIO_DIR) + "/" + filename;
-    if (SD.exists(path)) return true;
-
-    HTTPClient http;
-    http.begin(url);
-    http.setTimeout(15000);
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        Serial.println("[Audio] HTTP " + String(code));
-        http.end();
-        return false;
-    }
-
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) {
-        Serial.println("[Audio] Cannot create file: " + path);
-        http.end();
-        return false;
-    }
-
-    WiFiClient* stream = http.getStreamPtr();
-    uint8_t buf[1024];
-    int total = 0;
-    while (http.connected() && stream->available()) {
-        int n = stream->readBytes(buf, sizeof(buf));
-        if (n > 0) { f.write(buf, n); total += n; }
-    }
-    f.close();
-    http.end();
-    // Saved to SD
-    return total > 0;
 }

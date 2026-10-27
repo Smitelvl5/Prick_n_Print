@@ -4,7 +4,7 @@ const char* HttpBackendService::TAG = "HttpBackend";
 
 HttpBackendService::HttpBackendService(const String& url, int timeoutMs, const String& key)
     : baseUrl(url), apiKey(key), timeout(timeoutMs), retryCount(1), retryDelay(500),
-      lastRequest(0), rateLimitWindow(2000), initialRequestsAllowed(5) {
+      lastRequest(0) {
     // Ensure baseUrl has no trailing slash
     while (baseUrl.length() > 0 && baseUrl.endsWith("/"))
         baseUrl.remove(baseUrl.length() - 1);
@@ -18,20 +18,27 @@ void HttpBackendService::setRetryPolicy(int count, int delayMs) {
     retryDelay = delayMs;
 }
 
-void HttpBackendService::setRateLimit(int requestsPerMinute) {
-    unsigned long w = (unsigned long)(60000 / (requestsPerMinute > 0 ? requestsPerMinute : 1));
-    rateLimitWindow = (w < 2000) ? 2000 : w;
+void HttpBackendService::setDeviceIdentity(const String& id, const String& name) {
+    deviceId = id;
+    deviceName = name;
 }
 
-bool HttpBackendService::isRateLimited() {
-    if (initialRequestsAllowed > 0) {
-        initialRequestsAllowed--;
+// Common setup for every request. Connect timeout matters most: with the Pi down, the default 5 s
+// connect wait per attempt is what stalls the TZT's LVGL/touch loop.
+bool HttpBackendService::beginRequest(HTTPClient& http, const String& url) {
+    if (!http.begin(url)) {
+        lastError = "Connection failed";
         return false;
     }
-    unsigned long now = millis();
-    // Caller skips this cycle and retries on its own next poll tick rather than
-    // blocking here, since blocking stalls the TZT's LVGL/touch loop.
-    return (now - lastRequest < rateLimitWindow);
+    http.setConnectTimeout(timeout);
+    http.setTimeout(timeout);
+    http.addHeader("X-API-Key", apiKey);
+    // Lets the server mark this device as seen on every poll (no separate heartbeat request)
+    if (deviceId.length() > 0) {
+        http.addHeader("X-Device-Id", deviceId);
+        http.addHeader("X-Device-Name", deviceName);
+    }
+    return true;
 }
 
 bool HttpBackendService::executeRequest(HTTPClient& http, const String& method, const String& payload) {
@@ -86,17 +93,13 @@ String HttpBackendService::pathToApiPath(const String& path, bool isGet) {
 }
 
 bool HttpBackendService::get(const String& path, String& response) {
-    if (isRateLimited()) return false;
     String apiPath = pathToApiPath(path, true);
     if (apiPath.length() == 0) {
         lastError = "Unknown path";
         return false;
     }
     HTTPClient http;
-    String url = baseUrl + apiPath;
-    http.begin(url);
-    http.addHeader("X-API-Key", apiKey);
-    http.setTimeout(timeout);
+    if (!beginRequest(http, baseUrl + apiPath)) return false;
     if (executeRequest(http, "GET")) {
         response = http.getString();
         http.end();
@@ -107,7 +110,6 @@ bool HttpBackendService::get(const String& path, String& response) {
 }
 
 bool HttpBackendService::put(const String& path, const String& data) {
-    if (isRateLimited()) return false;
     String apiPath = pathToApiPath(path, false);
     if (apiPath.length() == 0) {
         lastError = "Unknown path";
@@ -119,18 +121,14 @@ bool HttpBackendService::put(const String& path, const String& data) {
         payload = "{\"downloaded\":true}";
     }
     HTTPClient http;
-    String url = baseUrl + apiPath;
-    http.begin(url);
+    if (!beginRequest(http, baseUrl + apiPath)) return false;
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-API-Key", apiKey);
-    http.setTimeout(timeout);
     bool ok = executeRequest(http, "PUT", payload);
     http.end();
     return ok;
 }
 
 bool HttpBackendService::deleteData(const String& path) {
-    if (isRateLimited()) return false;
     if (!path.startsWith("/commands/") || !path.endsWith(".json")) {
         lastError = "Unknown path";
         return false;
@@ -138,13 +136,8 @@ bool HttpBackendService::deleteData(const String& path) {
     String id = path.substring(9, path.length() - 5);
     String url = baseUrl + "/api/commands/" + id;
     HTTPClient http;
-    http.setTimeout(timeout);
     for (int redirects = 0; redirects < 3; redirects++) {
-        if (!http.begin(url)) {
-            lastError = "Connection failed";
-            return false;
-        }
-        http.addHeader("X-API-Key", apiKey);
+        if (!beginRequest(http, url)) return false;
         int httpCode = -1;
         for (int attempt = 0; attempt < retryCount; attempt++) {
             if (attempt > 0) delay(retryDelay);
@@ -211,8 +204,7 @@ bool HttpBackendService::saveConfig(const DynamicJsonDocument& doc) {
 
 bool HttpBackendService::isHealthy() {
     HTTPClient http;
-    http.begin(baseUrl + "/api/health");
-    http.setTimeout(timeout);
+    if (!beginRequest(http, baseUrl + "/api/health")) return false;
     bool ok = (http.GET() == HTTP_CODE_OK);
     http.end();
     return ok;
@@ -220,10 +212,8 @@ bool HttpBackendService::isHealthy() {
 
 bool HttpBackendService::sendHeartbeat(const String& deviceId, const String& name) {
     HTTPClient http;
-    http.begin(baseUrl + "/api/devices/heartbeat");
+    if (!beginRequest(http, baseUrl + "/api/devices/heartbeat")) return false;
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-API-Key", apiKey);
-    http.setTimeout(timeout);
     String body = "{\"device_id\":\"" + deviceId + "\",\"name\":\"" + name + "\"}";
     int code = http.POST(body);
     http.end();
