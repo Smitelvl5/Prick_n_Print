@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  firmware-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [esp32-wroom-32, tzt-esp32-devkit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+          key: pio-${{ matrix.env }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Provide dummy secrets.h
+        run: cp include/secrets.h.example include/secrets.h
+      - name: Build (${{ matrix.env }})
+        run: pio run -e ${{ matrix.env }}
+
+  backend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: raspberrypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r tests/requirements.txt ruff
+      - name: Lint
+        run: ruff check app.py tests/
+      - name: Test
+        run: pytest tests/ -v
+        env:
+          PRICK_N_PRINT_API_KEY: ci-test-key
