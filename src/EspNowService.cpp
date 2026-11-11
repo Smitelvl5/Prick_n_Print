@@ -118,6 +118,17 @@ void EspNowService::onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int
             // Main sends this to TZT; ignore if we somehow receive it (loopback/stray)
             break;
         case ESP_NOW_MSG_COMMAND: {
+            // Only the TZT may command this board. ESP-NOW delivers frames from any nearby device,
+            // and the packet format is no secret, so without this anyone in radio range could run
+            // the pump, print, or restart it. (A MAC can be spoofed; this stops casual misuse.)
+            if (memcmp(mac_addr, peerMacAddress, 6) != 0) {
+                static unsigned long lastWarn = 0;
+                if (millis() - lastWarn > 60000) {
+                    lastWarn = millis();
+                    Logger::warn("ESP-NOW", "Ignored command from unknown device " + macToString(mac_addr));
+                }
+                break;
+            }
             // ESP-NOW can receive from devices not in peer list, but the sender must be a peer
             // for our ACKs/responses to reach it
             if (espNowEnsurePeer(mac_addr, espNowPeerChannel(ESP_NOW_CHANNEL)) != ESP_OK) {

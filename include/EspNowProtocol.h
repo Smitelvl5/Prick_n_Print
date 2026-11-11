@@ -34,6 +34,14 @@
 #define CMD_SET_LED_SCHEDULE_TIME   0x0E  // param1 = 0 on-time, 1 off-time; param2 = quarter-hour of day (0-95, e.g. 67 = 4:45 PM)
 #define CMD_PRINT_CHUNK             0x0F  // param1 = chunk index (0-based), param2 = total chunks; message = chunk payload; Main reassembles and prints
 #define CMD_PRINT_CHUNK_START       0x10  // param2 = total chunks; TZT sends this first so Main pauses sensor before chunk 0
+// Chunked print limits, shared by both boards: Main reassembles at most this many chunks (anything
+// longer is dropped unprinted), so the TZT never sends more. The Pi rejects longer messages up front
+// (PRINT_MAX_BYTES in raspberrypi/app.py = these two multiplied).
+#define PRINT_MAX_CHUNKS            64
+#define PRINT_CHUNK_BYTES           199   // CommandPacket.message minus its terminating NUL
+#define CMD_LED_NOTIFY              0x11  // param1 = number of slow LED flashes (new message/sound/picture on the TZT)
+#define CMD_RESTART                 0x12  // reboot Main (TZT Settings "Restart" restarts both boards)
+#define CMD_SET_MOISTURE_SENSOR     0x13  // param1 = 1 on, 0 off (off: not read, reported as -1, left off receipts)
 
 // Sensor data packet (Main ESP32 → TZT Display)
 // Total size: ~32 bytes
@@ -41,7 +49,7 @@
 struct SensorDataPacket {
     uint8_t msgType;           // ESP_NOW_MSG_SENSOR_DATA
     uint32_t timestamp;        // millis() from main ESP32
-    float moisturePercent;     // 0-100
+    float moisturePercent;     // 0-100; -1 = moisture sensor switched off
     float sanitizerLevel;      // 0-100
     bool irDetected;           // true/false
     uint16_t ledOnMinute;      // LED schedule on-time, minutes since local midnight
@@ -51,7 +59,7 @@ struct SensorDataPacket {
     bool isDispensing;         // true/false
     bool pumpRunning;          // true/false
     uint8_t sequenceNumber;    // For detecting lost packets
-    bool autoDispense;         // true = IR sensor controls pump
+    bool autoDispense;         // true = IR sensor controls pump (TZT Settings > Sensors > IR hand sensor)
     bool ledSchedule;          // true = night schedule controls LED
     uint8_t checksum;          // Simple checksum for data integrity
 };
@@ -156,6 +164,9 @@ inline const char* espNowCommandName(uint8_t cmd) {
         case CMD_SET_PUMP_COOLDOWN: return "SET_PUMP_COOLDOWN";
         case CMD_SET_AUTO_DISPENSE: return "SET_AUTO_DISPENSE";
         case CMD_SET_LED_SCHEDULE_TIME: return "SET_LED_SCHEDULE_TIME";
+        case CMD_LED_NOTIFY: return "LED_NOTIFY";
+        case CMD_RESTART: return "RESTART";
+        case CMD_SET_MOISTURE_SENSOR: return "SET_MOISTURE_SENSOR";
         default: return "CMD_?";
     }
 }

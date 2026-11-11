@@ -34,7 +34,7 @@ The system is built on **two ESP32 modules** connected over ESP-NOW:
 |---|---|---|
 | **Role** | Hardware controller | Brain / UI / cloud |
 | **PlatformIO env** | `esp32-wroom-32` | `tzt-esp32-devkit` |
-| **Serial port** | COM3 (CP210x) | COM7 (CH340) |
+| **Serial port** | COM3 (CH340C on the main PCB) | COM7 (CH340) |
 | **Controls** | Printer, pump, LED, sensors | 2.4" TFT + touch, web server, HTTP backend, SD card, speaker |
 | **Network** | WiFi (for ESP-NOW channel sync) | WiFi + HTTP backend + HTTP server (port 8080) |
 | **Config file** | `include/config.h` | `include/config_tzt.h` |
@@ -146,29 +146,36 @@ Password: `your-web-password` (set via `WEB_PASSWORD` in `secrets.h`)
 
 ### Main ESP32 (WROOM-32)
 
+The Main ESP32 lives on a custom PCB (see [Main PCB](#main-pcb)) that replaces the old ESP32 DevKit, its breakout board and the separate LM2596 PSU board. The firmware pin map is unchanged.
+
 #### Pin Map
 
 | GPIO | Function | Direction | Component |
 |------|----------|-----------|-----------|
-| 2 | Onboard LED | Output | Status indicator |
-| 16 | Serial RX2 | Input | Thermal printer RX |
-| 17 | Serial TX2 | Output | Thermal printer TX |
-| 26 | Pump control | Output | IRF520 MOSFET gate |
-| 27 | LED PWM | Output | 12 V LED via MOSFET |
-| 32 | IR sensor | Input | Motion detection |
-| 34 | Moisture sensor | ADC Input | Capacitive moisture probe |
-| 35 | Light sensor | ADC Input | LM393 analog output |
+| 2 | Status LED | Output | On-board LED D42 (active HIGH) |
+| 16 | Serial RX2 | Input | Thermal printer data (J11), 1 k + clamp diode |
+| 17 | Serial TX2 | Output | Thermal printer data (J11), 100 Ω series |
+| 26 | Pump control | Output | AO3400A low-side MOSFET (J63) |
+| 27 | LED PWM | Output | AO3400A low-side MOSFET, 12 V LED (J60) |
+| 32 | IR sensor | Input | J12, 1 k + clamp to 3.3 V (sensor runs on 5 V) |
+| 34 | Moisture sensor | ADC Input | J13, 1 k + 100 nF filter |
+| 35 | Light sensor | ADC Input | J14, 1 k + 100 nF filter |
 
-> GPIO 34 and 35 are input-only pins (no internal pull-ups). GPIO 16/17 are used for the thermal printer's Serial2 UART.
+> GPIO 34 and 35 are input-only pins (no internal pull-ups). GPIO 16/17 are used for the thermal printer's Serial2 UART. GPIO 4, 13, 14, 18, 19, 21, 22, 23, 25 and 33 are spare and broken out on the J20 expansion header.
 
 #### Components
 
-- **Thermal Printer** -- QR204, 9 V, 9600 baud, Serial2
-- **Sanitizer Pump** -- CJWP08 micro diaphragm, 3.3 V, via IRF520 MOSFET
-- **12 V LED** -- 5 W, PWM dimming via IRF520 MOSFET, software ramp (1 V/s)
-- **IR Sensor** -- Digital output, active LOW = detected
-- **Moisture Sensor** -- Analog 0-4095 mapped to 0-100%
-- **Light Sensor** -- LM393, analog output, potentiometer for sensitivity tuning
+| Device | Supply | Connector | Notes |
+|---|---|---|---|
+| **Thermal Printer** -- QR204 | 9 V (5-9 V), ~2 A peak | J61 power, J11 data | 9600 baud, Serial2. The firmware never reads from the printer, so leave the printer's TX wire (J11 pin 3) unconnected; on RS-232 models it swings negative. |
+| **Sanitizer Pump** -- CJWP08 micro diaphragm | **3.3 V** | J63 | Voltage set by solder jumper JP1: bridge **1-2 for 3.3 V** (2-3 = 5 V would overdrive a 3.3 V pump). JP1 ships open. |
+| **12 V LED** -- 5 W | 12 V, ~0.42 A | J60 | PWM dimming, software ramp (1 V/s), 1.1 A PTC |
+| **IR Sensor** | **5 V** | J12 | Digital, active LOW = detected. Fed through its own 0.2 A PTC (F52); its output is clamped to 3.3 V before GPIO32 |
+| **Moisture Sensor** -- capacitive | 3.3 V | J13 | Analog 0-4095 mapped to 0-100% |
+| **Light Sensor** -- LM393 module | 3.3 V | J14 | Analog output, potentiometer for sensitivity tuning |
+| **TZT Display** (CYD) | 5 V | J62 | 1.1 A PTC |
+
+The moisture and light sensors share a 0.2 A PTC (F50) on 3.3 V, so their outputs can never exceed the ESP32's 3.3 V input limit.
 
 ### TZT Display ESP32 (CYD -- Cheap Yellow Display)
 
@@ -448,6 +455,10 @@ Prick_n_Print/
 │   ├── app.py                # Flask backend (commands, audio, images, reminders)
 │   ├── setup.sh              # Pi install script (Tailscale, nginx, ufw, systemd)
 │   └── tests/                # pytest suite for app.py
+├── PCB/
+│   ├── prick_n_print_main.kicad_pro  # KiCad 10 project for the Main board (net classes, rules)
+│   ├── prick_n_print_main.kicad_sch  # Schematic
+│   └── prick_n_print_main.kicad_pcb  # Routed 2-layer layout (open via the .kicad_pro)
 ├── scripts/
 │   ├── copy_tft_user_setup.py  # Pre-build script: copies User_Setup.h into TFT_eSPI library
 │   ├── ota_upload_auth.py      # OTA upload auth helper (esp32-*-ota envs)
@@ -521,9 +532,9 @@ Main uses `build_src_filter = +<*> -<tzt-display/>`; TZT uses `-<*> +<tzt-displa
 
 1. Use a **data-capable** USB cable (not charge-only)
 2. Install the correct USB-serial driver:
-   - CP210x: [Silicon Labs](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)
-   - CH340: [WCH](https://www.wch.cn/downloads/CH341SER_EXE.html)
-3. Hold **BOOT**, press **RESET**, release BOOT, then upload
+   - CH340 (Main PCB and TZT): [WCH](https://www.wch.cn/downloads/CH341SER_EXE.html)
+   - CP210x (old ESP32 DevKit only): [Silicon Labs](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)
+3. On the Main PCB, use the **programming** USB-C port (J10), not the PD power port (J1). Auto-reset normally handles flashing; if it doesn't, hold **BOOT**, press **RESET**, release BOOT, then upload
 4. Run `pio device list` to check port; update `upload_port` in `platformio.ini`
 
 ### WiFi AP not appearing
@@ -549,21 +560,64 @@ This means ESP-NOW between TZT and Main is not working:
 
 ---
 
-## Power
+## Main PCB
 
-### Power Rails
+The KiCad project in [`PCB/`](PCB/) is a single 160 × 110 mm, 2-layer board that combines the Main ESP32 (ESP32-WROOM-32E), its USB programmer and the power supply. Open `PCB/prick_n_print_main.kicad_pro` (not the `.kicad_pcb` directly) so the project's design rules and net classes load.
 
-| Rail | Voltage | Load | Current |
-|------|---------|------|---------|
-| 3.3 V | 3.3 V | Pump + moisture/light sensors | ~520 mA peak |
-| 5 V | 5 V | Main ESP32 + IR sensor + TZT display | ~620 mA peak |
-| 9 V | 9 V | Thermal printer | ~1 A printing |
-| 12 V | 12 V | 5 W LED | ~417 mA |
+### Connectors
 
-**Total peak: ~19 W output / ~24 W input (80% efficiency)**
+| Ref | Connector | Pins / voltage |
+|---|---|---|
+| J1 | USB-C (power only) | **20 V USB-C PD input** |
+| J10 | USB-C | Programming / serial (CH340C, 5 V only, auto-reset) |
+| J11 | JST-XH 3-pin | Printer data: 1 GND, 2 printer RXD (from GPIO17), 3 printer TXD (to GPIO16, leave unconnected) |
+| J12 | JST-XH 3-pin | IR sensor: 1 **5 V**, 2 GND, 3 OUT |
+| J13 | JST-XH 3-pin | Moisture: 1 3.3 V, 2 GND, 3 OUT |
+| J14 | JST-XH 3-pin | Light: 1 3.3 V, 2 GND, 3 OUT |
+| J20 | 2×7 header | Expansion: 3.3 V, 5 V, GND, spare GPIOs |
+| J60 | Screw terminal | LED: 1 +12 V, 2 LED − (switched) |
+| J61 | Screw terminal | Printer power: 1 +9 V, 2 GND |
+| J62 | Screw terminal | TZT display: 1 +5 V, 2 GND |
+| J63 | Screw terminal | Pump: 1 + (3.3 V/5 V via JP1), 2 pump − (switched) |
+| JP1 | Solder jumper | Pump voltage: **1-2 = 3.3 V** (CJWP08), 2-3 = 5 V |
 
-A **30 W USB-C power supply** is recommended. A 20 W supply is insufficient when the printer, LED, and pump are active simultaneously.
+### Power architecture
 
-### LM2596 Multi-Channel PSU
+```
+USB-C PD (J1) ─ F1 3.15 A fuse ─ TVS ─ CH224A asks for 20 V
+                                          │ (power-good)
+                                Soft-start P-MOSFET switch ─ +20 V
+                                          ├─ LM2596-ADJ → 11.9 V → LED (J60)
+                                          ├─ LM2596-ADJ → 8.9 V  → 2.5 A PTC → printer (J61)
+                                          └─ LM2596-5   → 5 V  → TZT (J62), IR sensor (J12),
+                                                                 ESP32 3.3 V LDO, pump 3.3 V LDO
+```
 
-Provides 3.3 V, 5 V, 9 V, and 12 V from the USB-C input. Each rail has two screw terminals.
+- The CH224A negotiates **20 V** (120 kΩ on CFG1). A charger that can't supply 20 V never gives "power good", so every rail stays off rather than running the converters in dropout.
+- The ESP32 is diode-ORed between the 5 V rail and the programming port (J10), so you can flash it with the PD supply unplugged.
+
+### Power budget
+
+| Rail | Load | Current |
+|------|------|---------|
+| 12 V | 5 W LED | ~0.42 A |
+| 9 V | QR204 printer | ~2 A peak while printing |
+| 5 V | TZT display, IR sensor, ESP32 (via LDO), pump (via 3.3 V LDO) | ~1.4 A peak |
+| 3.3 V (sensors) | Moisture + light sensors | < 50 mA |
+
+**Worst case ≈ 30 W output / ≈ 35 W from the charger.**
+
+Use a **USB-C PD charger that offers 20 V at ≥ 2.25 A (45 W or more; 65 W is ideal)** and a normal 3 A USB-C cable. A 30 W charger only supplies 1.5 A at 20 V and will brown out when the printer, LED and pump run together.
+
+### Electrical safety
+
+- 20 V DC only (SELV). There is no mains voltage on the board.
+- F1 is a 3.15 A slow-blow fuse on the input, backed by a TVS diode on the input and on the 5 V rail.
+- Every off-board output except the printer has its own resettable PTC fuse: LED and TZT 1.1 A, IR sensor 0.2 A, other sensors 0.2 A. The printer's 9 V output is current-limited by its LM2596.
+- The programming port has USB ESD protection (USBLC6) and plain 5.1 k CC resistors, so a PD charger plugged into J10 stays at 5 V.
+
+### Before first power-up
+
+1. Bridge JP1 pads **1-2** (3.3 V pump).
+2. Power J1 with nothing connected and measure the J60/J61/J62 outputs: 12 V, about 9 V and 5 V.
+3. Connect the loads one at a time, printer last.

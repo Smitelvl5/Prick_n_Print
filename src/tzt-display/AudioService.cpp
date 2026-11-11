@@ -5,17 +5,21 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
 #include <AudioOutputI2S.h>
+#include <AudioFileSourcePROGMEM.h>
+#include <AudioGeneratorRTTTL.h>
 
 static AudioFileSourceSD*   audioSrc = nullptr;
 static AudioOutputI2S*      audioOut = nullptr;
 static AudioGeneratorMP3*   mp3Gen   = nullptr;
 static AudioGeneratorWAV*   wavGen   = nullptr;
 static bool                 usingMp3 = false;
+static AudioFileSourcePROGMEM* tuneSrc = nullptr;
+static AudioGeneratorRTTTL*    tuneGen = nullptr;
 
 bool AudioService::begin() {
     if (initialized) return true;
     audioOut = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
-    volume = 0.5f;
+    volume = 0.25f;
     audioOut->SetGain(volume);
     initialized = true;
     return true;
@@ -65,9 +69,35 @@ bool AudioService::playFile(const String& sdPath) {
     return ok;
 }
 
+bool AudioService::playTune(const char* rtttl) {
+    if (!initialized || !rtttl) return false;
+    stop();
+    tuneSrc = new AudioFileSourcePROGMEM(rtttl, strlen(rtttl));
+    tuneGen = new AudioGeneratorRTTTL();
+    if (!tuneGen->begin(tuneSrc, audioOut)) {
+        delete tuneGen; tuneGen = nullptr;
+        delete tuneSrc; tuneSrc = nullptr;
+        return false;
+    }
+    playing = true;
+    playingTune = true;
+    nowPlaying = "";
+    return true;
+}
+
 void AudioService::stop() {
     playing = false;
+    playingTune = false;
     nowPlaying = "";
+    if (tuneGen) {
+        if (tuneGen->isRunning()) tuneGen->stop();
+        delete tuneGen;
+        tuneGen = nullptr;
+    }
+    if (tuneSrc) {
+        delete tuneSrc;
+        tuneSrc = nullptr;
+    }
     if (mp3Gen) {
         if (mp3Gen->isRunning()) mp3Gen->stop();
         delete mp3Gen;
@@ -87,7 +117,8 @@ void AudioService::stop() {
 void AudioService::loop() {
     if (!playing) return;
     bool running = false;
-    if (usingMp3 && mp3Gen) running = mp3Gen->loop();
+    if (tuneGen) running = tuneGen->loop();
+    else if (usingMp3 && mp3Gen) running = mp3Gen->loop();
     else if (wavGen)        running = wavGen->loop();
     if (!running) stop();
 }

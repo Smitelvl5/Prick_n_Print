@@ -12,6 +12,7 @@ static const unsigned long TEST_LED_DURATION_MS = 1000;
 // Defined in main.cpp: cancels the ESP-NOW-driven test-pulse timer so it
 // doesn't also try to shut off the actuator this server just started testing.
 void cancelEspNowTest();
+void saveAutoDispense();  // main.cpp: keeps the IR auto-dispense flag in NVS
 
 TestServer::TestServer(HardwareAbstraction* hw, PrinterService* printer, bool* autoDispense, EspNowService* espNow)
     : server_(8081), hardware_(hw), printerService_(printer), autoDispenseEnabled_(autoDispense), espNow_(espNow) {
@@ -183,6 +184,7 @@ void TestServer::handleSetAutoDispense() {
     if (!autoDispenseEnabled_) { sendError(503, "auto-dispense state not available"); return; }
     if (!server_.hasArg("enabled")) { sendError(400, "enabled must be 0 or 1"); return; }
     *autoDispenseEnabled_ = server_.arg("enabled").toInt() != 0;
+    saveAutoDispense();
     sendOk("\"autoDispense\":" + String(*autoDispenseEnabled_ ? "true" : "false"));
 }
 

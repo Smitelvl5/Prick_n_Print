@@ -1,4 +1,5 @@
 #include "HardwareAbstraction.h"
+#include <esp_timer.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <time.h>
@@ -17,15 +18,20 @@ static const char* LED_NVS_ON = "on";
 static const char* LED_NVS_OFF = "off";
 static const char* LED_NVS_LEVEL = "level";
 
+// NVS namespace shared with main.cpp (which keeps the IR auto-dispense flag under "ir")
+static const char* SENSORS_NVS_NS = "sensors";
+static const char* SENSORS_NVS_MOIST = "moist";
+
 HardwareAbstraction::HardwareAbstraction() 
     : printerSerial(nullptr), pumpState(false),
-      moisturePercent(0.0), irDetected(false),
+      moisturePercent(0.0), moistureEnabled(true), irDetected(false),
       ledBrightness(0), ledScheduleEnabled(true), ledOnMinute(LED_SCHEDULE_ON_MINUTE),
       ledOffMinute(LED_SCHEDULE_OFF_MINUTE), ledScheduleLastWindow(-1), ledLevelPct(LED_DEFAULT_LEVEL_PCT),
       sanitizerLevel(0.0), totalDispenses(0), lastDispenseTime(0), dispenseStartTime(0),
       dispensing(false),
       maxDispenseDurationMs_(0), dispenseCooldownMs_(0),
-      rampActive(false), rampStartPWM(0), rampTargetPWM(0), currentPWM(0), rampStartTime(0) {
+      rampActive(false), rampStartPWM(0), rampTargetPWM(0), currentPWM(0), rampStartTime(0),
+      notifyFlashPhasesLeft(0), notifyFlashNextMs(0) {
 }
 
 HardwareAbstraction::~HardwareAbstraction() {
@@ -57,6 +63,16 @@ bool HardwareAbstraction::initialize() {
     Logger::info(TAG, "LED schedule: " + String(ledScheduleEnabled ? "on " : "off ") +
                  formatMinute(ledOnMinute) + " - " + formatMinute(ledOffMinute) + ", level " + String(ledLevelPct) + "%");
     
+    // Moisture sensor on/off (TZT Settings > Sensors)
+    {
+        Preferences prefs;
+        if (prefs.begin(SENSORS_NVS_NS, true)) {
+            moistureEnabled = prefs.getBool(SENSORS_NVS_MOIST, true);
+            prefs.end();
+        }
+        if (!moistureEnabled) Logger::info(TAG, "Moisture sensor switched off");
+    }
+
     // Read initial sensor values
     readMoistureSensor();
     readIRSensor();
@@ -132,6 +148,16 @@ bool HardwareAbstraction::initializePrinter() {
 }
 
 
+// esp_timer task context: only the GPIO write and a timestamp, no logging or allocation
+void HardwareAbstraction::pumpTimerCb(void* arg) {
+    digitalWrite(SANITIZER_PUMP_PIN, LOW);
+    static_cast<HardwareAbstraction*>(arg)->pumpCutAtMs_ = millis();
+}
+
+unsigned long HardwareAbstraction::dispenseLimitMs() const {
+    return (maxDispenseDurationMs_ > 0) ? maxDispenseDurationMs_ : MAX_DISPENSE_DURATION_MS;
+}
+
 bool HardwareAbstraction::startPump() {
     Logger::debug(TAG, "startPump() called - Current state: dispensing=" + String(dispensing) + ", pumpState=" + String(pumpState));
     
@@ -168,12 +194,28 @@ bool HardwareAbstraction::startPump() {
         Logger::info(TAG, "✅ GPIO " + String(SANITIZER_PUMP_PIN) + " confirmed HIGH (MOSFET should be switching)");
     } else {
         Logger::error(TAG, "❌ GPIO " + String(SANITIZER_PUMP_PIN) + " state inconsistent after retry! Read: " + String(pinState1) + ", " + String(pinState2) + " - pump not started");
+        digitalWrite(SANITIZER_PUMP_PIN, LOW);  // "not started" must mean off: nothing would stop it later
         return false;
     }
 
     pumpState = true;
     dispensing = true;
     dispenseStartTime = millis();
+    pumpCutAtMs_ = 0;
+    if (!pumpTimer_) {
+        esp_timer_create_args_t args = {};
+        args.callback = &HardwareAbstraction::pumpTimerCb;
+        args.arg = this;
+        args.name = "pumpCut";
+        esp_timer_handle_t t = nullptr;
+        if (esp_timer_create(&args, &t) == ESP_OK) pumpTimer_ = t;
+    }
+    if (pumpTimer_) {
+        esp_timer_stop((esp_timer_handle_t)pumpTimer_);
+        esp_timer_start_once((esp_timer_handle_t)pumpTimer_, (uint64_t)dispenseLimitMs() * 1000ULL);
+    } else {
+        Logger::error(TAG, "Pump cut-off timer unavailable: relying on loop() timeout only");
+    }
 
     Logger::info(TAG, "✅ Pump started - GPIO " + String(SANITIZER_PUMP_PIN) + " = HIGH");
     return true;
@@ -190,6 +232,7 @@ bool HardwareAbstraction::stopPump() {
         return false;
     }
     
+    if (pumpTimer_) esp_timer_stop((esp_timer_handle_t)pumpTimer_);
     Logger::debug(TAG, "Setting GPIO " + String(SANITIZER_PUMP_PIN) + " to LOW");
     digitalWrite(SANITIZER_PUMP_PIN, LOW);
     delay(2);  // Minimal settle for GPIO/MOSFET (sensor→actuator priority)
@@ -226,7 +269,10 @@ bool HardwareAbstraction::stopPump() {
 
     if (verifiedOff) {
         totalDispenses++;
-        unsigned long duration = lastDispenseTime - dispenseStartTime;
+        // If the timer cut it, it ran until then, not until this (possibly much later) call
+        unsigned long endMs = pumpCutAtMs_ ? pumpCutAtMs_ : lastDispenseTime;
+        pumpCutAtMs_ = 0;
+        unsigned long duration = endMs - dispenseStartTime;
         float usedMl = (duration / 1000.0f) * PUMP_FLOW_ML_PER_SEC;
         updateSanitizerLevel(usedMl / SANITIZER_CAPACITY_ML * 100.0f);
         saveSanitizerState();
@@ -243,8 +289,7 @@ unsigned long HardwareAbstraction::getDispenseDuration() const {
 
 bool HardwareAbstraction::checkDispenseTimeout() {
     if (!dispensing) return false;
-    unsigned long limit = (maxDispenseDurationMs_ > 0) ? maxDispenseDurationMs_ : MAX_DISPENSE_DURATION_MS;
-    if (getDispenseDuration() >= limit) {
+    if (pumpCutAtMs_ || getDispenseDuration() >= dispenseLimitMs()) {
         stopPump();
         return true;
     }
@@ -265,7 +310,23 @@ void HardwareAbstraction::setDispenseCooldownMs(unsigned long ms) {
     dispenseCooldownMs_ = ms;
 }
 
+void HardwareAbstraction::setMoistureEnabled(bool on) {
+    if (on == moistureEnabled) return;
+    moistureEnabled = on;
+    Preferences prefs;
+    if (prefs.begin(SENSORS_NVS_NS, false)) {
+        prefs.putBool(SENSORS_NVS_MOIST, on);
+        prefs.end();
+    }
+    readMoistureSensor();  // report the new state right away
+    Logger::info(TAG, String("Moisture sensor ") + (on ? "on" : "off"));
+}
+
 float HardwareAbstraction::readMoistureSensor() {
+    if (!moistureEnabled) {
+        moisturePercent = -1;
+        return moisturePercent;
+    }
     int rawValue = analogRead(MOISTURE_SENSOR_PIN);
     moisturePercent = 100.0 - ((float)rawValue * 100.0 / 4095.0);
     
@@ -402,8 +463,33 @@ void HardwareAbstraction::setLEDBrightness(uint8_t brightness) {
     Logger::debug(TAG, "LED ramp started: " + String(currentPWM) + " -> " + String(targetPWM) + " PWM (1V/s)");
 }
 
+// "Something new on the TZT" blink: slow on/off cycles written straight to the pin (the 1 V/s ramp
+// would smear a flash into a fade), then the LED goes back to exactly what it was showing.
+#define NOTIFY_FLASH_PHASE_MS 600
+#define NOTIFY_FLASH_MIN_PWM  128   // visible even when the night level is only a few percent
+
+void HardwareAbstraction::startNotifyFlash(uint8_t count) {
+    if (count == 0) return;
+    if (count > 10) count = 10;
+    notifyFlashPhasesLeft = count * 2;
+    notifyFlashNextMs = millis();
+}
+
+void HardwareAbstraction::updateNotifyFlash() {
+    if (notifyFlashPhasesLeft == 0 || (long)(millis() - notifyFlashNextMs) < 0) return;
+    notifyFlashPhasesLeft--;
+    notifyFlashNextMs = millis() + NOTIFY_FLASH_PHASE_MS;
+    if (notifyFlashPhasesLeft == 0) {
+        ledcWrite(LED_PWM_CHANNEL, currentPWM);  // restore (a ramp paused meanwhile resumes from here)
+        return;
+    }
+    uint8_t onPwm = getLedOnPwm();
+    if (onPwm < NOTIFY_FLASH_MIN_PWM) onPwm = NOTIFY_FLASH_MIN_PWM;
+    ledcWrite(LED_PWM_CHANNEL, (notifyFlashPhasesLeft % 2) ? onPwm : 0);
+}
+
 void HardwareAbstraction::updateLEDRamp() {
-    if (!rampActive) return;
+    if (!rampActive || notifyFlashPhasesLeft) return;
     
     // Calculate voltage difference
     float startVoltage = (rampStartPWM / 255.0) * LED_MAX_VOLTAGE;

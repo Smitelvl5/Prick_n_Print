@@ -1,0 +1,15 @@
+(version 1)
+
+# The 1 uF VIN decoupling caps (C12/C22/C32) sit directly below pin 1 of each LM2596,
+# inside the generous TO-263 courtyard but clear of the flat pin leads. This is
+# intentional: it gives the shortest VIN -> GND-tab loop.
+(rule "LM2596 VIN caps inside regulator courtyard"
+	(constraint courtyard_clearance)
+	(condition "A.Reference == 'C12' || A.Reference == 'C22' || A.Reference == 'C32' || B.Reference == 'C12' || B.Reference == 'C22' || B.Reference == 'C32'")
+	(severity ignore))
+
+# Their silk line touches the regulator's pin-1 triangle (cosmetic only).
+(rule "LM2596 VIN cap silk vs pin-1 marker"
+	(constraint silk_clearance)
+	(condition "A.memberOfFootprint('C22') || A.memberOfFootprint('C32') || B.memberOfFootprint('C22') || B.memberOfFootprint('C32')")
+	(severity ignore))

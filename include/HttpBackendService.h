@@ -22,9 +22,19 @@ private:
     unsigned long lastRequest;
     String deviceId;
     String deviceName;
+    int pollWaitS = 0;  // > 0: pollCommands() long-polls (server holds the request until a command arrives)
+    String pollAck;     // handled command ids, sent with the next poll (the server deletes them)
+    String pollSkip;    // received but unreadable command ids (the server deletes them, marks them failed)
+    WiFiClient* pollConn = nullptr;  // kept alive between long polls: one TLS handshake, not one per poll
+    HTTPClient* pollHttp = nullptr;  // long-lived too: ~HTTPClient() closes its connection
 
-    bool beginRequest(HTTPClient& http, const String& url);
+    bool beginRequest(HTTPClient& http, const String& url, WiFiClient* conn = nullptr);
+    void ensureKeptAlive();   // creates pollHttp/pollConn
+    void dropKeptAlive();     // after a failed request: the next one reconnects
+    // The HTTPClient to use for a request: the kept-alive one in long-poll mode, else `fresh`
+    HTTPClient& clientFor(HTTPClient& fresh, const String& url, bool& ok);
     bool executeRequest(HTTPClient& http, const String& method, const String& payload = "");
+    String failureText(int httpCode);  // error text for a failed request, with TLS + RAM detail
     String pathToApiPath(const String& path, bool isGet);
 
 public:
@@ -33,6 +43,19 @@ public:
 
     void setRetryPolicy(int count, int delayMs) override;
     void setDeviceIdentity(const String& id, const String& name) override;
+    // Long poll: blocks up to waitS seconds, so only call pollCommands() off the UI loop when set
+    void setPollWait(int waitS) { pollWaitS = waitS; }
+    // Comma-separated ids handled since the last poll; replaces DELETE /commands/<id> per command
+    void setPollAck(const String& ids) { pollAck = ids; }
+    void setPollSkip(const String& ids) { pollSkip = ids; }
+    // pollCommands() without the parse: the body as received, and the Pi's X-Command-Id header (the
+    // command's id even when the body can't be parsed, so it can be skipped instead of jamming the queue)
+    bool pollCommandsRaw(String& body, String& commandId);
+    // GET baseUrl + path into `out` (e.g. a file on the SD card); false unless the whole body arrived.
+    // In long-poll mode get(), put() and download() reuse the poll's open connection: the ESP32 has
+    // no RAM for a second TLS session while it's open, and reusing it skips a ~6 s handshake. So only
+    // call them while pollCommands() isn't running (for the TZT: between polls, while loop() has the batch).
+    bool download(const String& path, Stream& out);
 
     bool get(const String& path, String& response) override;
     bool put(const String& path, const String& data) override;

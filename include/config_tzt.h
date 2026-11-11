@@ -94,11 +94,11 @@
 // Same LAN: use Pi's local IP e.g. "http://192.168.1.146:5000" (Flask) or "http://192.168.1.146" (nginx)
 // Include :5000 if running Flask directly; omit if nginx proxies port 80.
 #ifndef BACKEND_URL
-#define BACKEND_URL "http://192.168.1.185:5000"
+#define BACKEND_URL "https://dhara.tailf6c4f5.ts.net"   // Pi via Tailscale Funnel -> nginx :80 (works off the home LAN)
 #endif
-// Connect + read timeout per request (ms). The Pi is on the LAN, so a short one keeps an
-// unreachable Pi from freezing the TZT screen while the loop waits on HTTP.
-#define BACKEND_TIMEOUT 3000
+// Connect + read timeout per request (ms). Short enough that an unreachable Pi doesn't freeze the
+// TZT screen while the loop waits on HTTP, long enough for a TLS handshake over the internet.
+#define BACKEND_TIMEOUT 5000
 
 // Time Settings (Central Time Zone - Tennessee)
 #define NTP_SERVER "pool.ntp.org"

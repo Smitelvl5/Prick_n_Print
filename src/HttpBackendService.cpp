@@ -1,4 +1,6 @@
 #include "HttpBackendService.h"
+#include "BackendTls.h"
+#include <WiFiClientSecure.h>
 
 const char* HttpBackendService::TAG = "HttpBackend";
 
@@ -11,6 +13,8 @@ HttpBackendService::HttpBackendService(const String& url, int timeoutMs, const S
 }
 
 HttpBackendService::~HttpBackendService() {
+    delete pollHttp;
+    delete pollConn;
 }
 
 void HttpBackendService::setRetryPolicy(int count, int delayMs) {
@@ -25,8 +29,9 @@ void HttpBackendService::setDeviceIdentity(const String& id, const String& name)
 
 // Common setup for every request. Connect timeout matters most: with the Pi down, the default 5 s
 // connect wait per attempt is what stalls the TZT's LVGL/touch loop.
-bool HttpBackendService::beginRequest(HTTPClient& http, const String& url) {
-    if (!http.begin(url)) {
+// conn: a caller-owned connection to reuse (keep-alive); otherwise HTTPClient opens its own.
+bool HttpBackendService::beginRequest(HTTPClient& http, const String& url, WiFiClient* conn) {
+    if (conn ? !http.begin(*conn, url) : !beginBackendHttp(http, url)) {
         lastError = "Connection failed";
         return false;
     }
@@ -63,22 +68,71 @@ bool HttpBackendService::executeRequest(HTTPClient& http, const String& method, 
             return false;
         }
     }
-    lastError = "HTTP " + String(httpCode);
+    lastError = failureText(httpCode);
     return false;
+}
+
+// "HTTP -1 (connection refused) tls -9984 X509 - ... heap 52000/30000": for a connection that never
+// got an HTTP answer, the TLS library's own error and the RAM left (free / largest block)
+String HttpBackendService::failureText(int httpCode) {
+    String s = "HTTP " + String(httpCode);
+    if (httpCode >= 0) return s;
+    s += " (" + HTTPClient::errorToString(httpCode) + ")";
+    if (pollConn && baseUrl.startsWith("https://")) {
+        VerifiedTlsClient* tls = static_cast<VerifiedTlsClient*>(pollConn);
+        char buf[96] = {0};
+        int e = tls->lastError(buf, sizeof(buf));
+        if (e) s += " tls " + String(e) + " " + buf;
+        if (tls->verifyError.length()) s += " " + tls->verifyError;
+    }
+    s += " heap " + String(ESP.getFreeHeap()) + "/" + String(ESP.getMaxAllocHeap());
+    return s;
+}
+
+void HttpBackendService::ensureKeptAlive() {
+    if (pollHttp) return;
+    pollHttp = new HTTPClient();
+    pollHttp->setReuse(true);
+    if (baseUrl.startsWith("https://")) {
+        pollConn = new VerifiedTlsClient();  // checks the chain after the handshake (see BackendTls.h)
+    } else {
+        pollConn = new WiFiClient();
+    }
+}
+
+void HttpBackendService::dropKeptAlive() {
+    if (pollConn) pollConn->stop();
+}
+
+HTTPClient& HttpBackendService::clientFor(HTTPClient& fresh, const String& url, bool& ok) {
+    if (pollWaitS > 0) {
+        ensureKeptAlive();
+        ok = beginRequest(*pollHttp, url, pollConn);
+        return *pollHttp;
+    }
+    ok = beginRequest(fresh, url);
+    return fresh;
 }
 
 // Map backend paths to API paths
 // GET: /commands.json -> /api/commands, /audio.json -> /api/audio, /images.json -> /api/images, /reminders.json -> /api/reminders, /config.json -> /api/config
 // PUT: /reminders.json -> /api/reminders, /config.json -> /api/config, /audio/X/downloaded.json -> /api/audio/X, /images/X/downloaded.json -> /api/images/X
 // DELETE: /commands/X.json -> /api/commands/X
-String HttpBackendService::pathToApiPath(const String& path, bool isGet) {
+String HttpBackendService::pathToApiPath(const String& fullPath, bool isGet) {
+    // A query string ("/audio.json?pending=1") is passed through to the API path
+    int q = fullPath.indexOf('?');
+    if (q >= 0) {
+        String api = pathToApiPath(fullPath.substring(0, q), isGet);
+        return api.length() ? api + fullPath.substring(q) : api;
+    }
+    const String& path = fullPath;
     if (path == "/commands.json") return "/api/commands";
     if (path == "/audio.json") return "/api/audio";
     if (path == "/images.json") return "/api/images";
     if (path == "/reminders.json") return "/api/reminders";
     if (path == "/config.json") return "/api/config";
     if (path.startsWith("/commands/") && path.endsWith(".json")) {
-        String id = path.substring(9, path.length() - 5);
+        String id = path.substring(10, path.length() - 5);  // after "/commands/"
         return "/api/commands/" + id;
     }
     if (path.startsWith("/audio/") && path.endsWith("/downloaded.json")) {
@@ -98,15 +152,42 @@ bool HttpBackendService::get(const String& path, String& response) {
         lastError = "Unknown path";
         return false;
     }
-    HTTPClient http;
-    if (!beginRequest(http, baseUrl + apiPath)) return false;
+    HTTPClient fresh;
+    bool begun;
+    HTTPClient& http = clientFor(fresh, baseUrl + apiPath, begun);
+    if (!begun) return false;
     if (executeRequest(http, "GET")) {
         response = http.getString();
         http.end();
         return true;
     }
     http.end();
+    dropKeptAlive();
     return false;
+}
+
+bool HttpBackendService::download(const String& path, Stream& out) {
+    HTTPClient fresh;
+    bool begun;
+    HTTPClient& http = clientFor(fresh, baseUrl + path, begun);
+    if (!begun) return false;
+    http.setTimeout(15000);
+    if (!executeRequest(http, "GET")) {
+        http.end();
+        dropKeptAlive();
+        return false;
+    }
+    // writeToStream reads until Content-Length (or chunked end) is reached, not just until the
+    // receive buffer is momentarily empty, so slow transfers aren't cut short
+    int expected = http.getSize();
+    int written = http.writeToStream(&out);
+    http.end();
+    if (written <= 0 || (expected > 0 && written != expected)) {
+        lastError = "Incomplete (" + String(written) + "/" + String(expected) + ")";
+        dropKeptAlive();  // the rest of the body may still be in flight
+        return false;
+    }
+    return true;
 }
 
 bool HttpBackendService::put(const String& path, const String& data) {
@@ -120,11 +201,14 @@ bool HttpBackendService::put(const String& path, const String& data) {
     if (path.indexOf("/downloaded.json") >= 0 && (data == "true" || data == "\"true\"")) {
         payload = "{\"downloaded\":true}";
     }
-    HTTPClient http;
-    if (!beginRequest(http, baseUrl + apiPath)) return false;
+    HTTPClient fresh;
+    bool begun;
+    HTTPClient& http = clientFor(fresh, baseUrl + apiPath, begun);
+    if (!begun) return false;
     http.addHeader("Content-Type", "application/json");
     bool ok = executeRequest(http, "PUT", payload);
     http.end();
+    if (!ok) dropKeptAlive();
     return ok;
 }
 
@@ -133,7 +217,7 @@ bool HttpBackendService::deleteData(const String& path) {
         lastError = "Unknown path";
         return false;
     }
-    String id = path.substring(9, path.length() - 5);
+    String id = path.substring(10, path.length() - 5);  // after "/commands/"
     String url = baseUrl + "/api/commands/" + id;
     HTTPClient http;
     for (int redirects = 0; redirects < 3; redirects++) {
@@ -174,9 +258,42 @@ bool HttpBackendService::deleteData(const String& path) {
     return false;
 }
 
+bool HttpBackendService::pollCommandsRaw(String& body, String& commandId) {
+    body = "";
+    commandId = "";
+    if (pollWaitS <= 0) return get("/commands.json", body);
+    // One kept-alive connection for every poll: a TLS handshake costs the ESP32 ~5 s, so paying
+    // it once (not per poll) is what lets a queued command land within a second.
+    ensureKeptAlive();
+    String url = baseUrl + "/api/commands?wait=" + String(pollWaitS);
+    // Skipped ids go in ack= too, so a server without skip= support still drops them
+    String ack = pollAck;
+    if (pollSkip.length()) ack += (ack.length() ? "," : "") + pollSkip;
+    if (ack.length() > 0) url += "&ack=" + ack;
+    if (pollSkip.length() > 0) url += "&skip=" + pollSkip;
+    HTTPClient& http = *pollHttp;
+    if (!beginRequest(http, url, pollConn)) return false;
+    static const char* headerKeys[] = {"X-Command-Id"};
+    http.collectHeaders(headerKeys, 1);
+    http.setTimeout((pollWaitS + 10) * 1000);  // the server answers by pollWaitS; the rest is slack
+    bool ok = executeRequest(http, "GET");
+    if (ok) {
+        body = http.getString();
+        commandId = http.header("X-Command-Id");
+    }
+    http.end();  // keeps the connection open (setReuse) for the next poll
+    if (!ok) {
+        pollConn->stop();  // start clean next time
+        return false;
+    }
+    pollAck = "";  // the server has deleted them
+    pollSkip = "";
+    return true;
+}
+
 bool HttpBackendService::pollCommands(DynamicJsonDocument& commands) {
-    String response;
-    if (!get("/commands.json", response)) return false;
+    String response, commandId;
+    if (!pollCommandsRaw(response, commandId)) return false;
     if (response.length() == 0 || response == "null") {
         commands.clear();
         return true;

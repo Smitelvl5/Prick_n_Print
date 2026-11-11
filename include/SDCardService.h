@@ -2,6 +2,7 @@
 #define SD_CARD_SERVICE_H
 
 #include <Arduino.h>
+#include <functional>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
@@ -24,7 +25,7 @@
 #define MSG_PREVIEW_LEN     60
 
 struct SavedMessage {
-    uint32_t id;        // millis() at save time
+    uint32_t id;        // random at save time (older entries: millis())
     time_t   timestamp; // Unix epoch (0 if NTP not synced)
     char     preview[MSG_PREVIEW_LEN + 1];
     char     source[12];
@@ -42,14 +43,17 @@ public:
     const SavedMessage& getCachedMessage(int index) const;
     String readFullMessage(int index);
 
-    // Audio file helpers
+    // Audio file helpers (the maxFiles newest, newest first)
     int  listAudioFiles(String* outNames, int maxFiles);
 
-    // Image file helpers
+    // Image file helpers (the maxFiles newest, newest first; media/ uploads prefixed "media/")
     int  listImageFiles(String* outNames, int maxFiles);
 
     // HTTP GET straight to `path` (no-op if it already exists); partial files are removed on failure
-    bool downloadToFile(const String& url, const String& path);
+    // fetchFromPi: downloads a path on the Pi (e.g. "/uploads/images/x.jpg") into the stream, over
+    // the connection the caller already has open (the ESP32 has no RAM for a second TLS session)
+    using PiFetcher = std::function<bool(const String& piPath, Stream& out)>;
+    bool downloadToFile(const String& url, const String& path, PiFetcher fetchFromPi = nullptr);
 
     // Data persistence (config, groceries, todos, reminders)
     bool readFile(const char* path, String& out);

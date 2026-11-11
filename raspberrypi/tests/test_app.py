@@ -8,6 +8,8 @@ Run: pip install -r requirements.txt -r tests/requirements.txt && pytest raspber
 import io
 import os
 import sys
+import threading
+import time
 
 TEST_API_KEY = "test-key-do-not-use-in-prod"
 os.environ.setdefault("PRICK_N_PRINT_API_KEY", TEST_API_KEY)
@@ -231,7 +233,47 @@ def test_commands_poll_marks_device_seen(client):
     assert body["tzt-display"]["last_seen"]
 
 
-def test_image_upload_queues_silent_download_command(client):
+def test_commands_long_poll_returns_at_once_when_queued(client, monkeypatch):
+    monkeypatch.setattr(app_module, "COMMANDS_WAIT_CHECK_S", 0.01)
+    client.post("/api/commands", json={"type": "print", "data": "hi"}, headers=AUTH)
+    start = time.monotonic()
+    r = client.get("/api/commands?wait=5", headers=AUTH)
+    assert time.monotonic() - start < 1
+    assert len(r.get_json()) == 1
+
+
+def test_commands_long_poll_wakes_on_new_command(client, monkeypatch):
+    monkeypatch.setattr(app_module, "COMMANDS_WAIT_CHECK_S", 0.01)
+    def queue_later():
+        time.sleep(0.3)
+        with app_module.update_data() as data:
+            data["commands"]["c1"] = {"type": "print", "data": "hi"}
+    threading.Thread(target=queue_later).start()
+    start = time.monotonic()
+    r = client.get("/api/commands?wait=5", headers=AUTH)
+    assert 0.2 < time.monotonic() - start < 3
+    assert list(r.get_json()) == ["c1"]
+
+
+def test_commands_poll_ack_deletes_handled_commands(client):
+    a = client.post("/api/commands", json={"type": "print", "data": "a"}, headers=AUTH).get_json()["id"]
+    b = client.post("/api/commands", json={"type": "print", "data": "b"}, headers=AUTH).get_json()["id"]
+    r = client.get(f"/api/commands?ack={a},unknown", headers=AUTH)
+    assert list(r.get_json()) == [b]
+    # Acks are idempotent: a repeat (after a failed poll) is harmless
+    r = client.get(f"/api/commands?ack={a},{b}", headers=AUTH)
+    assert r.get_json() == {}
+
+
+def test_commands_long_poll_times_out_empty(client, monkeypatch):
+    monkeypatch.setattr(app_module, "COMMANDS_WAIT_CHECK_S", 0.01)
+    start = time.monotonic()
+    r = client.get("/api/commands?wait=0.3", headers=AUTH)
+    assert 0.25 < time.monotonic() - start < 2
+    assert r.get_json() == {}
+
+
+def test_image_upload_queues_download_command(client):
     r = client.post(
         "/api/images",
         data={"file": (io.BytesIO(b"\xff\xd8jpeg"), "cat.jpg")},
@@ -244,8 +286,21 @@ def test_image_upload_queues_silent_download_command(client):
     cmds = client.get("/api/commands", headers=AUTH).get_json()
     assert cmds[mid]["type"] == "download_image"
     assert cmds[mid]["media_id"] == mid
-    assert cmds[mid]["silent"] is True
+    assert "silent" not in cmds[mid]  # the TZT shows / plays new uploads on arrival
     assert cmds[mid]["url"].endswith("/uploads/images/cat.jpg")
+
+
+def test_image_upload_accepts_any_form_field_name(client):
+    # iOS Shortcuts "Form" body: the file sits under whatever key the user typed
+    r = client.post(
+        "/api/images",
+        data={"Photo": (io.BytesIO(b"\xff\xd8jpeg"), "IMG_0042.HEIC")},
+        content_type="multipart/form-data",
+        headers=AUTH,
+    )
+    assert r.status_code == 201
+    cmds = client.get("/api/commands", headers=AUTH).get_json()
+    assert any(c["type"] == "download_image" for c in cmds.values())
 
 
 def test_deleting_media_drops_pending_download_command(client):
@@ -258,3 +313,135 @@ def test_deleting_media_drops_pending_download_command(client):
     mid = r.get_json()["id"]
     assert client.delete(f"/api/audio/{mid}", headers=AUTH).status_code == 204
     assert mid not in client.get("/api/commands", headers=AUTH).get_json()
+
+
+# ---------- One command per poll, delivery state, size limits ----------
+
+def test_commands_poll_hands_out_oldest_command_only(client):
+    a = client.post("/api/commands", json={"type": "print", "data": "a"}, headers=AUTH).get_json()["id"]
+    b = client.post("/api/commands", json={"type": "print", "data": "b"}, headers=AUTH).get_json()["id"]
+    r = client.get("/api/commands", headers=AUTH)
+    assert list(r.get_json()) == [a]
+    assert r.headers["X-Command-Id"] == a
+    r = client.get(f"/api/commands?ack={a}", headers=AUTH)
+    assert list(r.get_json()) == [b]
+    assert r.headers["X-Command-Id"] == b
+
+
+def test_empty_poll_has_no_command_id_header(client):
+    r = client.get("/api/commands", headers=AUTH)
+    assert r.get_json() == {}
+    assert "X-Command-Id" not in r.headers
+
+
+def test_ack_marks_message_delivered(client):
+    cid = client.post("/api/commands", json={"type": "print", "data": "hi"}, headers=AUTH).get_json()["id"]
+    msg = client.get("/api/history").get_json()["messages"][0]
+    assert msg["pending"] is True and "delivered_at" not in msg
+    client.get(f"/api/commands?ack={cid}", headers=AUTH)
+    msg = client.get("/api/history").get_json()["messages"][0]
+    assert msg["pending"] is False and msg["delivered_at"]
+
+
+def test_skip_removes_command_and_marks_message_failed(client):
+    cid = client.post("/api/commands", json={"type": "print", "data": "hi"}, headers=AUTH).get_json()["id"]
+    # The TZT sends a skipped id in both ack= (older servers) and skip=
+    r = client.get(f"/api/commands?ack={cid}&skip={cid}", headers=AUTH)
+    assert r.get_json() == {}
+    msg = client.get("/api/history").get_json()["messages"][0]
+    assert msg["failed"] and "delivered_at" not in msg
+
+
+def test_print_over_printer_limit_is_rejected(client):
+    ok = "x" * app_module.PRINT_MAX_BYTES
+    assert client.post("/api/commands", json={"type": "print", "data": ok}, headers=AUTH).status_code == 201
+    r = client.post("/api/commands", json={"type": "print", "data": ok + "x"}, headers=AUTH)
+    assert r.status_code == 413
+    assert "too long" in r.get_json()["error"]
+
+
+def test_print_limit_counts_utf8_bytes(client):
+    # 3 bytes per character: the printer limit is bytes, not characters
+    text = "\u0928" * (app_module.PRINT_MAX_BYTES // 3 + 1)
+    r = client.post("/api/commands", json={"type": "print", "data": text}, headers=AUTH)
+    assert r.status_code == 413
+
+
+def test_oversized_batch_queues_nothing(client):
+    big = {"type": "print", "data": "x" * (app_module.PRINT_MAX_BYTES + 1)}
+    r = client.post("/api/commands", json=[{"type": "print", "data": "ok"}, big], headers=AUTH)
+    assert r.status_code == 413
+    assert client.get("/api/commands", headers=AUTH).get_json() == {}
+
+
+def test_legacy_message_route_enforces_limit(client):
+    r = client.post("/message", json={"message": "x" * (app_module.PRINT_MAX_BYTES + 1)}, headers=AUTH)
+    assert r.status_code == 413
+
+
+def test_commands_sent_as_utf8_not_escaped(client):
+    client.post("/api/commands", json={"type": "print", "data": "caf\u00e9"}, headers=AUTH)
+    r = client.get("/api/commands", headers=AUTH)
+    assert "caf\u00e9".encode("utf-8") in r.data
+
+
+def test_wrong_api_key_rejected_on_open_routes(client):
+    # nginx's public listener skips its password for requests that carry a key, so every route
+    # (even ones that need no key) must reject a wrong one
+    for path in ("/", "/api/history", "/api/health", "/uploads/images/x.jpg"):
+        assert client.get(path, headers={"X-API-Key": "wrong"}).status_code == 401, path
+    assert client.get("/api/health", headers=AUTH).status_code == 200
+
+
+def test_concurrent_writes_are_not_lost(client):
+    """Two workers' read-modify-write must not undo each other (lost or resurrected commands)."""
+    errors = []
+
+    def post(i):
+        try:
+            with app_module.app.test_client() as c:
+                r = c.post("/api/commands", json={"type": "print", "data": f"m{i}"}, headers=AUTH)
+                assert r.status_code == 201
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=post, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    data = app_module.get_data()
+    assert len(data["commands"]) == 20
+    assert len(data["messages"]) == 20
+
+
+def test_clearing_messages_keeps_other_pending_commands(client):
+    client.post("/api/commands", json={"type": "print", "data": "hi"}, headers=AUTH)
+    alarm = client.post("/api/commands", json={"type": "set_alarm", "time": "07:30"}, headers=AUTH).get_json()["id"]
+    assert client.delete("/api/history/messages", headers=AUTH).status_code == 200
+    assert client.get("/api/history").get_json()["messages"] == []
+    assert list(client.get("/api/commands", headers=AUTH).get_json()) == [alarm]
+
+
+def test_uploads_with_the_same_name_get_unique_files(client):
+    names = []
+    for body in (b"\xff\xd8first", b"\xff\xd8second"):
+        r = client.post("/image", headers=AUTH, content_type="multipart/form-data",
+                        data={"image": (io.BytesIO(body), "image.jpg")})
+        assert r.status_code == 201
+        names.append(r.get_json()["filename"])
+    assert names[0] != names[1]
+    assert (app_module.IMAGES_DIR / names[0]).read_bytes() == b"\xff\xd8first"
+    assert (app_module.IMAGES_DIR / names[1]).read_bytes() == b"\xff\xd8second"
+
+
+def test_media_list_pending_only(client):
+    ids = []
+    for name in ("a.jpg", "b.jpg"):
+        r = client.post("/api/images", data={"file": (io.BytesIO(b"\xff\xd8x"), name)},
+                        content_type="multipart/form-data", headers=AUTH)
+        ids.append(r.get_json()["id"])
+    client.put(f"/api/images/{ids[0]}", json={"downloaded": True}, headers=AUTH)
+    assert set(client.get("/api/images", headers=AUTH).get_json()) == set(ids)
+    assert list(client.get("/api/images?pending=1", headers=AUTH).get_json()) == [ids[1]]

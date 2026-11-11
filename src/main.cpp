@@ -10,8 +10,12 @@
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <esp_task_wdt.h>
+#include <esp_sleep.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
 #include <time.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 #include "version.h"
 #include "config.h"
@@ -39,14 +43,31 @@ static unsigned long espNowTestStartMs = 0;  // millis() when test started
 static const unsigned long TEST_PUMP_DURATION_MS = 800;
 static const unsigned long TEST_LED_DURATION_MS = 1000;
 static unsigned long espNowTestDurationMs = 0;  // actual duration for the in-flight test (set per-call)
+static volatile unsigned long pendingRestartAt = 0;  // CMD_RESTART: millis() to reboot at (0 = none)
 
 // Cancels this file's in-flight pump/LED test pulse without touching the
 // actuator - called before TestServer starts its own pulse, so only one
 // timer is left owning the shutoff. Defined here so TestServer.cpp can call it.
 void cancelEspNowTest() { espNowTestType = 0; }
 
-// Auto-dispense: when true, IR sensor triggers pump; when false, only manual/ESP-NOW commands do
+// Auto-dispense: when true, IR sensor triggers pump; when false, only manual/ESP-NOW commands do.
+// Saved in NVS so a broken IR sensor that was switched off stays off after a reboot.
 static bool autoDispenseEnabled = true;
+
+static void loadAutoDispense() {
+    Preferences prefs;
+    if (!prefs.begin("sensors", true)) return;  // first boot: keep the default (on)
+    autoDispenseEnabled = prefs.getBool("ir", true);
+    prefs.end();
+}
+
+// Also called by TestServer after its toggle changes the flag
+void saveAutoDispense() {
+    Preferences prefs;
+    if (!prefs.begin("sensors", false)) return;
+    prefs.putBool("ir", autoDispenseEnabled);
+    prefs.end();
+}
 
 // Print state shared between the ESP-NOW receive callback (WiFi task) and loop() (other core).
 // Fixed buffers instead of Strings (no reallocation while the other side reads), and every access
@@ -56,7 +77,7 @@ static portMUX_TYPE printStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Chunked print reassembly (CMD_PRINT_CHUNK) - in scope for loop() sensor pause.
 // Once pendingChunkPrintReady is set the callback leaves the buffers alone until loop() has printed them.
-#define PRINT_CHUNK_MAX 64
+#define PRINT_CHUNK_MAX PRINT_MAX_CHUNKS
 static char printChunkData[PRINT_CHUNK_MAX][PRINT_MSG_BYTES];  // ~12.8 KB
 static uint8_t printChunkLen[PRINT_CHUNK_MAX];
 static bool printChunkReceived[PRINT_CHUNK_MAX];
@@ -188,6 +209,9 @@ void setup() {
         Logger::warn("Main", "Continuing with limited hardware functionality");
     }
 
+    loadAutoDispense();
+    if (!autoDispenseEnabled) Logger::info("Main", "IR hand sensor switched off: pump only on Dispense");
+
     // Initialize printer service
     printerService = new PrinterService(hardware);
     Logger::info("Main", "Printer service initialized");
@@ -291,6 +315,23 @@ void loop() {
     
     // Update LED PWM ramp-up (1V per second) - call frequently for smooth ramping
     hardware->updateLEDRamp();
+    hardware->updateNotifyFlash();
+
+    if (pendingRestartAt && (long)(millis() - pendingRestartAt) >= 0) {
+        // Not ESP.restart(): on this board a software restart freezes during boot (blue LED stuck on,
+        // no WiFi, no ESP-NOW) until power is pulled. A 100 ms deep sleep resets the chip and its
+        // radio much like a power cycle does.
+        Serial.println("Restarting (requested by TZT) via 100 ms deep sleep...");
+        if (hardware && hardware->isDispensing()) hardware->stopPump();
+        digitalWrite(SANITIZER_PUMP_PIN, LOW);
+        ledcWrite(LED_PWM_CHANNEL, 0);
+        esp_now_deinit();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(50);
+        esp_sleep_enable_timer_wakeup(100 * 1000ULL);
+        esp_deep_sleep_start();
+    }
     
     // Send sensor data to TZT via ESP-NOW (uses cached sensor values from above)
     // Wait 3 seconds after ESP-NOW init before first send (give TZT time to initialize)
@@ -579,7 +620,8 @@ static unsigned long lastSettingTime = 0;
 static bool isSettingCommandType(uint8_t type) {
     return (type == CMD_SET_LED_BRIGHTNESS || type == CMD_SET_LED_STATE || type == CMD_SET_LED_SCHEDULE
          || type == CMD_SET_PUMP_DURATION || type == CMD_SET_PUMP_COOLDOWN || type == CMD_SET_AUTO_DISPENSE
-         || type == CMD_SET_LED_SCHEDULE_TIME);
+         || type == CMD_SET_LED_SCHEDULE_TIME || type == CMD_LED_NOTIFY || type == CMD_RESTART
+         || type == CMD_SET_MOISTURE_SENSOR);
 }
 
 void handleEspNowCommand(CommandPacket* cmd) {
@@ -737,10 +779,14 @@ void handleEspNowCommand(CommandPacket* cmd) {
             bool wantOn = (cmd->param1 != 0);
             if (autoDispenseEnabled != wantOn) {
                 autoDispenseEnabled = wantOn;
+                saveAutoDispense();
                 Serial.println("✅ Executed: SET_AUTO_DISPENSE=" + String(autoDispenseEnabled ? 1 : 0));
             }
             break;
         }
+        case CMD_SET_MOISTURE_SENSOR:
+            hardware->setMoistureEnabled(cmd->param1 != 0);
+            break;
         case CMD_SET_LED_SCHEDULE_TIME: {
             // param1: 0 = on-time, 1 = off-time; param2: quarter-hour of day (0-95)
             if (cmd->param2 > 95) break;
@@ -752,6 +798,15 @@ void handleEspNowCommand(CommandPacket* cmd) {
                                HardwareAbstraction::formatMinute(minute));
             break;
         }
+        case CMD_LED_NOTIFY:
+            hardware->startNotifyFlash(cmd->param1 ? cmd->param1 : 3);
+            break;
+        case CMD_RESTART:
+            // Reboot from loop() a moment later, so the ACK sent after this callback still goes out
+            pendingRestartAt = millis() + 500;
+            if (pendingRestartAt == 0) pendingRestartAt = 1;
+            Logger::info("Main", "Restart requested by TZT");
+            break;
         default:
             Logger::warn("Main", "Unknown ESP-NOW command: " + String(cmd->commandType));
             break;

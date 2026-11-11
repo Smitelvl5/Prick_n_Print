@@ -37,7 +37,7 @@ static inline lv_color_t uiColor(UiColor c) { return lv_color_hex(c); }
 // here, but rows and back targets stay >= 44px for the resistive panel.
 #define UI_MARGIN      8
 #define UI_GAP         6
-#define UI_RADIUS      8
+#define UI_RADIUS      10   // = --radius in theme.css
 #define UI_ROW_H       44   // list row card height (touch target)
 #define UI_BACK_W      44   // header "<" tap target width
 #define UI_SWITCH_W    40

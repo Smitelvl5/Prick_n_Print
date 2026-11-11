@@ -5,6 +5,7 @@
 #include "OTAUpdateService.h"
 #include "Logger.h"
 #include <ArduinoOTA.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
@@ -93,5 +94,9 @@ void OTAUpdateService::onError(ota_error_t error) {
         case OTA_END_ERROR:      msg = "End failed"; break;
         default:                 msg = "Unknown error"; break;
     }
-    Logger::error(TAG, "OTA error: " + String(msg));
+    // ArduinoOTA leaves a failed update open, and every later Update.begin() then fails
+    // ("Begin failed") until a reboot: cancel it so the next upload can start
+    String detail = Update.hasError() ? String(" (") + Update.errorString() + ")" : String("");
+    if (Update.isRunning()) Update.abort();
+    Logger::error(TAG, "OTA error: " + String(msg) + detail);
 }

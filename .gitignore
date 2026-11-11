@@ -10,3 +10,10 @@ __pycache__/
 raspberrypi/data.json
 raspberrypi/data.json.lock
 raspberrypi/uploads/
+
+# macOS / KiCad local files
+.DS_Store
+PCB/.history/
+*.kicad_prl
+*-backups/
+fp-info-cache

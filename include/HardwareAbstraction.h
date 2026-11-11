@@ -16,7 +16,8 @@ private:
     bool pumpState;
     
     // Sensor readings
-    float moisturePercent;
+    float moisturePercent;     // -1 while the moisture sensor is switched off
+    bool moistureEnabled;      // TZT Settings > Sensors; persisted in NVS "sensors"/"moist"
     bool irDetected;
     uint8_t ledBrightness;
     // LED night schedule: on at ledOnMinute, off at ledOffMinute (minutes since local midnight)
@@ -32,6 +33,10 @@ private:
     uint8_t rampTargetPWM;
     uint8_t currentPWM;  // Track current PWM value
     unsigned long rampStartTime;
+
+    // New-item blink (CMD_LED_NOTIFY): phases left (on/off alternating), next phase time
+    uint8_t notifyFlashPhasesLeft;
+    unsigned long notifyFlashNextMs;
     
     // Sanitizer tracking
     float sanitizerLevel;
@@ -39,6 +44,13 @@ private:
     unsigned long lastDispenseTime;
     unsigned long dispenseStartTime;
     bool dispensing;
+    // One-shot hardware timer that cuts the pump at its maximum run time on its own: loop()'s
+    // checkDispenseTimeout() can be held up for many seconds (a long receipt prints with delay()s),
+    // and DISPENSE_START arrives on the ESP-NOW callback, so the pump could otherwise run that long.
+    void* pumpTimer_ = nullptr;               // esp_timer_handle_t
+    volatile unsigned long pumpCutAtMs_ = 0;  // when the timer cut it (0 = it didn't)
+    static void pumpTimerCb(void* arg);
+    unsigned long dispenseLimitMs() const;
     // Runtime config (0 = use config.h defaults)
     unsigned long maxDispenseDurationMs_;
     unsigned long dispenseCooldownMs_;
@@ -75,7 +87,9 @@ public:
     // Sensor Reading
     float readMoistureSensor();
     bool readIRSensor();
-    float getMoisturePercent() const { return moisturePercent; }
+    float getMoisturePercent() const { return moisturePercent; }  // -1 = sensor switched off
+    void setMoistureEnabled(bool on);  // off: not read (a broken probe reads garbage), saved to NVS
+    bool isMoistureEnabled() const { return moistureEnabled; }
     bool isIRDetected() const { return irDetected; }
     
     // LED Control: night schedule switches the LED at the on/off times; manual changes
@@ -95,6 +109,8 @@ public:
     uint8_t getLedLevel() const { return ledLevelPct; }
     uint8_t getLedOnPwm() const;  // ledLevelPct -> 0-255 with perceptual (gamma 2) curve
     void updateLEDRamp();  // Update PWM ramp-up (call in main loop)
+    void startNotifyFlash(uint8_t count);  // slow blink count times, then restore the LED
+    void updateNotifyFlash();              // call in main loop
     
     // Sanitizer Management
     float getSanitizerLevel() const { return sanitizerLevel; }

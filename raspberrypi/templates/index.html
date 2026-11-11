@@ -42,6 +42,9 @@
     .card .history-item { background: var(--surface-2); }
     .history-item .text { overflow-wrap: anywhere; }
     .history-item .meta { color: var(--text-faint); font-size: 0.75rem; font-family: var(--font-mono); margin-top: 2px; }
+    .history-item .meta .delivered { color: var(--fi-success); }
+    .history-item .meta .waiting { color: var(--fi-amber); }
+    .history-item .meta .failed { color: var(--fi-warning); }
     .history-item .actions { display: flex; gap: 6px; flex-shrink: 0; }
     .history-item .btn { min-height: 34px; padding: 6px 12px; font-size: 0.8rem; }
 
@@ -146,10 +149,15 @@
       label.textContent = ok ? 'online' : 'unreachable';
     }
 
+    // Safe in text and in quoted attributes (textContent/innerHTML alone leaves quotes as they are)
     function escapeHtml(s) {
-      const d = document.createElement('div');
-      d.textContent = s;
-      return d.innerHTML;
+      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    // uploads/<kind>/<name>, with the name URL-encoded
+    function uploadUrl(path) {
+      const i = path.lastIndexOf('/');
+      return API + '/uploads/' + path.slice(0, i + 1) + encodeURIComponent(path.slice(i + 1));
     }
     function formatTime(iso) {
       if (!iso) return '';
@@ -183,6 +191,14 @@
       });
     }
 
+    // Delivery state from the server: queued (TZT hasn't taken it yet), delivered, or skipped by the TZT
+    function deliveryHtml(m) {
+      if (m.failed) return ' · <span class="failed">Not printed: ' + escapeHtml(m.failed) + '</span>';
+      if (m.delivered_at) return ' · <span class="delivered" title="' + escapeHtml(formatTime(m.delivered_at)) + '">Delivered ✓</span>';
+      if (m.pending) return ' · <span class="waiting">Waiting for the TZT…</span>';
+      return '';  // sent before delivery tracking existed
+    }
+
     function renderHistory() {
       let msgs = sortByDate(historyData.messages || [], sortNewestFirst);
       let imgs = sortByDate(historyData.images || [], sortNewestFirst);
@@ -192,12 +208,12 @@
       auds = auds.slice(0, 50);
 
       document.getElementById('historyMessagesList').innerHTML = msgs.length
-        ? msgs.map(m => `<div class="history-item"><div><div class="text">${escapeHtml(m.text)}</div><div class="meta">${formatTime(m.at)}${m.source ? ' · ' + escapeHtml(m.source) : ''}</div></div><div class="actions"><button type="button" class="btn btn-danger btn-delete-msg" data-id="${escapeHtml(m.id)}">Delete</button></div></div>`).join('')
+        ? msgs.map(m => `<div class="history-item"><div><div class="text">${escapeHtml(m.text)}</div><div class="meta">${formatTime(m.at)}${m.source ? ' · ' + escapeHtml(m.source) : ''}${deliveryHtml(m)}</div></div><div class="actions"><button type="button" class="btn btn-danger btn-delete-msg" data-id="${escapeHtml(m.id)}">Delete</button></div></div>`).join('')
         : '<div class="empty">No messages yet. Send one from iOS Shortcuts.</div>';
 
       document.getElementById('historyImagesList').innerHTML = imgs.length
         ? imgs.map(img => {
-            const url = API + '/uploads/' + img.path;
+            const url = escapeHtml(uploadUrl(img.path));
             const dateStr = formatTime(img.at) ? `<div class="meta" style="margin-top:0.25rem">${formatTime(img.at)}</div>` : '';
             return `<div class="img-card"><a href="${url}?dl=1" download><img src="${url}" alt="" loading="lazy" onerror="this.parentElement.parentElement.style.display='none'"></a><div class="info">${escapeHtml(img.name)}${dateStr}</div><div class="img-actions"><a href="${url}?dl=1" download class="btn btn-ghost">Download</a><button type="button" class="btn btn-danger btn-delete-img" data-id="${escapeHtml(img.id)}">Delete</button></div></div>`;
           }).join('')
@@ -206,8 +222,8 @@
       document.getElementById('historyAudioList').innerHTML = auds.length
         ? auds.map(a => {
             const path = a.path;
-            const url = API + '/uploads/' + path;
-            const safePath = path.replace(/"/g, '&quot;');
+            const url = escapeHtml(uploadUrl(path));
+            const safePath = escapeHtml(path);
             const dateStr = formatTime(a.at) || 'Audio clip';
             return `<div class="history-item"><div style="flex:1;min-width:0"><div class="text" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.name)}</div><div class="meta">${dateStr}</div></div><div class="actions"><button type="button" class="btn btn-ghost btn-play" data-path="${safePath}">Play</button><a href="${url}" download class="btn btn-ghost">Download</a><button type="button" class="btn btn-danger btn-delete-audio" data-id="${escapeHtml(a.id)}">Delete</button></div></div>`;
           }).join('')
@@ -242,7 +258,7 @@
     }
 
     function togglePlay(btn) {
-      const url = API + '/uploads/' + (btn.dataset.path || '');
+      const url = uploadUrl(btn.dataset.path || '');
       const player = document.getElementById('audioPlayer');
       if (currentAudioUrl === url && !player.paused) {
         player.pause();
@@ -336,8 +352,14 @@
       };
     });
 
-    loadHistory();
-    setInterval(loadHistory, 10000);  // auto-refresh every 10s so iOS Shortcut messages appear
+    // Auto-refresh so iOS Shortcut messages appear: every 10 s, or every 1 s while a message is still
+    // waiting for the TZT, so "Delivered ✓" shows about a second after it lands
+    async function refreshLoop() {
+      await loadHistory();
+      const waiting = (historyData.messages || []).some(m => m.pending);
+      setTimeout(refreshLoop, waiting && !document.hidden ? 1000 : 10000);
+    }
+    refreshLoop();
   </script>
 </body>
 </html>

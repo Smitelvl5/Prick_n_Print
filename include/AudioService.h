@@ -12,10 +12,12 @@ public:
     bool isReady() const { return initialized; }
 
     bool playFile(const String& sdPath);
+    bool playTune(const char* rtttl);  // short RTTTL melody from flash (event chimes, alarm); no SD needed
     void stop();
     void loop();                       // Must be called from main loop() to feed audio buffer
 
     bool isPlaying() const { return playing; }
+    bool isPlayingTune() const { return playing && playingTune; }
     String currentFile() const { return nowPlaying; }
 
     void setVolume(float gain);   // 0.0 .. 1.0
@@ -25,8 +27,9 @@ public:
 private:
     bool initialized = false;
     bool playing = false;
+    bool playingTune = false;
     String nowPlaying;
-    float volume = 0.5f;
+    float volume = 0.25f;
 };
 
 #endif // AUDIO_SERVICE_H

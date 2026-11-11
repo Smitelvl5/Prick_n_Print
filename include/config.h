@@ -75,12 +75,12 @@
 
 // Sanitizer Dispensing Settings
 #define DISPENSE_COOLDOWN_MS 3000        // Cooldown period: 3 seconds between dispenses (3000ms)
-#define MAX_DISPENSE_DURATION_MS 2000   // Maximum dispense duration: 2 seconds (prevents continuous dumping)
+#define MAX_DISPENSE_DURATION_MS 600    // One dose: 0.6 s x 5 ml/s = 3 ml, like a standard sanitizer pump (also the safety cut-off)
 
 // Sanitizer level tracking: level drops by (pump run time x flow rate) / capacity.
 // Calibrate flow: run the pump for 10 s into a measuring cup, divide ml by 10.
-#define SANITIZER_CAPACITY_ML 250.0f    // Full reservoir volume (ml)
-#define PUMP_FLOW_ML_PER_SEC 1.0f       // Pump output (ml/s) - measure and update
+#define SANITIZER_CAPACITY_ML 1000.0f   // Usable reservoir volume (ml): container holds 1149, filled to ~1000
+#define PUMP_FLOW_ML_PER_SEC 5.0f       // Pump output (ml/s): 0.3 L/min
 
 // Web Server Authentication
 // WEB_PASSWORD now comes from secrets.h
@@ -95,7 +95,7 @@
 
 // TZT Display MAC address — MUST match TZT serial "This MAC: xx:xx:xx:xx:xx:xx"
 // Format: {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-#define TZT_DISPLAY_MAC_ADDRESS {0xF4, 0x2D, 0xC9, 0x6D, 0x6E, 0x60}
+#define TZT_DISPLAY_MAC_ADDRESS {0xB0, 0xCB, 0xD8, 0xC2, 0xED, 0xF4}
 
 // ESP-NOW channel: fallback when WiFi.channel() is 0. Set to your AP's channel (TZT showed 6 for Kanta).
 #define ESP_NOW_CHANNEL 6

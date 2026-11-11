@@ -10,6 +10,7 @@
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <Preferences.h>
 #if !defined(TZT_HEADLESS)
 #include <lvgl.h>
 #include <TFT_eSPI.h>
@@ -25,6 +26,7 @@
 #include "IBackendService.h"
 #include "HttpBackendService.h"
 #include "ReminderService.h"
+#include "AlarmService.h"
 #include "SDCardService.h"
 #include <SD.h>
 #include "AudioService.h"
@@ -80,41 +82,108 @@ static lv_obj_t* picturesScreen = nullptr;   // picture list (tap -> full-screen
 #define SCREEN_SOUNDS   1
 #define SCREEN_PICTURES 2
 #define SCREEN_SETTINGS 3
-#define LAUNCHER_BUTTONS 3  // Settings is not a launcher button
-#define SCREEN_LAUNCHER -1
-static int currentScreenIndex = SCREEN_LAUNCHER;
-#define DASHBOARD_IDLE_RETURN_MS  120000  // untouched for 2 min on a section -> back to launcher
+#define LAUNCHER_BUTTONS 3  // menu tiles that can carry a NEW badge (Settings is the 4th tile, never new)
+#define SCREEN_LAUNCHER -1  // the menu: Messages / Sounds / Pictures tiles + settings gear
+#define SCREEN_HOME     -2  // big Dispense button over a Menu button; idle always returns here
+static int currentScreenIndex = SCREEN_HOME;
+#define DASHBOARD_IDLE_RETURN_MS  120000  // untouched for 2 min anywhere but home -> back to home
 static unsigned long lastDashboardTouchTime = 0;   // any touch resets the idle-return timer
 static lv_obj_t* launcherScreen = nullptr;
+// Home: Dispense fills the top 75%, Menu the bottom 25%
+static lv_obj_t* homeScreen = nullptr;
+static lv_obj_t* homeDispenseBtn = nullptr;
+static lv_obj_t* homeDispenseLabel = nullptr;  // "Dispense" / "Dispensing..."
+static lv_obj_t* homeDispenseInfo = nullptr;   // sanitizer level, or why it may not work
+static lv_obj_t* homeMenuBadge = nullptr;      // NEW on the Menu button while a section has something unseen
+static lv_obj_t* homeLevelArc = nullptr;       // sanitizer level ring
+static lv_obj_t* homeLevelLabel = nullptr;     // "72%" inside the ring
+static lv_obj_t* homeDoseBar = nullptr;        // fills while the pump runs
+#define MAX_DOSE_MS 600                        // Main's MAX_DISPENSE_DURATION_MS (3 ml)
+// Toast: short confirmation pill over everything (top layer), gone after a moment
+static lv_obj_t* toastLabel = nullptr;
+static unsigned long toastHideAt = 0;
+static void showToast(const char* text);
+static unsigned long dispenseLockUntil = 0;    // one dose per tap: button rests until Main's dose + cooldown is over
+#define DISPENSE_LOCK_MS 2000                  // one dose (0.6 s) plus a moment, so taps don't stack
+static void updateHomeScreen();
+// Sensors (Settings): switch a broken sensor off so it can't misfire. The TZT keeps the wanted
+// state in its own NVS and re-sends it whenever Main reports something else (e.g. after Main
+// rebooted on firmware that forgets it), so a broken IR sensor stays ignored.
+static bool wantIrSensor = true;        // IR hand sensor starts the pump (Main: CMD_SET_AUTO_DISPENSE)
+static bool wantMoistureSensor = true;  // moisture readings used (Main: CMD_SET_MOISTURE_SENSOR)
+static lv_obj_t* irSensorSwitch = nullptr;
+static lv_obj_t* moistureSensorSwitch = nullptr;
+static unsigned long lastSensorResyncAt = 0;
+#define SENSOR_RESYNC_MS 15000  // at most this often while Main disagrees
+static void loadSensorPrefs();
+static void saveSensorPrefs();
+static void syncSensorSettingsToMain();
+// Screen dimming: after dimAfterMin minutes without a touch the backlight drops to DIM_BRIGHTNESS.
+// The first touch on a dim screen only wakes it (no accidental dose); new items and alarms wake it too.
+#define DIM_BRIGHTNESS 38                  // ~15% of TZT_TFT_BL_BRIGHTNESS: still shows where the dispenser is
+static const uint8_t dimChoices[] = { 1, 2, 5, 0 };  // Settings cycles these; 0 = never
+static uint8_t dimAfterMin = 2;            // saved in NVS "display"/"dimMin"
+static bool screenDimmed = false;
+static unsigned long lastScreenActivity = 0;
+static bool touchSwallow = false;          // the waking touch: hidden from LVGL until the finger lifts
+static lv_obj_t* dimValueLabel = nullptr;  // Settings: "2 min" / "Never"
+static void setBacklight(uint8_t level) { ledcWrite(TZT_TFT_BL_LEDC_CHANNEL, level); }
+// Full brightness and a fresh idle timer (touch, new item, alarm)
+static void wakeScreen() {
+    lastScreenActivity = millis();
+    if (!screenDimmed) return;
+    screenDimmed = false;
+    setBacklight(TZT_TFT_BL_BRIGHTNESS);
+}
 #define NO_MESSAGE_TEXT "(No messages yet)"
 static String lastPrintMessage = NO_MESSAGE_TEXT;
-// Messages section
-static lv_obj_t* historyList = nullptr;
-static lv_obj_t* historyDetail = nullptr;
-static lv_obj_t* historyDetailLabel = nullptr;
-static void refreshHistoryList();
-static void historyItemCb(lv_event_t* e);
-static void historyBackCb(lv_event_t* e);
-// Sounds section
-static lv_obj_t* audioList = nullptr;
-static lv_obj_t* audioNowPlayingLabel = nullptr;
-static lv_obj_t* audioStopBtn = nullptr;
-static void updateNowPlaying();
+// Each section opens on its newest item; Newer/Older buttons (or a sideways swipe) step back through
+// the newest few. No list menus: on a 320x240 resistive panel one big item beats a row of small ones.
+#define LIST_SHOW_NEWEST 3  // Messages / Sounds / Pictures step through only the newest few (older stay on the SD card)
+// Messages section: one message at a time
+static lv_obj_t* msgCard = nullptr;
+static lv_obj_t* msgMetaLabel = nullptr;   // "Today 4:45 PM"
+static lv_obj_t* msgPosLabel = nullptr;    // "1 of 3"
+static lv_obj_t* msgTextLabel = nullptr;
+static lv_obj_t* msgNewerBtn = nullptr;
+static lv_obj_t* msgOlderBtn = nullptr;
+static lv_obj_t* msgEmptyNote = nullptr;     // shown in place of the card when there are none
+static int msgCount = 0;    // messages that can be stepped through
+static int msgSdCount = 0;  // messages in the SD cache (0 = only the in-memory latest)
+static int msgShown = 0;    // 0 = newest
+static void refreshMessages();
+static void showMessageAt(int pos);
+static void messageStepCb(lv_event_t* e);
+static void messageCardCb(lv_event_t* e);
+// Sounds section: a player on one sound at a time
+static lv_obj_t* soundCard = nullptr;
+static lv_obj_t* soundNameLabel = nullptr;
+static lv_obj_t* soundPosLabel = nullptr;
+static lv_obj_t* soundNewBadge = nullptr;
+static lv_obj_t* soundPrevBtn = nullptr;
+static lv_obj_t* soundNextBtn = nullptr;
+static lv_obj_t* soundPlayBtn = nullptr;
+static lv_obj_t* soundPlayLabel = nullptr;
+static lv_obj_t* soundEmptyNote = nullptr;
+static int soundShown = 0;  // 0 = newest
+static void updateNowPlaying(bool force = false);
 #define MAX_AUDIO_FILES 20
 static String audioFileNames[MAX_AUDIO_FILES];
 static int audioFileCount = 0;
-static void refreshAudioList();
-static void audioFileCb(lv_event_t* e);
-static void audioStopCb(lv_event_t* e);
-// Pictures section
+static void refreshSounds(bool toNewest);
+static void soundStepCb(lv_event_t* e);
+static void soundPlayCb(lv_event_t* e);
+static void soundCardCb(lv_event_t* e);
+// Pictures section: straight to the full-screen viewer; picturesScreen is only the empty state
 #define MAX_IMAGE_FILES 30
 static String imageFileNames[MAX_IMAGE_FILES];
 static int imageFileCount = 0;
-static lv_obj_t* imageList = nullptr;
-static lv_obj_t* imageViewerScreen = nullptr;  // overlay with Back button when viewing
-static void refreshImageList();
-static void imageFileCb(lv_event_t* e);
-static void imageBackCb(lv_event_t* e);
+static int imageShown = -1;  // index into imageFileNames; -1 = a picture not in the list (test image)
+static lv_obj_t* picturesEmptyNote = nullptr;
+static lv_obj_t* imageViewerScreen = nullptr;  // full screen, tap/swipe to browse or close
+static void refreshImages();
+static void showImageAt(int idx);
+static void imageViewerTapCb(lv_event_t* e);
 static void drawSdJpegToTft(const char* path, int maxY = 240);
 static String currentImagePath;  // set when image viewer is open; JPEG is drawn over LVGL's black screen
 static volatile bool imageViewerNeedsDraw = false;  // LVGL flushed (painted over the JPEG) or a new image was picked
@@ -128,7 +197,6 @@ static lv_obj_t* statusTimeLabel = nullptr;
 static lv_obj_t* statusIpLabel = nullptr;    // created on Settings screen
 static lv_obj_t* statusWifiIcon = nullptr;   // header glyph on every screen: accent = connected, red = not
 static lv_obj_t* statusWifiLabel = nullptr;  // created on Settings screen, updated by updateStatusBar()
-static lv_obj_t* statusSettingsBtn = nullptr; // gear on the launcher header -> Settings
 static void updateStatusBar();
 // Volume: inline on the Settings screen
 static lv_obj_t* volumeSlider = nullptr;
@@ -147,23 +215,41 @@ static void gesture_timer_cb(lv_timer_t* t);
 #define TZT_STATUS_H   32
 #define TZT_CONTENT_TOP    TZT_STATUS_H
 #define TZT_CONTENT_H      (TZT_SCREEN_HEIGHT - TZT_STATUS_H)
+#define TZT_NAV_Y          (TZT_SCREEN_HEIGHT - UI_MARGIN - UI_ROW_H)  // bottom bar of big buttons on a section
 // Finger-friendly: minimum touch targets and consistent spacing (48px min for tap targets)
 #define TZT_MIN_TOUCH_H    48
-static lv_obj_t* statusBackBtn = nullptr;    // "< Home" in status bar; hidden on launcher
-static lv_obj_t* statusTitleLabel = nullptr; // section name in status bar; hidden on launcher
-static lv_obj_t* statusAppName = nullptr;    // app name in status bar; shown on launcher only
+static lv_obj_t* statusBackBtn = nullptr;    // "<" in status bar: section -> Menu, Menu -> home
+static lv_obj_t* statusTitleLabel = nullptr; // "Menu" or the section name
 static void updateHeader();
+// New items from the backend: the item opens itself, its launcher tile shows a "NEW" badge until
+// someone has looked at it, and Main blinks the LED
+static lv_obj_t* launcherBadges[LAUNCHER_BUTTONS] = {};
+static bool sectionHasNew[LAUNCHER_BUTTONS] = {};
+static int newItemShownSection = -1;        // section the last new item was opened on
+static unsigned long newItemShownAt = 0;
+static unsigned long lastUserTouchTime = 0;  // real touches only (lastDashboardTouchTime is also reset by code)
+static String newSoundName;                  // marked NEW on the Sounds player until played
+#define NEW_ITEM_BUSY_MS 15000  // touched this recently: someone is using the screen, badge it instead of jumping
+#define NEW_ITEM_LED_FLASHES 3
+static void setSectionNew(int section, bool isNew);
+static void openImageViewer(const String& path);
+// Settings > Restart (both boards)
+static lv_obj_t* restartConfirm = nullptr;
+static unsigned long restartAt = 0;
 static void launcherTileCb(lv_event_t* e);
 static void goToScreenIndex(int index);
 static void showStatusBar();
 static void hideStatusBar();
-// Splash: show splash.jpg at startup until UI is ready (defer createControlPanel to first loop).
-// Copy scripts/splash.jpg to the root of the SD card as /splash.jpg (optional; black screen if missing).
+// Splash: startup image until the UI is ready (createControlPanel is deferred to the first loop).
+// A 320x240 JPEG as /splash.jpg on the SD root, or a picture sent from the Pi named "splash.jpg";
+// without one, a drawn title card.
 #define SPLASH_PATH       "/splash.jpg"
-#define SPLASH_MIN_MS     10000  // Minimum time splash is visible (10 seconds)
+#define SPLASH_PHOTO_MS   6000   // minimum time a startup photo stays up (counted from boot, so WiFi time is included)
+#define SPLASH_CARD_MS    2500   // minimum time the drawn title card stays up
 static bool splashVisible = false;
 static unsigned long splashReadyAt = 0;
-static void drawSplashToTft();    // Draw splash to TFT before LVGL (raw); no-op if file missing
+static bool drawSplashToTft();    // Draw splash to TFT before LVGL (raw); true if it was a photo
+static void drawWifiSetupHelp();  // WiFi setup portal is open: how to connect
 static uint32_t calculateSensorHash() {
     if (!lastSensorDataValid) return 0;
     return ((uint32_t)((int)(lastSensorData.moisturePercent * 10)) << 24) |
@@ -200,7 +286,7 @@ static unsigned long pendingChunkSendTime = 0;  // Timeout: abort if no CHUNK_AC
 static unsigned long nextChunkSendAt = 0;      // When to send next chunk from loop (set by CHUNK_ACK; don't send from callback)
 static unsigned long chunkResendAt = 0;         // When to resend current chunk after send failed (set by onDataSent FAIL)
 static uint8_t chunkResendCount = 0;            // Cap retries to avoid infinite resend loop (Main dedupes late arrivals)
-#define PRINT_CHUNK_SIZE 199  // For CHUNK_ACK handler and sendPrintChunked
+#define PRINT_CHUNK_SIZE PRINT_CHUNK_BYTES  // For CHUNK_ACK handler and sendPrintChunked
 #define CHUNK_ACK_TIMEOUT_MS 15000
 #define CHUNK_RESEND_INTERVAL_MS 2000  // Resend current chunk every 2s until ACK or timeout
 #define CHUNK_MAX_RESENDS 8                     // Give up after 8 resends (~16s); Main will dedupe if late copy arrives
@@ -231,8 +317,49 @@ OTAUpdateService* otaService = nullptr;
 
 // Backend (HTTP server) + Reminders
 IBackendService* backend = nullptr;
+// The command poll's client (see commandPollTask). Its connection is the only TLS session the TZT has
+// RAM for, so Pi requests made while loop() handles a polled batch (downloads, "downloaded" marks,
+// the media sync) go through it too; `backend` (its own fresh connection) fails while that's open.
+static HttpBackendService* pollBackend = nullptr;
+// Health of the command poll and loop(), reported in /api/status
+static volatile unsigned long pollStartedAt = 0;  // set while a poll request is in flight (0 = none)
+static volatile unsigned long lastPollEndedAt = 0;
+static unsigned long maxLoopStallMs = 0;          // longest gap between loop() runs since boot
+#define POLL_HANG_RESTART_MS 120000  // a poll is answered within ~30 s; longer = a stalled connection
 ReminderService* reminderService = nullptr;
 bool remindersNeedSave = false;  // Flag to save reminders in background
+
+extern SDCardService sdCard;
+extern AudioService audioSvc;
+
+// Alarms (set from the web UI / API on :8080, or remotely via the Pi's /api/commands)
+AlarmService alarms;
+#define ALARMS_FILE DATA_DIR "/alarms.json"
+#define ALARM_RING_MS        120000  // rings until Stop, or this long
+#define ALARM_LED_EVERY_MS   6000    // re-send the LED blink while ringing
+#define ALARM_MIN_VOLUME     0.7f    // alarms ring at least this loud (restored after)
+static bool alarmRinging = false;
+static String alarmLabel;
+static unsigned long alarmStartedAt = 0;
+static unsigned long alarmLastLedAt = 0;
+static float alarmSavedVolume = 0;
+static void saveAlarms() { sdCard.writeFile(ALARMS_FILE, alarms.toJSON()); }
+static void stopAlarm();
+static void alarmLoop();
+static String addAlarmFrom(const String& hm, bool daily, const String& label);
+
+// Event chimes (RTTTL, played from flash): a short, distinct one per event
+#define TUNE_STARTUP  "start:d=16,o=6,b=160:c,e,g,4c7"
+#define TUNE_MESSAGE  "msg:d=16,o=6,b=200:g,8c7"
+#define TUNE_SOUND    "snd:d=16,o=6,b=200:c,e,c,8g"
+#define TUNE_PICTURE  "pic:d=16,o=6,b=200:e,g,8e7"
+#define TUNE_ALARM_SET "set:d=16,o=7,b=220:c,p,c"
+#define TUNE_ALARM    "alarm:d=8,o=7,b=200:c,p,c,p,c,p,c,2p"
+// Chime unless the user's own sound is playing (don't cut it off) or an alarm is ringing
+static void playChime(const char* tune) {
+    if (alarmRinging || (audioSvc.isPlaying() && !audioSvc.isPlayingTune())) return;
+    audioSvc.playTune(tune);
+}
 
 // SD Card
 SDCardService sdCard;
@@ -410,13 +537,15 @@ void onDataRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int len) {
 // Human-readable name for command type (for serial logs)
 // Send a long print message in chunks; handshake: send 1 → recv ACK 1 → send 2 → recv ACK 2 → ...
 // messageOnly: true = just the text (e.g. from index.html); false = full receipt with title, date, weather (e.g. from Shortcut)
-#define PRINT_CHUNK_DELAY_MS 300
-bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
-    if (!espNowInitialized) return false;
+// Only call when no chunked send is in progress: it replaces pendingChunkMessage. Use sendPrintChunked().
+static bool startPrintChunked(const String& fullMessage, bool messageOnly) {
     unsigned int len = fullMessage.length();
-    if (len == 0) return true;
     unsigned int totalChunks = (len + PRINT_CHUNK_SIZE - 1) / PRINT_CHUNK_SIZE;
-    if (totalChunks > 128) totalChunks = 128;
+    if (totalChunks > PRINT_MAX_CHUNKS) {  // Main would drop the whole message; print what fits
+        Logger::warn("Print", "Message too long (" + String(len) + " bytes), printing the first " +
+                     String(PRINT_MAX_CHUNKS * PRINT_CHUNK_SIZE));
+        totalChunks = PRINT_MAX_CHUNKS;
+    }
     pendingChunkMessage = fullMessage;
     pendingChunkIndex = 0;
     pendingChunkTotal = (uint8_t)totalChunks;
@@ -427,6 +556,65 @@ bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
     pendingChunkSendTime = millis();
     String chunk0 = fullMessage.substring(0, PRINT_CHUNK_SIZE);
     return sendCommandViaESPNow(CMD_PRINT_CHUNK, 0, (uint8_t)totalChunks, chunk0.c_str());
+}
+
+// Print queue. Main takes one message at a time: after the last chunk it prints (its loop is busy, so
+// it can't ACK) and it ignores a new PRINT_CHUNK_START for 3 s (CHUNK_PRINT_COOLDOWN_MS in main.cpp).
+// Starting the next message straight away would overwrite this one mid-send, or get it dropped. So
+// messages (from the Pi, reminders, this board's web page) wait here and go one after another.
+#define PRINT_QUEUE_MAX       4
+#define PRINT_QUEUE_MAX_BYTES (2 * PRINT_MAX_CHUNKS * PRINT_CHUNK_BYTES)  // caps the RAM it holds (~25 KB)
+#define PRINT_GAP_MS          4000  // after Main ACKs the last chunk: longer than its 3 s cooldown...
+#define PRINT_GAP_MS_PER_BYTE 2     // ...plus printing time, roughly 16 lines of 32 characters a second
+struct QueuedPrint { String text; bool messageOnly; };
+static QueuedPrint printQueue[PRINT_QUEUE_MAX];
+static uint8_t printQueueHead = 0, printQueueCount = 0;
+static size_t printQueueBytes = 0;
+static bool printSending = false;          // the message startPrintChunked() last began is still going out
+static unsigned long printSendDoneAt = 0;  // when it finished (all chunks ACKed, or the send gave up)
+static unsigned int printSendDoneLen = 0;  // its length, for the printing-time part of the gap
+
+static bool printQueueHasRoom(size_t len, uint8_t count = 1) {
+    if (printQueueCount == 0) return true;  // any one message fits an empty queue
+    return printQueueCount + count <= PRINT_QUEUE_MAX && printQueueBytes + len <= PRINT_QUEUE_MAX_BYTES;
+}
+
+// Called from loop(): starts the next queued message once Main is ready for it
+static void printQueueLoop() {
+    if (printSending) {
+        if (pendingChunkTotal > 0) return;
+        printSending = false;
+        printSendDoneAt = millis();
+    }
+    if (printQueueCount == 0) return;
+    if (millis() - printSendDoneAt < PRINT_GAP_MS + (unsigned long)PRINT_GAP_MS_PER_BYTE * printSendDoneLen) return;
+    QueuedPrint& q = printQueue[printQueueHead];
+    String text = q.text;
+    bool messageOnly = q.messageOnly;
+    q.text = String();  // free it now, not when the slot is reused
+    printQueueHead = (printQueueHead + 1) % PRINT_QUEUE_MAX;
+    printQueueCount--;
+    printQueueBytes -= text.length();
+    printSending = true;
+    printSendDoneLen = text.length();
+    startPrintChunked(text, messageOnly);  // a failed first send is retried by the chunk resend logic
+}
+
+// Queue a message for the printer. false = not queued (ESP-NOW down, or the queue is full).
+bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
+    if (!espNowInitialized) return false;
+    if (fullMessage.length() == 0) return true;
+    if (!printQueueHasRoom(fullMessage.length())) {
+        Logger::warn("Print", "Print queue full, message not printed");
+        return false;
+    }
+    QueuedPrint& q = printQueue[(printQueueHead + printQueueCount) % PRINT_QUEUE_MAX];
+    q.text = fullMessage;
+    q.messageOnly = messageOnly;
+    printQueueCount++;
+    printQueueBytes += fullMessage.length();
+    printQueueLoop();  // starts at once if the printer is free
+    return true;
 }
 
 // Enqueue a setting command: sent until Main ACKs it (up to SETTINGS_MAX_ATTEMPTS, SETTINGS_ACK_TIMEOUT_MS apart). Latest overwrites.
@@ -559,7 +747,12 @@ static void touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
         touchDebounceCount++;
         if (touchDebounceCount >= TOUCH_DEBOUNCE) {
             lastDashboardTouchTime = millis();  // any touch pauses auto-rotate 2 min
-            if (pressed) {
+            lastUserTouchTime = millis();
+            if (pressed && screenDimmed) touchSwallow = true;  // this touch only wakes the screen
+            wakeScreen();
+            if (touchSwallow) {
+                if (!pressed) touchSwallow = false;  // finger lifted: the next touch is a real one
+            } else if (pressed) {
                 touchLastX = sx;
                 touchLastY = sy;
                 touchStartX = sx;
@@ -579,7 +772,7 @@ static void touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) {
     }
     data->point.x = touchLastX;
     data->point.y = touchLastY;
-    data->state = touchLastState ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    data->state = (touchLastState && !touchSwallow) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 // LVGL display flush callback: send buffer to TFT
@@ -596,10 +789,8 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     lv_disp_flush_ready(drv);
 }
 
-// Nav: launcher (SCREEN_LAUNCHER) or section by index (0=Messages, 1=Sounds, 2=Pictures, 3=Settings)
+// Nav: home (SCREEN_HOME) -> menu (SCREEN_LAUNCHER) -> section by index (0=Messages, 1=Sounds, 2=Pictures, 3=Settings)
 static const char* const sectionTitles[SCREEN_COUNT] = { "Messages", "Sounds", "Pictures", "Settings" };
-static const char* const sectionIcons[SCREEN_COUNT] = {
-    LV_SYMBOL_ENVELOPE, LV_SYMBOL_AUDIO, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
 
 static lv_obj_t* screenByIndex(int idx) {
     switch (idx) {
@@ -607,72 +798,104 @@ static lv_obj_t* screenByIndex(int idx) {
         case SCREEN_SOUNDS:   return soundsScreen;
         case SCREEN_PICTURES: return picturesScreen;
         case SCREEN_SETTINGS: return settingsScreen;
+        case SCREEN_HOME:     return homeScreen;
         default: return launcherScreen;
     }
 }
 
-static void refreshAudioList();
-static void refreshImageList();
+// Home 0, menu 1, sections (and the image viewer, which counts as Pictures) 2
+static int screenDepth(int idx) {
+    return idx == SCREEN_HOME ? 0 : idx == SCREEN_LAUNCHER ? 1 : 2;
+}
 
-// Open a section (or the launcher). Lists are re-read from SD on every open so they're never stale.
+// Open home, the menu or a section. Files are re-read from SD on every open so they're never stale,
+// and each section opens on its newest item. Going deeper slides in from the right, back from the left.
 static void goToScreenIndex(int index) {
-    if (index != SCREEN_LAUNCHER && (index < 0 || index >= SCREEN_COUNT)) return;
+    if (index != SCREEN_HOME && index != SCREEN_LAUNCHER && (index < 0 || index >= SCREEN_COUNT)) return;
     lv_obj_t* target = screenByIndex(index);
-    if (index == currentScreenIndex && lv_scr_act() == target) return;
-    bool opening = (index != SCREEN_LAUNCHER);
+    if (!target || (index == currentScreenIndex && lv_scr_act() == target)) return;
+    bool deeper = screenDepth(index) > screenDepth(currentScreenIndex);
     currentImagePath = "";
-    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);  // Messages always opens on the list
     currentScreenIndex = index;
-    if (index == SCREEN_MESSAGES) refreshHistoryList();
-    else if (index == SCREEN_SOUNDS) refreshAudioList();
-    else if (index == SCREEN_PICTURES) refreshImageList();
-    if (opening) lastSectionOpenTime = (uint32_t)millis();
-    showStatusBar();  // the image viewer hides it
-    lv_scr_load_anim(target, opening ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+    if (index == SCREEN_MESSAGES) refreshMessages();
+    else if (index == SCREEN_SOUNDS) refreshSounds(true);
+    else if (index == SCREEN_PICTURES) refreshImages();
+    else if (index == SCREEN_HOME) updateHomeScreen();
+    if (deeper) lastSectionOpenTime = (uint32_t)millis();  // the opening tap mustn't also hit the new screen
+    if (index == SCREEN_HOME) hideStatusBar();
+    else showStatusBar();  // home and the image viewer hide it
+    lv_scr_load_anim(target, deeper ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
         180, 0, false);
     updateHeader();
 }
 
 static void launcherTileCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    goToScreenIndex((int)(intptr_t)lv_event_get_user_data(e));
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    setSectionNew(idx, false);
+    if (idx == SCREEN_PICTURES) {
+        refreshImages();
+        if (imageFileCount > 0) {  // straight to the newest picture; the Pictures screen is only "none yet"
+            showImageAt(0);
+            return;
+        }
+    }
+    goToScreenIndex(idx);
 }
 
-// Jump to the launcher from any screen, including the image viewer
+static void setSectionNew(int section, bool isNew) {
+    if (section < 0 || section >= LAUNCHER_BUTTONS) return;
+    sectionHasNew[section] = isNew;
+    if (launcherBadges[section]) {
+        if (isNew) lv_obj_clear_flag(launcherBadges[section], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(launcherBadges[section], LV_OBJ_FLAG_HIDDEN);
+    }
+    // Home's Menu button carries a NEW pill while any section has something unseen
+    if (homeMenuBadge) {
+        bool any = false;
+        for (int i = 0; i < LAUNCHER_BUTTONS; i++) any = any || sectionHasNew[i];
+        if (any) lv_obj_clear_flag(homeMenuBadge, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(homeMenuBadge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Jump to the menu from any screen, including the image viewer
 static void returnToLauncher() {
     goToScreenIndex(SCREEN_LAUNCHER);
 }
 
+// "<": a section goes back to the menu, the menu back to home
 static void statusBackCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    goToScreenIndex(SCREEN_LAUNCHER);
+    goToScreenIndex(currentScreenIndex == SCREEN_LAUNCHER ? SCREEN_HOME : SCREEN_LAUNCHER);
 }
 
-static void statusSettingsCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    goToScreenIndex(SCREEN_SETTINGS);
-}
 
-// Status bar: launcher shows app name + settings gear; sections show "<" back + section title.
-// Time and WiFi glyph sit on the right, shifted left on the launcher to make room for the gear.
+// Status bar (hidden on home): "<" back + "Menu" or the section title
 static void updateHeader() {
-    bool onLauncher = (currentScreenIndex == SCREEN_LAUNCHER);
-    if (statusTitleLabel && !onLauncher) lv_label_set_text(statusTitleLabel, sectionTitles[currentScreenIndex]);
-    lv_obj_t* sectionOnly[] = { statusBackBtn, statusTitleLabel };
-    for (lv_obj_t* o : sectionOnly) {
-        if (!o) continue;
-        if (onLauncher) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    if (statusTitleLabel)
+        lv_label_set_text(statusTitleLabel, currentScreenIndex >= 0 ? sectionTitles[currentScreenIndex] : "Menu");
+}
+
+static void showToast(const char* text) {
+    if (!toastLabel) {
+        toastLabel = lv_label_create(lv_layer_top());
+        lv_obj_set_style_text_font(toastLabel, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(toastLabel, uiColor(UI_TEXT), 0);
+        lv_obj_set_style_bg_color(toastLabel, uiColor(UI_FIELD), 0);
+        lv_obj_set_style_bg_opa(toastLabel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(toastLabel, uiColor(UI_BORDER), 0);
+        lv_obj_set_style_border_width(toastLabel, 1, 0);
+        lv_obj_set_style_radius(toastLabel, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_hor(toastLabel, 14, 0);
+        lv_obj_set_style_pad_ver(toastLabel, 7, 0);
     }
-    lv_obj_t* launcherOnly[] = { statusAppName, statusSettingsBtn };
-    for (lv_obj_t* o : launcherOnly) {
-        if (!o) continue;
-        if (onLauncher) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
-    }
-    int right = onLauncher ? UI_BACK_W : UI_MARGIN;
-    if (statusWifiIcon) lv_obj_align(statusWifiIcon, LV_ALIGN_RIGHT_MID, -right, 0);
-    if (statusTimeLabel) lv_obj_align(statusTimeLabel, LV_ALIGN_RIGHT_MID, -(right + 24), 0);
+    lv_label_set_text(toastLabel, text);
+    lv_obj_clear_flag(toastLabel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(toastLabel);
+    lv_obj_align(toastLabel, LV_ALIGN_TOP_MID, 0, 4);  // over the status bar; taps pass through a label
+    toastHideAt = millis() + 2200;
+    if (toastHideAt == 0) toastHideAt = 1;
 }
 
 static void showStatusBar() {
@@ -763,11 +986,29 @@ static lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, const lv_font_t* 
     return l;
 }
 
-// Rounded card: header band / tile / row tone, no border
+// Hairline: cactus green 22% over the background (--border in theme.css)
+static lv_color_t uiHairline() {
+    return lv_color_mix(uiColor(UI_BORDER), uiColor(UI_BACKGROUND), 56);
+}
+
+// Short cactus-green rule: the brand mark under the splash title, reused on tiles and empty states
+static lv_obj_t* makeAccentRule(lv_obj_t* parent, int w) {
+    lv_obj_t* r = lv_obj_create(parent);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, w, 3);
+    lv_obj_set_style_bg_color(r, uiColor(UI_BORDER), 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(r, 2, 0);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_CLICKABLE);
+    return r;
+}
+
+// Rounded card: header band / tile / row tone with a hairline edge (.card in theme.css)
 static void styleCard(lv_obj_t* obj, int pad) {
     lv_obj_set_style_bg_color(obj, uiColor(UI_CARD), 0);
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_border_color(obj, uiHairline(), 0);
+    lv_obj_set_style_border_width(obj, 1, 0);
     lv_obj_set_style_shadow_width(obj, 0, 0);
     lv_obj_set_style_radius(obj, UI_RADIUS, 0);
     lv_obj_set_style_pad_all(obj, pad, 0);
@@ -813,66 +1054,72 @@ static lv_obj_t* makeBarIconButton(lv_obj_t* bar, const char* icon, lv_event_cb_
     return btn;
 }
 
-// Scrolling list under the status bar: transparent, rows are separate cards with a gap between
-static lv_obj_t* makeCardList(lv_obj_t* parent, int h = TZT_CONTENT_H) {
-    lv_obj_t* list = lv_list_create(parent);
-    lv_obj_set_size(list, TZT_SCREEN_WIDTH, h);
-    lv_obj_set_pos(list, 0, TZT_STATUS_H);
-    lv_obj_set_style_bg_color(list, uiColor(UI_BACKGROUND), 0);
-    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_radius(list, 0, 0);
-    lv_obj_set_style_pad_all(list, UI_MARGIN, 0);
-    lv_obj_set_style_pad_row(list, UI_GAP, 0);
-    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER);
-    return list;
+// Disabled buttons (nothing newer/older) sink into the card tone and stop sending CLICKED.
+// Local disabled-state colours, or the LVGL theme's grey disabled style would win.
+static void setButtonEnabled(lv_obj_t* btn, bool on) {
+    if (!btn) return;
+    lv_obj_set_style_bg_color(btn, uiColor(UI_CARD), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(btn, uiColor(UI_FIELD), LV_STATE_DISABLED);
+    if (on) lv_obj_clear_state(btn, LV_STATE_DISABLED);
+    else lv_obj_add_state(btn, LV_STATE_DISABLED);
 }
 
-// One list row card - Spectral's drawMenuRow(): label left, and a chevron
-// on the right only when the row opens another page (opensPage).
-// Rows share static styles rather than local ones: a list can hold 20+ rows and
-// per-object local style props add up in LVGL's heap.
-static lv_style_t style_row, style_row_icon;
-static lv_obj_t* addListRow(lv_obj_t* list, const char* icon, const char* text, bool opensPage,
-                            lv_event_cb_t cb, int idx) {
-    static bool inited = false;
-    if (!inited) {
-        lv_style_init(&style_row);
-        lv_style_set_height(&style_row, UI_ROW_H);
-        lv_style_set_bg_color(&style_row, uiColor(UI_CARD));
-        lv_style_set_bg_opa(&style_row, LV_OPA_COVER);
-        lv_style_set_border_width(&style_row, 0);
-        lv_style_set_shadow_width(&style_row, 0);
-        lv_style_set_radius(&style_row, UI_RADIUS);
-        lv_style_set_pad_hor(&style_row, 12);
-        lv_style_set_pad_ver(&style_row, 0);
-        lv_style_set_text_font(&style_row, &lv_font_montserrat_14);
-        lv_style_set_text_color(&style_row, uiColor(UI_TEXT));
-        lv_style_init(&style_row_icon);
-        lv_style_set_text_color(&style_row_icon, uiColor(UI_ACCENT));
-        inited = true;
-    }
-    lv_obj_t* btn = lv_list_add_btn(list, icon, text);
-    lv_obj_add_style(btn, &style_row, 0);
-    applyBtnPressStyle(btn);
-    lv_obj_t* img = lv_obj_get_child(btn, 0);  // the icon: a symbol, drawn in the text colour
-    if (icon && img) lv_obj_add_style(img, &style_row_icon, 0);
-    lv_obj_t* lbl = lv_obj_get_child(btn, icon ? 1 : 0);
-    if (lbl) lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-    if (opensPage) makeLabel(btn, LV_SYMBOL_RIGHT, &lv_font_montserrat_12, UI_TEXT_MUTED);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void*)(uintptr_t)idx);
+// Big button for a section's bottom bar; user_data carries the step (-1 newer, +1 older) or 0
+static lv_obj_t* makeBarButton(lv_obj_t* parent, const char* text, int x, int w, bool primary,
+                               lv_event_cb_t cb, int step) {
+    lv_obj_t* btn = makeButton(parent, text, w, UI_ROW_H, primary, nullptr);
+    lv_obj_set_pos(btn, x, TZT_NAV_Y);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void*)(intptr_t)step);
     return btn;
 }
 
-// Empty/error state inside a card list
-static void addListNote(lv_obj_t* list, const char* text) {
-    lv_obj_t* t = lv_list_add_text(list, text);
-    lv_obj_set_style_bg_opa(t, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_text_color(t, uiColor(UI_TEXT_MUTED), 0);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_pad_ver(t, 12, 0);
+// Card filling the content area above the bottom bar; tap/swipe on it is handled by cb
+static lv_obj_t* makeItemCard(lv_obj_t* parent, int pad, lv_event_cb_t cb) {
+    lv_obj_t* card = lv_obj_create(parent);
+    lv_obj_set_size(card, TZT_SCREEN_WIDTH - 2 * UI_MARGIN, TZT_NAV_Y - UI_GAP - (TZT_CONTENT_TOP + UI_GAP));
+    lv_obj_set_pos(card, UI_MARGIN, TZT_CONTENT_TOP + UI_GAP);
+    styleCard(card, pad);
+    lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, nullptr);
+    return card;
+}
+
+// "Nothing here yet": a short cactus rule over a line of text, filling the content area.
+// The text label is the note's child 1 (set by showItemView).
+static lv_obj_t* makeEmptyNote(lv_obj_t* parent) {
+    lv_obj_t* note = lv_obj_create(parent);
+    lv_obj_remove_style_all(note);
+    lv_obj_set_size(note, TZT_SCREEN_WIDTH, TZT_CONTENT_H);
+    lv_obj_set_pos(note, 0, TZT_CONTENT_TOP);
+    lv_obj_clear_flag(note, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* rule = makeAccentRule(note, 28);
+    lv_obj_align(rule, LV_ALIGN_CENTER, 0, -22);
+    lv_obj_t* l = makeLabel(note, "", &lv_font_montserrat_16, UI_TEXT_MUTED);
+    lv_obj_set_width(l, TZT_SCREEN_WIDTH - 4 * UI_MARGIN);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(l, LV_ALIGN_CENTER, 0, 22);
+    return note;
+}
+
+// "NEW" pill, shown while something nobody has looked at yet is waiting
+static lv_obj_t* makeNewBadge(lv_obj_t* parent) {
+    lv_obj_t* badge = lv_label_create(parent);
+    lv_label_set_text(badge, "NEW");
+    lv_obj_set_style_text_font(badge, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(badge, uiColor(UI_BACKGROUND), 0);
+    lv_obj_set_style_bg_color(badge, uiColor(UI_ACCENT), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(badge, 8, 0);
+    lv_obj_set_style_pad_ver(badge, 3, 0);
+    return badge;
+}
+
+// Sideways swipe of the touch that just ended (set by touch_read_cb before LVGL handles the release):
+// finger moved left = +1 (older, like flicking to the next page), right = -1 (newer), 0 = a tap
+static int lastSwipeStep() {
+    int32_t dx = gestureEndX - gestureStartX, dy = gestureEndY - gestureStartY;
+    if (abs(dx) < SWIPE_THRESHOLD || abs(dx) < 2 * abs(dy)) return 0;
+    return dx < 0 ? 1 : -1;
 }
 
 // App-style toggle: accent pill + white knob when on, dark outlined track when off
@@ -946,112 +1193,412 @@ static void ledToggleCb(lv_event_t* e) {
     enqueueSettingCommand(CMD_SET_LED_STATE, turnOn ? 1 : 0, 0);
 }
 
-// Icon (accent) + title, the caption row used on tiles and cards
-static void makeIconTitle(lv_obj_t* parent, const char* icon, const char* text,
-                          const lv_font_t* font, UiColor textColor, int textX) {
-    lv_obj_t* i = makeLabel(parent, icon, font, UI_ACCENT);
-    lv_obj_set_pos(i, 0, 0);
-    lv_obj_t* t = makeLabel(parent, text, font, textColor);
-    lv_obj_set_pos(t, textX, 0);
+// ---- Restart (Settings): confirm, then reboot Main over ESP-NOW and this board a moment later ----
+
+static void closeRestartConfirm() {
+    if (restartConfirm) lv_obj_del_async(restartConfirm);
+    restartConfirm = nullptr;
 }
+
+static void restartCancelCb(lv_event_t* e) {
+    (void)e;
+    closeRestartConfirm();
+}
+
+static void restartGoCb(lv_event_t* e) {
+    (void)e;
+    closeRestartConfirm();
+    enqueueSettingCommand(CMD_RESTART, 0, 0);  // resent until Main ACKs; Main reboots ~0.5 s after
+    restartAt = millis() + 2500;               // give that time to land before we reboot too
+    if (restartAt == 0) restartAt = 1;
+    lv_obj_t* cover = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(cover);
+    lv_obj_set_size(cover, TZT_SCREEN_WIDTH, TZT_SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(cover, uiColor(UI_BACKGROUND), 0);
+    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, 0);
+    lv_obj_add_flag(cover, LV_OBJ_FLAG_CLICKABLE);  // swallow taps while we go down
+    lv_obj_t* msg = makeLabel(cover, "Restarting...", &lv_font_montserrat_18, UI_TEXT);
+    lv_obj_center(msg);
+}
+
+// Modal card over everything (top layer); the dimmed backdrop swallows taps
+static void restartAskCb(lv_event_t* e) {
+    (void)e;
+    if (restartConfirm || restartAt) return;
+    restartConfirm = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(restartConfirm);
+    lv_obj_set_size(restartConfirm, TZT_SCREEN_WIDTH, TZT_SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(restartConfirm, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(restartConfirm, LV_OPA_60, 0);
+    lv_obj_add_flag(restartConfirm, LV_OBJ_FLAG_CLICKABLE);
+    const int w = 260, h = 132, btnW = (w - 3 * 12) / 2;
+    lv_obj_t* card = lv_obj_create(restartConfirm);
+    lv_obj_set_size(card, w, h);
+    lv_obj_center(card);
+    styleCard(card, 12);
+    lv_obj_t* title = makeLabel(card, "Restart both boards?", &lv_font_montserrat_16, UI_TEXT);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_t* body = makeLabel(card, "The screen and Main come back in ~15 s.", &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_set_width(body, w - 24);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 26);
+    lv_obj_t* cancel = makeButton(card, "Cancel", btnW, 40, false, restartCancelCb);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t* go = makeButton(card, "Restart", btnW, 40, true, restartGoCb);
+    lv_obj_align(go, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+}
+
+// ---- Home: Dispense + Menu ----
+
+static bool dispenseLocked() { return dispenseLockUntil && (long)(millis() - dispenseLockUntil) < 0; }
+
+// Ring, label, status line and enabled state of the Dispense card, from Main's last sensor packet
+static void updateHomeScreen() {
+    if (!homeDispenseBtn) return;
+    if (dispenseLockUntil && !dispenseLocked()) {
+        dispenseLockUntil = 0;
+        if (homeDoseBar) lv_obj_add_flag(homeDoseBar, LV_OBJ_FLAG_HIDDEN);
+    }
+    bool busy = dispenseLocked() || (lastSensorDataValid && lastSensorData.isDispensing);
+    setLabelIfChanged(homeDispenseLabel, busy ? "Dispensing" : "Dispense");
+    setButtonEnabled(homeDispenseBtn, !busy);
+    int level = lastSensorDataValid ? (int)(lastSensorData.sanitizerLevel + 0.5f) : -1;
+    bool low = level >= 0 && level <= 15;
+    const char* info;
+    if (busy) info = "Hands under nozzle";
+    else if (!lastSensorDataValid) info = "Main board offline";
+    else if (low) info = "Refill soon";
+    else if (!wantIrSensor) info = "Hand sensor off";
+    else info = "One dose per tap";
+    setLabelIfChanged(homeDispenseInfo, info);
+    if (homeLevelArc) {
+        lv_arc_set_value(homeLevelArc, level < 0 ? 0 : constrain(level, 0, 100));
+        lv_obj_set_style_arc_color(homeLevelArc, uiColor(low ? UI_AMBER : UI_ACCENT), LV_PART_INDICATOR);
+    }
+    if (homeLevelLabel) {
+        char pct[8];
+        if (level < 0) snprintf(pct, sizeof(pct), "--");
+        else snprintf(pct, sizeof(pct), "%d%%", level);
+        setLabelIfChanged(homeLevelLabel, pct);
+    }
+}
+
+// One dose: Main runs the pump for its set dose (0.6 s = 3 ml) and stops it on its own
+static void homeDispenseCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || dispenseLocked() || sectionJustOpened()) return;
+    dispenseLockUntil = millis() + DISPENSE_LOCK_MS;
+    if (dispenseLockUntil == 0) dispenseLockUntil = 1;
+    bool sent = sendPumpCommandRepeated(CMD_DISPENSE_START);
+    Logger::info("UI", sent ? "Dispense tapped" : "Dispense tapped, but ESP-NOW send failed");
+    if (!lastSensorDataValid) showToast("Main board isn't answering");
+    if (homeDoseBar) {  // fills over the dose time
+        lv_obj_clear_flag(homeDoseBar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(homeDoseBar, 0, LV_ANIM_OFF);
+        lv_bar_set_value(homeDoseBar, 100, LV_ANIM_ON);
+    }
+    updateHomeScreen();
+}
+
+static void homeMenuCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    goToScreenIndex(SCREEN_LAUNCHER);
+}
+
+// ---- Sensors (Settings) ----
+
+static void loadSensorPrefs() {
+    Preferences prefs;
+    if (!prefs.begin("sensors", true)) return;  // first boot: namespace not created yet, keep defaults
+    wantIrSensor = prefs.getBool("ir", true);
+    wantMoistureSensor = prefs.getBool("moist", true);
+    prefs.end();
+}
+
+static void loadDisplayPrefs() {
+    Preferences prefs;
+    if (!prefs.begin("display", true)) return;  // first boot: keep the default
+    uint8_t m = prefs.getUChar("dimMin", dimAfterMin);
+    for (uint8_t c : dimChoices) if (c == m) dimAfterMin = m;  // ignore anything unexpected
+    prefs.end();
+}
+
+static void dimLabelText(char* out, size_t len) {
+    if (dimAfterMin) snprintf(out, len, "%u min", (unsigned)dimAfterMin);
+    else snprintf(out, len, "Never");
+}
+
+// Settings: tap cycles 1 -> 2 -> 5 min -> Never
+static void dimCycleCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    size_t n = sizeof(dimChoices), i = 0;
+    while (i < n && dimChoices[i] != dimAfterMin) i++;
+    dimAfterMin = dimChoices[(i + 1) % n];
+    Preferences prefs;
+    if (prefs.begin("display", false)) {
+        prefs.putUChar("dimMin", dimAfterMin);
+        prefs.end();
+    }
+    char t[12];
+    dimLabelText(t, sizeof(t));
+    if (dimValueLabel) lv_label_set_text(dimValueLabel, t);
+    wakeScreen();
+}
+
+static void saveSensorPrefs() {
+    Preferences prefs;
+    if (!prefs.begin("sensors", false)) return;
+    prefs.putBool("ir", wantIrSensor);
+    prefs.putBool("moist", wantMoistureSensor);
+    prefs.end();
+}
+
+// Main reports moisture < 0 while its moisture sensor is switched off
+static bool mainMoistureOn() { return lastSensorData.moisturePercent >= 0; }
+
+// Re-send a sensor setting Main doesn't match (it rebooted, or missed the command). One setting per
+// call: the settings queue holds a single command, and the next packet catches the other one.
+static void syncSensorSettingsToMain() {
+    if (!lastSensorDataValid || pendingSettingRemainingSends > 0) return;
+    if (lastSensorResyncAt && millis() - lastSensorResyncAt < SENSOR_RESYNC_MS) return;
+    if (lastSensorData.autoDispense != wantIrSensor) {
+        enqueueSettingCommand(CMD_SET_AUTO_DISPENSE, wantIrSensor ? 1 : 0, 0);
+    } else if (mainMoistureOn() != wantMoistureSensor) {
+        enqueueSettingCommand(CMD_SET_MOISTURE_SENSOR, wantMoistureSensor ? 1 : 0, 0);
+    } else {
+        return;
+    }
+    lastSensorResyncAt = millis();
+}
+
+static void sensorSwitchCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    lv_obj_t* sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (sw == irSensorSwitch) {
+        wantIrSensor = on;
+        enqueueSettingCommand(CMD_SET_AUTO_DISPENSE, on ? 1 : 0, 0);
+        showToast(on ? "Hand sensor on" : "Hand sensor off - Dispense only");
+        Logger::info("UI", String("IR hand sensor ") + (on ? "on" : "off"));
+    } else {
+        wantMoistureSensor = on;
+        enqueueSettingCommand(CMD_SET_MOISTURE_SENSOR, on ? 1 : 0, 0);
+        showToast(on ? "Moisture sensor on" : "Moisture sensor off");
+        Logger::info("UI", String("Moisture sensor ") + (on ? "on" : "off"));
+    }
+    saveSensorPrefs();
+    lastSensorResyncAt = millis();  // give Main time to apply it before checking its packets
+    updateHomeScreen();
+}
+
+// ---- Layout pieces shared by the menu and Settings ----
+
+// Small uppercase caption over a group (".caption" in theme.css)
+static lv_obj_t* makeCaption(lv_obj_t* parent, const char* text, int x, int y) {
+    lv_obj_t* c = makeLabel(parent, text, &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_set_style_text_letter_space(c, 1, 0);
+    lv_obj_set_pos(c, x, y);
+    return c;
+}
+
+// Settings row inside a group card: title (+ optional muted line under it) on the left
+static void makeRowText(lv_obj_t* card, int y, int rowH, const char* title, const char* sub) {
+    lv_obj_t* t = makeLabel(card, title, &lv_font_montserrat_14, UI_TEXT);
+    if (sub) {
+        lv_obj_t* s = makeLabel(card, sub, &lv_font_montserrat_12, UI_TEXT_MUTED);
+        lv_obj_set_pos(t, 0, y + rowH / 2 - 17);
+        lv_obj_set_pos(s, 0, y + rowH / 2 + 2);
+    } else {
+        lv_obj_set_pos(t, 0, y + rowH / 2 - 8);
+    }
+}
+
+// Hairline between rows of a group card
+static void makeRowDivider(lv_obj_t* card, int y, int w) {
+    lv_obj_t* d = lv_obj_create(card);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_size(d, w, 1);
+    lv_obj_set_pos(d, 0, y);
+    lv_obj_set_style_bg_color(d, uiHairline(), 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+}
+
+static const char* const tileSubtitles[SCREEN_COUNT] = {
+    "Notes sent to you", "Voice messages", "From the phone", "Sensors, light, sound" };
 
 static void createControlPanel() {
     const int cardW = TZT_SCREEN_WIDTH - 2 * UI_MARGIN;
+
+    // ---- Home (no status bar): Dispense card over the top 75%, Menu bar in the bottom 25% ----
+    homeScreen = lv_obj_create(NULL);
+    setScreenStyle(homeScreen);
+    {
+        const int split = TZT_SCREEN_HEIGHT * 3 / 4;  // 180 of 240
+        const int cardH = split - UI_MARGIN - UI_GAP / 2;
+        homeDispenseBtn = lv_btn_create(homeScreen);
+        lv_obj_set_size(homeDispenseBtn, cardW, cardH);
+        lv_obj_set_pos(homeDispenseBtn, UI_MARGIN, UI_MARGIN);
+        styleButton(homeDispenseBtn, true);
+        lv_obj_set_style_bg_grad_color(homeDispenseBtn, uiColor(UI_BUTTON), 0);  // cactus green, deepening downwards
+        lv_obj_set_style_bg_grad_dir(homeDispenseBtn, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_grad_dir(homeDispenseBtn, LV_GRAD_DIR_NONE, LV_STATE_DISABLED);
+        lv_obj_set_style_pad_all(homeDispenseBtn, 0, 0);
+        lv_obj_add_event_cb(homeDispenseBtn, homeDispenseCb, LV_EVENT_CLICKED, nullptr);
+
+        // Sanitizer level ring on the left
+        const int ring = 104;
+        homeLevelArc = lv_arc_create(homeDispenseBtn);
+        lv_obj_set_size(homeLevelArc, ring, ring);
+        lv_obj_align(homeLevelArc, LV_ALIGN_LEFT_MID, 18, -4);
+        lv_obj_remove_style(homeLevelArc, nullptr, LV_PART_KNOB);
+        lv_obj_clear_flag(homeLevelArc, LV_OBJ_FLAG_CLICKABLE);  // taps go to the card
+        lv_arc_set_rotation(homeLevelArc, 270);
+        lv_arc_set_bg_angles(homeLevelArc, 0, 360);
+        lv_arc_set_range(homeLevelArc, 0, 100);
+        lv_obj_set_style_arc_width(homeLevelArc, 8, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(homeLevelArc, 8, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(homeLevelArc, uiColor(UI_BUTTON), LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(homeLevelArc, true, LV_PART_INDICATOR);
+        lv_obj_set_style_pad_all(homeLevelArc, 0, 0);
+        homeLevelLabel = makeLabel(homeLevelArc, "--", &lv_font_montserrat_24, UI_TITLE);
+        lv_obj_align(homeLevelLabel, LV_ALIGN_CENTER, 0, -6);
+        lv_obj_t* left = makeLabel(homeLevelArc, "LEFT", &lv_font_montserrat_12, UI_ACCENT);
+        lv_obj_set_style_text_letter_space(left, 1, 0);
+        lv_obj_align(left, LV_ALIGN_CENTER, 0, 16);
+
+        // Action text on the right
+        const int textX = 18 + ring + 20;
+        homeDispenseLabel = makeLabel(homeDispenseBtn, "Dispense", &lv_font_montserrat_24, UI_TITLE);
+        lv_obj_align(homeDispenseLabel, LV_ALIGN_LEFT_MID, textX, -16);
+        homeDispenseInfo = makeLabel(homeDispenseBtn, "", &lv_font_montserrat_14, UI_ACCENT);
+        lv_obj_set_width(homeDispenseInfo, cardW - textX - 12);
+        lv_label_set_long_mode(homeDispenseInfo, LV_LABEL_LONG_DOT);
+        lv_obj_align(homeDispenseInfo, LV_ALIGN_LEFT_MID, textX, 14);
+
+        // Dose progress along the bottom edge while the pump runs
+        homeDoseBar = lv_bar_create(homeDispenseBtn);
+        lv_obj_set_size(homeDoseBar, cardW - 36, 4);
+        lv_obj_align(homeDoseBar, LV_ALIGN_BOTTOM_MID, 0, -12);
+        lv_bar_set_range(homeDoseBar, 0, 100);
+        lv_obj_set_style_bg_color(homeDoseBar, uiColor(UI_FIELD), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(homeDoseBar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(homeDoseBar, uiColor(UI_ACCENT), LV_PART_INDICATOR);
+        lv_obj_set_style_anim_time(homeDoseBar, MAX_DOSE_MS, 0);
+        lv_obj_clear_flag(homeDoseBar, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(homeDoseBar, LV_OBJ_FLAG_HIDDEN);
+
+        int menuY = split + UI_GAP / 2;
+        lv_obj_t* menuBtn = makeButton(homeScreen, "Menu", cardW, TZT_SCREEN_HEIGHT - menuY - UI_MARGIN, false, homeMenuCb);
+        lv_obj_set_pos(menuBtn, UI_MARGIN, menuY);
+        lv_obj_set_style_bg_color(menuBtn, uiColor(UI_CARD), 0);
+        lv_obj_set_style_border_color(menuBtn, uiHairline(), 0);
+        lv_obj_set_style_border_width(menuBtn, 1, 0);
+        lv_obj_set_style_text_font(lv_obj_get_child(menuBtn, 0), &lv_font_montserrat_18, 0);
+        homeMenuBadge = makeNewBadge(menuBtn);
+        lv_obj_align(homeMenuBadge, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_add_flag(homeMenuBadge, LV_OBJ_FLAG_HIDDEN);
+    }
+
     const int top = TZT_CONTENT_TOP + UI_GAP;   // first content row under the status bar
 
-    // ---- Launcher: three tall buttons, a big icon over the section name ----
+    // ---- Menu: 2x2 text tiles (Messages, Sounds, Pictures, Settings) ----
     launcherScreen = lv_obj_create(NULL);
     setScreenStyle(launcherScreen);
     {
-        int btnW = (cardW - (LAUNCHER_BUTTONS - 1) * UI_GAP) / LAUNCHER_BUTTONS;
-        int btnH = TZT_SCREEN_HEIGHT - top - UI_MARGIN;
-        for (int i = 0; i < LAUNCHER_BUTTONS; i++) {
+        int tileW = (cardW - UI_GAP) / 2;
+        int tileH = (TZT_SCREEN_HEIGHT - top - UI_MARGIN - UI_GAP) / 2;
+        for (int i = 0; i < SCREEN_COUNT; i++) {
             lv_obj_t* btn = lv_btn_create(launcherScreen);
-            lv_obj_set_size(btn, btnW, btnH);
-            lv_obj_set_pos(btn, UI_MARGIN + i * (btnW + UI_GAP), top);
-            styleCard(btn, 0);
+            lv_obj_set_size(btn, tileW, tileH);
+            lv_obj_set_pos(btn, UI_MARGIN + (i % 2) * (tileW + UI_GAP), top + (i / 2) * (tileH + UI_GAP));
+            styleCard(btn, 12);
             applyBtnPressStyle(btn);
             lv_obj_add_event_cb(btn, launcherTileCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-            lv_obj_t* icon = makeLabel(btn, sectionIcons[i], &lv_font_montserrat_32, UI_ACCENT);
-            lv_obj_align(icon, LV_ALIGN_CENTER, 0, -14);
-            lv_obj_t* name = makeLabel(btn, sectionTitles[i], &lv_font_montserrat_16, UI_TEXT);
-            lv_obj_align(name, LV_ALIGN_CENTER, 0, 26);
+            lv_obj_t* rule = makeAccentRule(btn, 22);
+            lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 0, 2);
+            lv_obj_t* name = makeLabel(btn, sectionTitles[i], &lv_font_montserrat_18, UI_TEXT);
+            lv_obj_align(name, LV_ALIGN_BOTTOM_LEFT, 0, -18);
+            lv_obj_t* sub = makeLabel(btn, tileSubtitles[i], &lv_font_montserrat_12, UI_TEXT_MUTED);
+            lv_obj_set_width(sub, tileW - 24);
+            lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
+            lv_obj_align(sub, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+            if (i < LAUNCHER_BUTTONS) {
+                lv_obj_t* badge = makeNewBadge(btn);
+                lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, 0, -4);
+                if (!sectionHasNew[i]) lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+                launcherBadges[i] = badge;
+            }
         }
     }
 
-    // ---- Messages: list (newest first); tap a row to read it in full ----
+    const int halfW = (cardW - UI_GAP) / 2;
+
+    // ---- Messages: the newest message in full; Newer / Older below (or swipe the card) ----
     messagesScreen = lv_obj_create(NULL);
     setScreenStyle(messagesScreen);
-    historyList = makeCardList(messagesScreen);
+    msgCard = makeItemCard(messagesScreen, 12, messageCardCb);
+    lv_obj_add_flag(msgCard, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scroll_dir(msgCard, LV_DIR_VER);
+    msgMetaLabel = makeLabel(msgCard, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_set_style_text_letter_space(msgMetaLabel, 1, 0);
+    lv_obj_set_pos(msgMetaLabel, 0, 0);
+    msgPosLabel = makeLabel(msgCard, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
+    lv_obj_align(msgPosLabel, LV_ALIGN_TOP_RIGHT, 0, 0);
+    msgTextLabel = makeLabel(msgCard, "", &lv_font_montserrat_16, UI_TEXT);
+    lv_label_set_long_mode(msgTextLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msgTextLabel, cardW - 24);
+    lv_obj_set_style_text_line_space(msgTextLabel, 3, 0);
+    lv_obj_set_pos(msgTextLabel, 0, 24);
+    msgNewerBtn = makeBarButton(messagesScreen, LV_SYMBOL_LEFT "  Newer", UI_MARGIN, halfW, false, messageStepCb, -1);
+    msgOlderBtn = makeBarButton(messagesScreen, "Older  " LV_SYMBOL_RIGHT, UI_MARGIN + halfW + UI_GAP, halfW, false, messageStepCb, 1);
+    msgEmptyNote = makeEmptyNote(messagesScreen);
 
-    historyDetail = lv_obj_create(messagesScreen);
-    lv_obj_set_size(historyDetail, TZT_SCREEN_WIDTH, TZT_CONTENT_H);
-    lv_obj_set_pos(historyDetail, 0, TZT_CONTENT_TOP);
-    lv_obj_set_style_bg_color(historyDetail, uiColor(UI_BACKGROUND), 0);
-    lv_obj_set_style_bg_opa(historyDetail, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(historyDetail, 0, 0);
-    lv_obj_set_style_radius(historyDetail, 0, 0);
-    lv_obj_set_style_pad_all(historyDetail, UI_MARGIN, 0);
-    lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(historyDetail, LV_OBJ_FLAG_SCROLLABLE);
-    {
-        const int backH = 40;
-        lv_obj_t* textCard = lv_obj_create(historyDetail);
-        lv_obj_set_size(textCard, cardW, TZT_CONTENT_H - 2 * UI_MARGIN - backH - UI_GAP);
-        lv_obj_set_pos(textCard, 0, 0);
-        styleCard(textCard, 10);
-        lv_obj_add_flag(textCard, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC);
-        lv_obj_set_scroll_dir(textCard, LV_DIR_VER);
-        historyDetailLabel = makeLabel(textCard, "", &lv_font_montserrat_16, UI_TEXT);
-        lv_label_set_long_mode(historyDetailLabel, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(historyDetailLabel, cardW - 24);
-        lv_obj_t* backBtn = makeButton(historyDetail, LV_SYMBOL_LIST " All messages", 150, backH, false, historyBackCb);
-        lv_obj_align(backBtn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    }
-
-    // ---- Sounds: list (tap to play) over a now-playing bar with Stop ----
+    // ---- Sounds: a player on the newest sound; tap the card or Play, arrows pick another ----
     soundsScreen = lv_obj_create(NULL);
     setScreenStyle(soundsScreen);
     {
-        const int barH = UI_ROW_H + UI_MARGIN;
-        audioList = makeCardList(soundsScreen, TZT_CONTENT_H - barH);
-        lv_obj_t* bar = lv_obj_create(soundsScreen);
-        lv_obj_set_size(bar, cardW, UI_ROW_H);
-        lv_obj_set_pos(bar, UI_MARGIN, TZT_SCREEN_HEIGHT - UI_MARGIN - UI_ROW_H);
-        styleCard(bar, 0);
-        lv_obj_set_style_pad_hor(bar, 12, 0);
-        lv_obj_t* icon = makeLabel(bar, LV_SYMBOL_AUDIO, &lv_font_montserrat_16, UI_ACCENT);
-        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
-        const int stopW = 64;
-        audioNowPlayingLabel = makeLabel(bar, "Nothing playing", &lv_font_montserrat_14, UI_TEXT_MUTED);
-        lv_obj_set_width(audioNowPlayingLabel, cardW - 24 - 26 - stopW - UI_GAP);
-        lv_label_set_long_mode(audioNowPlayingLabel, LV_LABEL_LONG_SCROLL_CIRCULAR);
-        lv_obj_align(audioNowPlayingLabel, LV_ALIGN_LEFT_MID, 26, 0);
-        audioStopBtn = makeButton(bar, LV_SYMBOL_STOP, stopW, UI_ROW_H - 10, false, audioStopCb);
-        lv_obj_align(audioStopBtn, LV_ALIGN_RIGHT_MID, 6, 0);
-        lv_obj_set_ext_click_area(audioStopBtn, 5);
+        soundCard = makeItemCard(soundsScreen, 12, soundCardCb);
+        applyBtnPressStyle(soundCard);  // the whole card is the play/stop target
+        makeCaption(soundCard, "VOICE MESSAGE", 0, 0);
+        soundPosLabel = makeLabel(soundCard, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
+        lv_obj_align(soundPosLabel, LV_ALIGN_TOP_RIGHT, 0, 0);
+        soundNameLabel = makeLabel(soundCard, "", &lv_font_montserrat_18, UI_TEXT);
+        lv_label_set_long_mode(soundNameLabel, LV_LABEL_LONG_DOT);
+        lv_obj_set_size(soundNameLabel, cardW - 24, 44);  // two lines at most
+        lv_obj_set_style_text_align(soundNameLabel, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(soundNameLabel, LV_ALIGN_CENTER, 0, 6);
+        lv_obj_t* hint = makeLabel(soundCard, "Tap to play or stop", &lv_font_montserrat_12, UI_TEXT_MUTED);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
+        soundNewBadge = makeNewBadge(soundCard);
+        lv_obj_align(soundNewBadge, LV_ALIGN_TOP_MID, 0, 24);
+        const int arrowW = 64, playW = cardW - 2 * (arrowW + UI_GAP);
+        soundPrevBtn = makeBarButton(soundsScreen, LV_SYMBOL_LEFT, UI_MARGIN, arrowW, false, soundStepCb, -1);
+        soundPlayBtn = makeBarButton(soundsScreen, "", UI_MARGIN + arrowW + UI_GAP, playW, true, soundPlayCb, 0);
+        soundPlayLabel = lv_obj_get_child(soundPlayBtn, 0);
+        soundNextBtn = makeBarButton(soundsScreen, LV_SYMBOL_RIGHT, UI_MARGIN + arrowW + UI_GAP + playW + UI_GAP,
+                                     arrowW, false, soundStepCb, 1);
+        soundEmptyNote = makeEmptyNote(soundsScreen);
     }
 
-    // ---- Pictures: list; tap a row for the full-screen viewer ----
+    // ---- Pictures: the menu opens the viewer directly; this screen only says there are none ----
     picturesScreen = lv_obj_create(NULL);
     setScreenStyle(picturesScreen);
-    imageList = makeCardList(picturesScreen);
+    picturesEmptyNote = makeEmptyNote(picturesScreen);
 
-    // Image viewer: full screen; tap anywhere to go back to the Pictures list
+    // Image viewer: full screen. Swipe or tap an edge for newer/older, tap the middle to close.
     imageViewerScreen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(imageViewerScreen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(imageViewerScreen, LV_OPA_COVER, 0);
     lv_obj_set_style_border_opa(imageViewerScreen, LV_OPA_0, 0);
     lv_obj_set_style_pad_all(imageViewerScreen, 0, 0);
     lv_obj_add_flag(imageViewerScreen, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(imageViewerScreen, imageBackCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(imageViewerScreen, imageViewerTapCb, LV_EVENT_CLICKED, nullptr);
 
-    currentScreenIndex = SCREEN_LAUNCHER;
+    currentScreenIndex = SCREEN_HOME;
     lastDashboardTouchTime = millis();
-    lv_scr_load(launcherScreen);
+    lv_scr_load(homeScreen);
 
-    // ---- Status bar (top layer): card-tone header like Spectral's drawTitleBar() ----
-    // Launcher: app name + settings gear. Sections: "<" back + section title. Right: time + WiFi glyph.
+    // ---- Status bar (top layer, hidden on home): card band with a hairline under it, like the web
+    // pages' top bar. "<" back + title on the left; time and WiFi glyph on the right.
     {
         lv_obj_t* layer = lv_layer_top();
         statusBar = lv_obj_create(layer);
@@ -1059,91 +1606,139 @@ static void createControlPanel() {
         lv_obj_set_pos(statusBar, 0, 0);
         styleCard(statusBar, 0);
         lv_obj_set_style_radius(statusBar, 0, 0);
-
-        statusAppName = makeLabel(statusBar, "Prick'n'Print", &lv_font_montserrat_16, UI_TEXT);
-        lv_obj_align(statusAppName, LV_ALIGN_LEFT_MID, UI_MARGIN + 4, 0);
+        lv_obj_set_style_border_side(statusBar, LV_BORDER_SIDE_BOTTOM, 0);
 
         statusBackBtn = makeBarIconButton(statusBar, LV_SYMBOL_LEFT, statusBackCb);
         lv_obj_align(statusBackBtn, LV_ALIGN_LEFT_MID, 0, 0);
 
-        statusTitleLabel = makeLabel(statusBar, "", &lv_font_montserrat_16, UI_TEXT);
-        lv_obj_align(statusTitleLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 2, 0);
-
-        statusSettingsBtn = makeBarIconButton(statusBar, LV_SYMBOL_SETTINGS, statusSettingsCb);
-        lv_obj_align(statusSettingsBtn, LV_ALIGN_RIGHT_MID, 0, 0);
+        statusTitleLabel = makeLabel(statusBar, "", &lv_font_montserrat_18, UI_TEXT);
+        lv_obj_align(statusTitleLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 4, 0);
 
         statusWifiIcon = makeLabel(statusBar, LV_SYMBOL_WIFI, &lv_font_montserrat_14, UI_WARNING);
-        statusTimeLabel = makeLabel(statusBar, "--:--", &lv_font_montserrat_14, UI_TEXT);
-        // Right-side positions are set by updateHeader() (they shift for the gear on the launcher)
+        lv_obj_align(statusWifiIcon, LV_ALIGN_RIGHT_MID, -UI_MARGIN - 2, 0);
+        statusTimeLabel = makeLabel(statusBar, "--:--", &lv_font_montserrat_14, UI_TEXT_MUTED);
+        lv_obj_align(statusTimeLabel, LV_ALIGN_RIGHT_MID, -UI_MARGIN - 26, 0);
     }
 
-    // ---- Settings (card rows: WiFi + IP, Volume, LED) ----
+    // ---- Settings: grouped list (caption over a card of rows), scrolls under the status bar ----
     settingsScreen = lv_obj_create(NULL);
     setScreenStyle(settingsScreen);
-    const int setCardPad = 10, wifiCardH = 44, sliderCardH = 66;
+    lv_obj_add_flag(settingsScreen, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_set_scroll_dir(settingsScreen, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(settingsScreen, LV_SCROLLBAR_MODE_AUTO);
+    const int pad = 12, innerW = cardW - 2 * pad, rowH = 46, sliderRowH = 64, capH = 20;
+    const int sliderW = innerW - 16;  // room for the knob at both ends
+    int y = top + 6;
 
-    // WiFi row: name left, network over IP address on the right (Spectral's value-on-the-right row)
-    lv_obj_t* wifiCard = lv_obj_create(settingsScreen);
-    lv_obj_set_size(wifiCard, cardW, wifiCardH);
-    lv_obj_set_pos(wifiCard, UI_MARGIN, top);
-    styleCard(wifiCard, 0);
-    lv_obj_set_style_pad_hor(wifiCard, setCardPad, 0);
-    lv_obj_t* wifiTitle = makeLabel(wifiCard, LV_SYMBOL_WIFI, &lv_font_montserrat_14, UI_ACCENT);
-    lv_obj_align(wifiTitle, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_t* wifiName = makeLabel(wifiCard, "WiFi", &lv_font_montserrat_14, UI_TEXT);
-    lv_obj_align(wifiName, LV_ALIGN_LEFT_MID, 22, 0);
-    const int wifiValueW = cardW - 2 * setCardPad - 80;
-    statusWifiLabel = makeLabel(wifiCard, "--", &lv_font_montserrat_14, UI_TEXT);
-    lv_label_set_long_mode(statusWifiLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(statusWifiLabel, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_width(statusWifiLabel, wifiValueW);
-    lv_obj_align(statusWifiLabel, LV_ALIGN_TOP_RIGHT, 0, 4);
-    statusIpLabel = makeLabel(wifiCard, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
-    lv_obj_set_style_text_align(statusIpLabel, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_width(statusIpLabel, wifiValueW);
-    lv_obj_align(statusIpLabel, LV_ALIGN_BOTTOM_RIGHT, 0, -4);
-
-    auto makeSliderCard = [&](int y, const char* icon, const char* name) {
+    auto makeGroup = [&](const char* caption, int h) {
+        makeCaption(settingsScreen, caption, UI_MARGIN + 4, y);
+        y += capH;
         lv_obj_t* card = lv_obj_create(settingsScreen);
-        lv_obj_set_size(card, cardW, sliderCardH);
+        lv_obj_set_size(card, cardW, h);
         lv_obj_set_pos(card, UI_MARGIN, y);
-        styleCard(card, setCardPad);
-        makeIconTitle(card, icon, name, &lv_font_montserrat_14, UI_TEXT, 22);
+        styleCard(card, 0);
+        lv_obj_set_style_pad_hor(card, pad, 0);
+        y += h + 14;
         return card;
     };
-    const int sliderW = cardW - 2 * setCardPad - 16;  // room for the knob at both ends
 
-    // Volume card
-    int volCardY = top + wifiCardH + UI_GAP;
-    lv_obj_t* volCard = makeSliderCard(volCardY, LV_SYMBOL_VOLUME_MAX, "Volume");
-    int v0 = (int)(audioSvc.getVolume() * 100.0f);
-    settingsVolumeValueLabel = makeLabel(volCard, "", &lv_font_montserrat_14, UI_TEXT_MUTED);
-    lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v0);
-    lv_obj_align(settingsVolumeValueLabel, LV_ALIGN_TOP_RIGHT, 0, 0);
-    volumeSlider = makeSlider(volCard, sliderW, 0, 100, v0);
-    lv_obj_align(volumeSlider, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    // Connection: network on the right, IP under it
+    {
+        lv_obj_t* card = makeGroup("CONNECTION", rowH);
+        makeRowText(card, 0, rowH, "Wi-Fi", nullptr);
+        const int valueW = innerW - 60;
+        statusWifiLabel = makeLabel(card, "--", &lv_font_montserrat_14, UI_TEXT);
+        lv_label_set_long_mode(statusWifiLabel, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(statusWifiLabel, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_width(statusWifiLabel, valueW);
+        lv_obj_align(statusWifiLabel, LV_ALIGN_TOP_RIGHT, 0, 5);
+        statusIpLabel = makeLabel(card, "", &lv_font_montserrat_12, UI_TEXT_MUTED);
+        lv_obj_set_style_text_align(statusIpLabel, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_width(statusIpLabel, valueW);
+        lv_obj_align(statusIpLabel, LV_ALIGN_BOTTOM_RIGHT, 0, -5);
+    }
 
-    // LED card: on/off switch + brightness
-    int ledCardY = volCardY + sliderCardH + UI_GAP;
-    lv_obj_t* ledCard = makeSliderCard(ledCardY, LV_SYMBOL_CHARGE, "LED");
-    ledSwitch = makeSwitch(ledCard);
-    lv_obj_align(ledSwitch, LV_ALIGN_TOP_RIGHT, 0, -3);
-    lv_obj_add_event_cb(ledSwitch, ledToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    ledLevelValueLabel = makeLabel(ledCard, "--", &lv_font_montserrat_14, UI_TEXT_MUTED);
-    lv_obj_align(ledLevelValueLabel, LV_ALIGN_TOP_RIGHT, -(UI_SWITCH_W + 10), 0);
-    ledLevelSlider = makeSlider(ledCard, sliderW, 1, 100, 10);
-    lv_obj_align(ledLevelSlider, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_RELEASED, nullptr);
+    // Sound & light: volume slider; light switch + level slider
+    {
+        lv_obj_t* card = makeGroup("SOUND & LIGHT", 2 * sliderRowH + 1);
+        lv_obj_t* vt = makeLabel(card, "Volume", &lv_font_montserrat_14, UI_TEXT);
+        lv_obj_set_pos(vt, 0, 12);
+        int v0 = (int)(audioSvc.getVolume() * 100.0f);
+        settingsVolumeValueLabel = makeLabel(card, "", &lv_font_montserrat_14, UI_TEXT_MUTED);
+        lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v0);
+        lv_obj_align(settingsVolumeValueLabel, LV_ALIGN_TOP_RIGHT, 0, 12);
+        volumeSlider = makeSlider(card, sliderW, 0, 100, v0);
+        lv_obj_set_pos(volumeSlider, 8, 42);
+        lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+        makeRowDivider(card, sliderRowH, innerW);
+
+        int ly = sliderRowH + 1;
+        lv_obj_t* lt = makeLabel(card, "Light", &lv_font_montserrat_14, UI_TEXT);
+        lv_obj_set_pos(lt, 0, ly + 12);
+        ledSwitch = makeSwitch(card);
+        lv_obj_align(ledSwitch, LV_ALIGN_TOP_RIGHT, 0, ly + 9);
+        lv_obj_add_event_cb(ledSwitch, ledToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+        ledLevelValueLabel = makeLabel(card, "--", &lv_font_montserrat_14, UI_TEXT_MUTED);
+        lv_obj_align(ledLevelValueLabel, LV_ALIGN_TOP_RIGHT, -(UI_SWITCH_W + 10), ly + 12);
+        ledLevelSlider = makeSlider(card, sliderW, 1, 100, 10);
+        lv_obj_set_pos(ledLevelSlider, 8, ly + 42);
+        lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+        lv_obj_add_event_cb(ledLevelSlider, ledLevelSliderCb, LV_EVENT_RELEASED, nullptr);
+    }
+
+    // Sensors: switch off one that broke, so it can't misfire (an IR sensor stuck on "hand detected"
+    // would otherwise pump every few seconds). Dispense on home always works.
+    {
+        lv_obj_t* card = makeGroup("SENSORS", 2 * rowH + 1);
+        auto row = [&](int ry, const char* title, const char* sub, bool on) {
+            makeRowText(card, ry, rowH, title, sub);
+            lv_obj_t* sw = makeSwitch(card);
+            lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, ry + (rowH - UI_SWITCH_H) / 2);
+            if (on) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, sensorSwitchCb, LV_EVENT_VALUE_CHANGED, nullptr);
+            return sw;
+        };
+        irSensorSwitch = row(0, "Hand sensor", "Starts the pump on its own", wantIrSensor);
+        makeRowDivider(card, rowH, innerW);
+        moistureSensorSwitch = row(rowH + 1, "Moisture sensor", "Printed on receipts", wantMoistureSensor);
+    }
+
+    // Screen: dim after a while untouched
+    {
+        lv_obj_t* card = makeGroup("SCREEN", rowH);
+        makeRowText(card, 0, rowH, "Dim after", "First tap only wakes it");
+        char t[12];
+        dimLabelText(t, sizeof(t));
+        lv_obj_t* btn = makeButton(card, t, 84, rowH - 12, false, dimCycleCb);
+        lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+        dimValueLabel = lv_obj_get_child(btn, 0);
+    }
+
+    // Device: restart both boards (asks first)
+    {
+        lv_obj_t* card = makeGroup("DEVICE", rowH);
+        makeRowText(card, 0, rowH, "Restart", "Screen and main board");
+        lv_obj_t* restartBtn = makeButton(card, "Restart", 84, rowH - 12, false, restartAskCb);
+        lv_obj_align(restartBtn, LV_ALIGN_RIGHT_MID, 0, 0);
+    }
+    // Bottom breathing room so the last card can scroll fully into view
+    lv_obj_t* spacer = lv_obj_create(settingsScreen);
+    lv_obj_remove_style_all(spacer);
+    lv_obj_set_size(spacer, 1, 1);
+    lv_obj_set_pos(spacer, 0, y);
 
     updateStatusBar();  // fill time, WiFi glyph and the Settings WiFi/IP labels
     updateHeader();
+    hideStatusBar();    // starts on home
+    updateHomeScreen();
 }
 
 // Main's sensor packets carry the LED state; keep the Settings LED controls in sync with it
 static void updateControlPanelStatus() {
     if (!launcherScreen) return;
+    updateHomeScreen();
+    syncSensorSettingsToMain();
     if (lastSensorDataValid && millis() - lastLedControlTouch > LED_CONTROL_ECHO_HOLD_MS) {
         bool ledOn = lastSensorData.ledBrightness > 0;
         if (ledSwitch) {
@@ -1158,123 +1753,227 @@ static void updateControlPanelStatus() {
     updateStatusBar();
 }
 
-// ── Message History screen helpers ──────────────────────────────
+// ── Messages screen ─────────────────────────────────────────────
 
-#define LATEST_MESSAGE_IDX -1  // list row for the in-memory latest message (no SD card)
+#define LATEST_MESSAGE_IDX -1  // the in-memory latest message (no SD card)
 
-static void refreshHistoryList() {
-    if (!historyList) return;
-    lv_obj_clean(historyList);
-    bool haveLatest = lastPrintMessage.length() > 0 && lastPrintMessage != NO_MESSAGE_TEXT;
-    int n = 0;
-    if (sdCard.isReady()) {
-        n = sdCard.getMessageCount();
-        if (n == 0) {
-            sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
-            n = sdCard.getMessageCount();
-        }
-    }
-    if (n == 0) {
-        // No history on SD: still show the message received since boot
-        if (haveLatest) addListRow(historyList, LV_SYMBOL_ENVELOPE, lastPrintMessage.c_str(), true, historyItemCb, LATEST_MESSAGE_IDX);
-        if (!sdCard.isReady()) addListNote(historyList, haveLatest ? "No SD card: only the latest message is kept" : "No messages yet (no SD card)");
-        else if (!haveLatest) addListNote(historyList, "No messages yet");
-        return;
-    }
-    // Show newest first
-    for (int i = n - 1; i >= 0; i--) {
-        const SavedMessage& m = sdCard.getCachedMessage(i);
-        char label[MSG_PREVIEW_LEN + 20];
-        if (m.timestamp > 1600000000) {
-            struct tm ti;
-            localtime_r(&m.timestamp, &ti);
-            char ts[18];
-            strftime(ts, sizeof(ts), "%m/%d %I:%M%p", &ti);
-            snprintf(label, sizeof(label), "%s  %s", ts, m.preview);
-        } else {
-            snprintf(label, sizeof(label), "%s", m.preview);
-        }
-        addListRow(historyList, LV_SYMBOL_ENVELOPE, label, true, historyItemCb, i);
+// "Today 4:45 PM" / "Yesterday 9:02 AM" / "Nov 3, 4:45 PM"; empty if the clock wasn't set
+static void formatWhen(time_t t, char* out, size_t len) {
+    out[0] = '\0';
+    if (t < 1600000000) return;
+    struct tm ti, today;
+    localtime_r(&t, &ti);
+    time_t now = time(nullptr);
+    localtime_r(&now, &today);
+    today.tm_hour = today.tm_min = today.tm_sec = 0;
+    time_t midnight = mktime(&today);
+    char hm[10];
+    formatMinute(ti.tm_hour * 60 + ti.tm_min, hm, sizeof(hm));
+    if (t >= midnight) snprintf(out, len, "Today %s", hm);
+    else if (t >= midnight - 86400) snprintf(out, len, "Yesterday %s", hm);
+    else {
+        char day[8];
+        strftime(day, sizeof(day), "%b %d", &ti);
+        snprintf(out, len, "%s, %s", day, hm);
     }
 }
 
-static void historyItemCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+// Item views share this: the card + bottom bar, or the "none yet" note in their place
+static void showItemView(lv_obj_t* const* parts, int n, lv_obj_t* emptyNote, const char* emptyText) {
+    bool empty = emptyText != nullptr;
+    for (int i = 0; i < n; i++) {
+        if (empty) lv_obj_add_flag(parts[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_clear_flag(parts[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!empty) { lv_obj_add_flag(emptyNote, LV_OBJ_FLAG_HIDDEN); return; }
+    lv_obj_clear_flag(emptyNote, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lv_obj_get_child(emptyNote, 1), emptyText);
+}
+
+// Re-read from SD and show the newest message
+static void refreshMessages() {
+    if (!msgCard) return;
+    bool haveLatest = lastPrintMessage.length() > 0 && lastPrintMessage != NO_MESSAGE_TEXT;
+    msgSdCount = 0;
+    if (sdCard.isReady()) {
+        msgSdCount = sdCard.getMessageCount();
+        if (msgSdCount == 0) {
+            sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+            msgSdCount = sdCard.getMessageCount();
+        }
+    }
+    // No history on SD: still show the message received since boot
+    msgCount = msgSdCount > 0 ? min(msgSdCount, LIST_SHOW_NEWEST) : (haveLatest ? 1 : 0);
+    showMessageAt(0);
+}
+
+static void showMessageAt(int pos) {
+    lv_obj_t* parts[] = { msgCard, msgNewerBtn, msgOlderBtn };
+    if (msgCount == 0) {
+        showItemView(parts, 3, msgEmptyNote, sdCard.isReady() ? "No messages yet" : "No messages yet\n(no SD card)");
+        return;
+    }
+    showItemView(parts, 3, msgEmptyNote, nullptr);
+    msgShown = constrain(pos, 0, msgCount - 1);
+    int idx = msgSdCount > 0 ? msgSdCount - 1 - msgShown : LATEST_MESSAGE_IDX;  // SD cache is oldest first
     String full = (idx == LATEST_MESSAGE_IDX) ? lastPrintMessage : sdCard.readFullMessage(idx);
     if (full.length() == 0) full = "(could not read message)";
-    if (historyDetailLabel) lv_label_set_text(historyDetailLabel, full.c_str());
-    if (historyDetail) lv_obj_clear_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(msgTextLabel, full.c_str());
+    char when[32];
+    if (idx == LATEST_MESSAGE_IDX) snprintf(when, sizeof(when), "Latest");
+    else formatWhen(sdCard.getCachedMessage(idx).timestamp, when, sizeof(when));
+    lv_label_set_text(msgMetaLabel, when);
+    if (msgCount > 1) lv_label_set_text_fmt(msgPosLabel, "%d of %d", msgShown + 1, msgCount);
+    else lv_label_set_text(msgPosLabel, "");
+    lv_obj_scroll_to_y(msgCard, 0, LV_ANIM_OFF);
+    setButtonEnabled(msgNewerBtn, msgShown > 0);
+    setButtonEnabled(msgOlderBtn, msgShown < msgCount - 1);
 }
 
-static void historyBackCb(lv_event_t* e) {
+static void messageStepCb(lv_event_t* e) {
+    if (sectionJustOpened()) return;
+    showMessageAt(msgShown + (int)(intptr_t)lv_event_get_user_data(e));
+}
+
+// Card tap: a sideways swipe steps (vertical drags scroll the text instead and never get here)
+static void messageCardCb(lv_event_t* e) {
     (void)e;
-    if (historyDetail) lv_obj_add_flag(historyDetail, LV_OBJ_FLAG_HIDDEN);
+    int step = lastSwipeStep();
+    if (step) showMessageAt(msgShown + step);
 }
 
-// ── Audio Player screen helpers ─────────────────────────────────
+// ── Sounds screen ───────────────────────────────────────────────
 
-static void refreshAudioList() {
-    if (!audioList) return;
-    lv_obj_clean(audioList);
-    if (!sdCard.isReady()) {
-        addListNote(audioList, "SD card not available");
-        return;
-    }
-    audioFileCount = sdCard.listAudioFiles(audioFileNames, MAX_AUDIO_FILES);
+static String soundPath(int idx) { return String(AUDIO_DIR) + "/" + audioFileNames[idx]; }
+
+static void showSoundAt(int pos) {
+    lv_obj_t* parts[] = { soundCard, soundPrevBtn, soundPlayBtn, soundNextBtn };
     if (audioFileCount == 0) {
-        addListNote(audioList, "No audio files on SD");
+        showItemView(parts, 4, soundEmptyNote, sdCard.isReady() ? "No sounds yet" : "SD card not available");
         return;
     }
-    for (int i = 0; i < audioFileCount; i++) {
-        addListRow(audioList, LV_SYMBOL_PLAY, audioFileNames[i].c_str(), false, audioFileCb, i);
-    }
-    updateNowPlaying();
+    showItemView(parts, 4, soundEmptyNote, nullptr);
+    soundShown = constrain(pos, 0, audioFileCount - 1);
+    String name = audioFileNames[soundShown];
+    int dot = name.lastIndexOf('.');
+    lv_label_set_text(soundNameLabel, (dot > 0 ? name.substring(0, dot) : name).c_str());
+    if (audioFileCount > 1) lv_label_set_text_fmt(soundPosLabel, "%d of %d", soundShown + 1, audioFileCount);
+    else lv_label_set_text(soundPosLabel, "");
+    if (newSoundName.length() && name == newSoundName) lv_obj_clear_flag(soundNewBadge, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(soundNewBadge, LV_OBJ_FLAG_HIDDEN);
+    setButtonEnabled(soundPrevBtn, soundShown > 0);
+    setButtonEnabled(soundNextBtn, soundShown < audioFileCount - 1);
+    updateNowPlaying(true);
 }
 
-// Now-playing bar: file name while playing; Stop is the destructive action, red only while playing.
+// Re-read from SD. toNewest: show the newest; else stay on the sound shown (it may have moved down)
+static void refreshSounds(bool toNewest) {
+    if (!soundCard) return;
+    String keep = (!toNewest && soundShown < audioFileCount) ? audioFileNames[soundShown] : String();
+    audioFileCount = sdCard.isReady() ? sdCard.listAudioFiles(audioFileNames, LIST_SHOW_NEWEST) : 0;  // newest first
+    int pos = 0;
+    for (int i = 0; keep.length() && i < audioFileCount; i++)
+        if (audioFileNames[i] == keep) pos = i;
+    showSoundAt(pos);
+}
+
+// Play button: Stop (red) while the sound shown is playing, else Play.
 // Called every loop on the Sounds screen, so it only touches LVGL when the state changes.
-static void updateNowPlaying() {
+static void updateNowPlaying(bool force) {
     static int shownPlaying = -1;
-    static String shownFile;
-    bool playing = audioSvc.isPlaying();
-    String file = playing ? audioSvc.currentFile() : String();
-    if ((int)playing == shownPlaying && file == shownFile) return;
+    if (!soundPlayBtn || audioFileCount == 0) return;
+    bool playing = audioSvc.isPlaying() && audioSvc.currentFile() == soundPath(soundShown);
+    if (!force && (int)playing == shownPlaying) return;
     shownPlaying = playing;
-    shownFile = file;
-    if (audioNowPlayingLabel) {
-        lv_label_set_text(audioNowPlayingLabel, playing ? baseName(file).c_str() : "Nothing playing");
-        lv_obj_set_style_text_color(audioNowPlayingLabel, uiColor(playing ? UI_TEXT : UI_TEXT_MUTED), 0);
-    }
-    if (audioStopBtn) {
-        lv_obj_set_style_bg_color(audioStopBtn, uiColor(playing ? UI_WARNING : UI_BUTTON), 0);
-        lv_obj_set_style_text_color(audioStopBtn, uiColor(playing ? UI_TITLE : UI_TEXT_MUTED), 0);
+    lv_label_set_text(soundPlayLabel, playing ? LV_SYMBOL_STOP "  Stop" : LV_SYMBOL_PLAY "  Play");
+    lv_obj_set_style_bg_color(soundPlayBtn, uiColor(playing ? UI_WARNING : UI_BORDER), 0);
+}
+
+static void playShownSound() {
+    audioSvc.playFile(soundPath(soundShown));  // one sound at a time: replaces whatever is playing
+    if (audioFileNames[soundShown] == newSoundName) {
+        newSoundName = "";
+        setSectionNew(SCREEN_SOUNDS, false);
+        lv_obj_add_flag(soundNewBadge, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-static void audioFileCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
-    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    if (idx < 0 || idx >= audioFileCount) return;
-    String path = String(AUDIO_DIR) + "/" + audioFileNames[idx];
-    // Only one audio at a time: if already playing this file, leave it; else stop any current and play
-    if (audioSvc.isPlaying() && audioSvc.currentFile() == path) return;
-    audioSvc.playFile(path);
+static void toggleShownSound() {
+    if (audioFileCount == 0) return;
+    if (audioSvc.isPlaying() && audioSvc.currentFile() == soundPath(soundShown)) audioSvc.stop();
+    else playShownSound();
     updateNowPlaying();
 }
 
-static void audioStopCb(lv_event_t* e) {
+static void soundPlayCb(lv_event_t* e) {
     (void)e;
-    audioSvc.stop();
-    updateNowPlaying();
+    if (!sectionJustOpened()) toggleShownSound();
+}
+
+// Pick another sound; if one was playing, the new pick plays straight away
+static void stepSound(int step) {
+    bool wasPlaying = audioSvc.isPlaying();
+    showSoundAt(soundShown + step);
+    if (wasPlaying) { playShownSound(); updateNowPlaying(); }
+}
+
+static void soundStepCb(lv_event_t* e) {
+    if (!sectionJustOpened()) stepSound((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+// Card: tap plays/stops, a sideways swipe picks another sound
+static void soundCardCb(lv_event_t* e) {
+    (void)e;
+    if (sectionJustOpened()) return;
+    int step = lastSwipeStep();
+    if (step) stepSound(step);
+    else toggleShownSound();
 }
 
 // ── Splash (raw TFT before LVGL) and Image Gallery ──────────────
 
 #if !defined(TZT_HEADLESS)
-static void drawSplashToTft() {
-    if (sdCard.isReady() && SD.exists(SPLASH_PATH))
-        drawSdJpegToTft(SPLASH_PATH, TZT_SCREEN_HEIGHT);
+static uint16_t tftColor(UiColor c) {
+    return tft.color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+}
+
+// Background + centered title (font 4) with an accent rule under it; raw TFT, before LVGL runs
+static void drawTitleCard(const char* title) {
+    tft.fillScreen(tftColor(UI_BACKGROUND));
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
+    tft.drawString(title, TZT_SCREEN_WIDTH / 2, 70, 4);
+    tft.fillRoundRect(TZT_SCREEN_WIDTH / 2 - 40, 92, 80, 4, 2, tftColor(UI_BORDER));
+}
+
+static bool drawSplashToTft() {
+    const char* photos[] = { SPLASH_PATH, IMAGES_MEDIA_DIR "/splash.jpg" };
+    for (const char* p : photos) {
+        if (sdCard.isReady() && SD.exists(p)) {
+            tft.fillScreen(TFT_BLACK);
+            drawSdJpegToTft(p, TZT_SCREEN_HEIGHT);
+            return true;
+        }
+    }
+    drawTitleCard("Prick'n'Print");
+    tft.setTextColor(tftColor(UI_TEXT_MUTED), tftColor(UI_BACKGROUND));
+    tft.drawString("Starting...", TZT_SCREEN_WIDTH / 2, 140, 2);
+    return false;
+}
+
+static void drawWifiSetupHelp() {
+    drawTitleCard("Set up WiFi");
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
+    const int x = 28;
+    tft.drawString("1. On your phone, join WiFi:", x, 116, 2);
+    tft.setTextColor(tftColor(UI_ACCENT), tftColor(UI_BACKGROUND));
+    tft.drawString("   " TZT_AP_SSID "   pw: " TZT_AP_PASSWORD, x, 136, 2);
+    tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
+    tft.drawString("2. Pick your home WiFi on the page", x, 162, 2);
+    tft.drawString("   that opens (or go to 192.168.4.1)", x, 182, 2);
+    tft.setTextColor(tftColor(UI_TEXT_MUTED), tftColor(UI_BACKGROUND));
+    tft.drawString("Carries on by itself once connected.", x, 212, 2);
 }
 static void drawSdJpegToTft(const char* path, int maxY) {
     if (maxY <= 0) maxY = TZT_SCREEN_HEIGHT;
@@ -1334,98 +2033,111 @@ static void drawSdJpegToTft(const char* path, int maxY) {
 }
 #endif
 
-static void refreshImageList() {
-    if (!imageList) return;
-    lv_obj_clean(imageList);
-    if (!sdCard.isReady()) {
-        addListNote(imageList, "SD card not available");
-        return;
-    }
-    imageFileCount = sdCard.listImageFiles(imageFileNames, MAX_IMAGE_FILES);
-    if (imageFileCount == 0) {
-        addListNote(imageList, "No images on SD");
-        return;
-    }
-    for (int i = 0; i < imageFileCount; i++) {
-        addListRow(imageList, LV_SYMBOL_IMAGE, imageFileNames[i].c_str(), true, imageFileCb, i);
+// Re-read from SD (newest first); the Pictures screen itself only shows when there are none
+static void refreshImages() {
+    imageFileCount = sdCard.isReady() ? sdCard.listImageFiles(imageFileNames, LIST_SHOW_NEWEST) : 0;
+    if (picturesEmptyNote)
+        lv_label_set_text(lv_obj_get_child(picturesEmptyNote, 1), sdCard.isReady() ? "No pictures yet" : "SD card not available");
+}
+
+// idx into imageFileNames, or -1 for a picture outside the newest few (currentImagePath already set)
+static void showImageAt(int idx) {
+    imageShown = idx;
+    if (idx >= 0) currentImagePath = String(IMAGES_DIR) + "/" + imageFileNames[idx];
+    currentScreenIndex = SCREEN_PICTURES;
+    imageViewerNeedsDraw = true;
+    if (lv_scr_act() != imageViewerScreen) {
+        lastSectionOpenTime = (uint32_t)millis();
+        hideStatusBar();
+        lv_scr_load(imageViewerScreen);
     }
 }
 
-static void imageFileCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED || sectionJustOpened()) return;
-    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    if (idx < 0 || idx >= imageFileCount) return;
-    String path = String(IMAGES_DIR) + "/" + imageFileNames[idx];
-    String lower = imageFileNames[idx];
+// Full-screen viewer for any picture path; if it's one of the newest few, newer/older work from it
+static void openImageViewer(const String& path) {
+    refreshImages();
+    int idx = -1;
+    for (int i = 0; i < imageFileCount; i++)
+        if (String(IMAGES_DIR) + "/" + imageFileNames[i] == path) idx = i;
+    currentImagePath = path;
+    showImageAt(idx);
+}
+
+// Picture, then (when there's more than one) a "< 2 / 3 >" pill at the bottom. Raw TFT over LVGL's
+// black screen, redrawn whenever LVGL repaints it or another picture is picked.
+static void drawImageViewer() {
+    tft.fillScreen(TFT_BLACK);
+    String lower = currentImagePath;
     lower.toLowerCase();
-#if !defined(TZT_HEADLESS)
+    tft.setTextDatum(MC_DATUM);
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-        currentImagePath = path;
-        imageViewerNeedsDraw = true;
-        hideStatusBar();
-        lv_scr_load(imageViewerScreen);
+        drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
     } else {
-        Logger::warn("Image", "Only JPEG is displayed; file is not .jpg/.jpeg: " + path);
-        currentImagePath = "";
-        hideStatusBar();
-        lv_scr_load(imageViewerScreen);
+        tft.setTextColor(tftColor(UI_TEXT_MUTED), TFT_BLACK);
+        tft.drawString("Only JPEG pictures can be shown", TZT_SCREEN_WIDTH / 2, TZT_SCREEN_HEIGHT / 2, 2);
     }
-#else
-    (void)path;
-    (void)lower;
-#endif
+    if (imageShown < 0 || imageFileCount < 2) return;
+    const int w = 96, h = 24, x = (TZT_SCREEN_WIDTH - w) / 2, y = TZT_SCREEN_HEIGHT - h - 6, cy = y + h / 2;
+    uint16_t bg = tftColor(UI_CARD);
+    tft.fillRoundRect(x, y, w, h, h / 2, bg);
+    char pos[12];
+    snprintf(pos, sizeof(pos), "%d / %d", imageShown + 1, imageFileCount);
+    tft.setTextColor(tftColor(UI_TEXT), bg);
+    tft.drawString(pos, TZT_SCREEN_WIDTH / 2, cy, 2);
+    tft.setTextColor(tftColor(imageShown > 0 ? UI_ACCENT : UI_FIELD), bg);
+    tft.drawString("<", x + 12, cy, 2);
+    tft.setTextColor(tftColor(imageShown < imageFileCount - 1 ? UI_ACCENT : UI_FIELD), bg);
+    tft.drawString(">", x + w - 12, cy, 2);
 }
 
-// Tap on the viewer: back to the Pictures list (also when the image was pushed from the backend)
-static void imageBackCb(lv_event_t* e) {
+// Swipe, or tap the left/right quarter: newer/older. Tap the middle: close, back to the launcher.
+static void imageViewerTapCb(lv_event_t* e) {
     (void)e;
-    goToScreenIndex(SCREEN_PICTURES);
+    if (sectionJustOpened()) return;
+    int step = lastSwipeStep();
+    if (!step && gestureEndX < TZT_SCREEN_WIDTH / 4) step = -1;
+    else if (!step && gestureEndX >= TZT_SCREEN_WIDTH * 3 / 4) step = 1;
+    if (!step || imageShown < 0 || imageFileCount < 2) { returnToLauncher(); return; }
+    int next = constrain(imageShown + step, 0, imageFileCount - 1);
+    if (next != imageShown) showImageAt(next);
 }
 #endif
 
-void loadGroceries() {
-    groceryCount = 0;
+// Groceries / todos: a JSON array of strings on the SD card. Parsed in place and saved by pointer,
+// so the document needs only its fixed slots (16 bytes an item), however long the items are. Sizing it
+// from the file length, as before, failed the whole parse for a list of short items, and the list came
+// back empty after a reboot.
+static int loadStringList(const char* path, String* items, int maxItems) {
     String response;
-    if (!sdCard.isReady() || !sdCard.readFile(DATA_DIR "/groceries.json", response)) return;
-    if (response == "null" || response.length() == 0 || response == "{}") return;
-    size_t capacity = response.length() + 200;
-    DynamicJsonDocument doc(capacity);
-    if (deserializeJson(doc, response)) return;
-    JsonArray arr = doc.as<JsonArray>();
-    for (size_t i = 0; i < arr.size() && groceryCount < MAX_GROCERY_ITEMS; i++)
-        groceryItems[groceryCount++] = arr[i].as<String>();
+    if (!sdCard.isReady() || !sdCard.readFile(path, response) || response.length() < 2) return 0;
+    DynamicJsonDocument doc(JSON_ARRAY_SIZE(maxItems + 8));
+    DeserializationError err = deserializeJson(doc, response.begin(), response.length());
+    if (err) {
+        Logger::warn("SD", String(path) + " unreadable: " + err.c_str());
+        return 0;
+    }
+    int n = 0;
+    for (JsonVariant v : doc.as<JsonArray>()) {
+        if (n >= maxItems) break;
+        items[n++] = v.as<String>();  // copy out while `response` is alive
+    }
+    return n;
 }
 
-void saveGroceries() {
+static void saveStringList(const char* path, const String* items, int count) {
     if (!sdCard.isReady()) return;
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(JSON_ARRAY_SIZE(count) + 16);
     JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < groceryCount; i++) arr.add(groceryItems[i]);
-    String json; serializeJson(doc, json);
-    sdCard.writeFile(DATA_DIR "/groceries.json", json);
+    for (int i = 0; i < count; i++) arr.add(items[i].c_str());  // const char*: stored by pointer
+    String json;
+    serializeJson(doc, json);
+    sdCard.writeFile(path, json);
 }
 
-void loadTodos() {
-    todoCount = 0;
-    String response;
-    if (!sdCard.isReady() || !sdCard.readFile(DATA_DIR "/todos.json", response)) return;
-    if (response == "null" || response.length() == 0 || response == "{}") return;
-    size_t capacity = response.length() + 200;
-    DynamicJsonDocument doc(capacity);
-    if (deserializeJson(doc, response)) return;
-    JsonArray arr = doc.as<JsonArray>();
-    for (size_t i = 0; i < arr.size() && todoCount < MAX_TODO_ITEMS; i++)
-        todoItems[todoCount++] = arr[i].as<String>();
-}
-
-void saveTodos() {
-    if (!sdCard.isReady()) return;
-    DynamicJsonDocument doc(4096);
-    JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < todoCount; i++) arr.add(todoItems[i]);
-    String json; serializeJson(doc, json);
-    sdCard.writeFile(DATA_DIR "/todos.json", json);
-}
+void loadGroceries() { groceryCount = loadStringList(DATA_DIR "/groceries.json", groceryItems, MAX_GROCERY_ITEMS); }
+void saveGroceries() { saveStringList(DATA_DIR "/groceries.json", groceryItems, groceryCount); }
+void loadTodos() { todoCount = loadStringList(DATA_DIR "/todos.json", todoItems, MAX_TODO_ITEMS); }
+void saveTodos() { saveStringList(DATA_DIR "/todos.json", todoItems, todoCount); }
 
 // The request itself must carry a valid session token (cookie or ?token=)
 bool isAuthenticated() {
@@ -1543,11 +2255,16 @@ void handleApiLogin() {
 
 void handleGetStatus() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(384);
+    DynamicJsonDocument doc(512);
     doc["firmware"] = FIRMWARE_VERSION;
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["minFreeHeap"] = ESP.getMinFreeHeap();  // lowest since boot: TLS (two at once with the command poll) is the big user
+    unsigned long pollEnd = lastPollEndedAt;
+    doc["lastPollAgoS"] = pollEnd ? (long)((millis() - pollEnd) / 1000) : -1;  // a long poll ends every ~20 s
+    doc["maxLoopStallMs"] = maxLoopStallMs;  // screen/touch/audio freeze, worst since boot
     doc["sensorsValid"] = lastSensorDataValid;
     if (lastSensorDataValid) {
-        doc["moisture"] = lastSensorData.moisturePercent;
+        doc["moisture"] = lastSensorData.moisturePercent;  // < 0 = moisture sensor switched off
         doc["sanitizer"] = lastSensorData.sanitizerLevel;
         doc["irSensor"] = lastSensorData.irDetected;
         doc["ledBrightness"] = lastSensorData.ledBrightness;
@@ -1632,9 +2349,9 @@ void handleDeleteReminder() {
 
 void handleGetGroceries() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(JSON_ARRAY_SIZE(MAX_GROCERY_ITEMS) + 16);  // items by pointer, see saveStringList
     JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < groceryCount; i++) arr.add(groceryItems[i]);
+    for (int i = 0; i < groceryCount; i++) arr.add(groceryItems[i].c_str());
     String s; serializeJson(doc, s);
     server.send(200, "application/json", s);
 }
@@ -1709,9 +2426,9 @@ void handlePrintGroceries() {
 
 void handleGetTodos() {
     if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(JSON_ARRAY_SIZE(MAX_TODO_ITEMS) + 16);  // items by pointer, see saveStringList
     JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < todoCount; i++) arr.add(todoItems[i]);
+    for (int i = 0; i < todoCount; i++) arr.add(todoItems[i].c_str());
     String s; serializeJson(doc, s);
     server.send(200, "application/json", s);
 }
@@ -1780,7 +2497,7 @@ void handleTestSendMessage() {
     bool ok = sendPrintChunked(text, true);
 #if !defined(TZT_HEADLESS)
     lastPrintMessage = text;
-    if (currentScreenIndex == SCREEN_MESSAGES) refreshHistoryList();
+    if (currentScreenIndex == SCREEN_MESSAGES) refreshMessages();
 #endif
     if (ok)
         server.send(200, "application/json", JSON_SUCCESS);
@@ -1970,6 +2687,19 @@ void handleRoot() {
   </details>
 
   <details class="card">
+    <summary><span class="ico">&#9201;</span>Alarms<span class="count" id="alCount"></span></summary>
+    <div class="fold">
+      <input type="text" id="alLabel" placeholder="Label (optional)" maxlength="60">
+      <div class="btn-row">
+        <input type="time" id="alTime" style="flex:1;width:auto">
+        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="alDaily" style="width:auto"> Every day</label>
+        <button type="button" class="btn btn-primary" onclick="addAlarm()">Add</button>
+      </div>
+      <div class="list" id="al"></div>
+    </div>
+  </details>
+
+  <details class="card">
     <summary><span class="ico">&#10003;</span>Grocery list<span class="count" id="glCount"></span></summary>
     <div class="fold">
       <div class="btn-row">
@@ -2072,7 +2802,7 @@ function ref() {
     var v = d.sensorsValid;
     if (!v) liveStatus('main board offline', 'warn');
     else liveStatus('live', 'ok');
-    level('mo', v ? d.moisture : null, 40, 20);
+    level('mo', v && d.moisture >= 0 ? d.moisture : null, 40, 20);
     level('sa', v ? d.sanitizer : null, 50, 20);
     var on = v && d.ledBrightness > 0;
     el('light').textContent = !v ? '—' : on ? 'On ' + d.ledLevel + '%' : 'Off';
@@ -2131,6 +2861,32 @@ function delRem(id) {
   delete reminders[id]; drawReminders();
   if (id.indexOf('temp_') === 0) return;
   del('/api/reminders/' + encodeURIComponent(id)).then(function(d) { if (!d.success) loadReminders(); });
+}
+
+// ---- Alarms (id -> {time "HH:MM", daily, label}); ring on the screen with a Stop button ----
+var alarmsById = {};
+function drawAlarms() {
+  var ids = Object.keys(alarmsById).sort(function(a, b) { return alarmsById[a].time < alarmsById[b].time ? -1 : 1; });
+  fill('al', ids.map(function(k) {
+    var a = alarmsById[k];
+    return row(a.time + (a.label ? '  ' + a.label : ''), a.daily ? 'Every day' : 'Once',
+               [{label: 'Delete', cls: 'btn-danger', fn: function() { delAlarm(k); }}]);
+  }), 'No alarms');
+  count('alCount', ids.length);
+}
+function loadAlarms() { q('/api/alarms').then(function(d) { alarmsById = d || {}; drawAlarms(); }); }
+function addAlarm() {
+  var t = el('alTime').value;
+  if (!t) { el('alTime').focus(); return; }
+  po('/api/alarms', {time: t, daily: el('alDaily').checked, label: el('alLabel').value.trim()}).then(function(d) {
+    if (!d.success) alert(d.error || 'Could not set the alarm');
+    else { el('alLabel').value = ''; }
+    loadAlarms();
+  }).catch(loadAlarms);
+}
+function delAlarm(id) {
+  delete alarmsById[id]; drawAlarms();
+  del('/api/alarms/' + encodeURIComponent(id)).then(function(d) { if (!d.success) loadAlarms(); });
 }
 
 // ---- Groceries / todos: same shape, index-addressed on the device ----
@@ -2211,6 +2967,7 @@ setInterval(loadMessages, 15000);  // new messages arrive from the Pi without a 
 setInterval(loadAudio, 10000);     // keeps "Playing ..." current
 setInterval(loadImages, 60000);
 loadReminders();
+loadAlarms();
 groceries.load();
 todos.load();
 loadMessages();
@@ -2249,6 +3006,26 @@ void setupWebServer() {
     // Reminder endpoints
     server.on("/api/reminders", HTTP_GET, handleGetReminders);
     server.on("/api/reminders", HTTP_POST, handleAddReminder);
+
+    // Alarms: GET list, POST {"time":"07:30","daily":true,"label":"..."}, DELETE /api/alarms/<id>,
+    // POST /api/alarms/stop silences a ringing one
+    server.on("/api/alarms", HTTP_GET, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        server.send(200, "application/json", alarms.toJSON());
+    });
+    server.on("/api/alarms", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        DynamicJsonDocument doc(256);
+        if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false,\"error\":\"bad json\"}"); return; }
+        String id = addAlarmFrom(doc["time"] | "", doc["daily"] | false, doc["label"] | "");
+        if (id.length() == 0) { server.send(400, "application/json", "{\"success\":false,\"error\":\"time must be HH:MM (24 h), max " + String(MAX_ALARMS) + " alarms\"}"); return; }
+        server.send(200, "application/json", "{\"success\":true,\"id\":\"" + id + "\"}");
+    });
+    server.on("/api/alarms/stop", HTTP_POST, []() {
+        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+        stopAlarm();
+        server.send(200, "application/json", JSON_SUCCESS);
+    });
     
     // Grocery endpoints
     server.on("/api/groceries", HTTP_GET, handleGetGroceries);
@@ -2271,6 +3048,13 @@ void setupWebServer() {
         
         if (uri.startsWith("/api/reminders/") && method == HTTP_DELETE) {
             handleDeleteReminder();
+            return;
+        }
+        if (uri.startsWith("/api/alarms/") && method == HTTP_DELETE) {
+            if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
+            bool ok = alarms.remove(uri.substring(strlen("/api/alarms/")));
+            if (ok) saveAlarms();
+            server.send(ok ? 200 : 404, "application/json", ok ? JSON_SUCCESS : "{\"success\":false,\"error\":\"not found\"}");
             return;
         }
         if (uri.startsWith("/api/groceries/") && method == HTTP_DELETE) {
@@ -2345,6 +3129,15 @@ void setupWebServer() {
         String file = doc["file"] | "";
         if (file.length() == 0) { server.send(400, "application/json", "{\"error\":\"Missing file\"}"); return; }
         if (!isSafeFilename(file)) { server.send(400, "application/json", "{\"error\":\"Invalid filename\"}"); return; }
+        // Optional "volume" 0-100; keep the Settings slider in sync (handler runs on the LVGL loop task)
+        if (doc.containsKey("volume")) {
+            int v = constrain(doc["volume"].as<int>(), 0, 100);
+            audioSvc.setVolume((float)v / 100.0f);
+#if !defined(TZT_HEADLESS)
+            if (volumeSlider) lv_slider_set_value(volumeSlider, v, LV_ANIM_OFF);
+            if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v);
+#endif
+        }
         String path = String(AUDIO_DIR) + "/" + file;
         bool ok = audioSvc.playFile(path);
         server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Playback failed\"}");
@@ -2354,28 +3147,6 @@ void setupWebServer() {
         if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
         audioSvc.stop();
         server.send(200, "application/json", JSON_SUCCESS);
-    });
-
-    server.on("/api/audio/download", HTTP_POST, []() {
-        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-        String body = server.arg("plain");
-        DynamicJsonDocument doc(512);
-        if (deserializeJson(doc, body) != DeserializationError::Ok) {
-            server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-            return;
-        }
-        String url = doc["url"] | "";
-        String name = doc["name"] | "";
-        if (url.length() == 0 || name.length() == 0) {
-            server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
-            return;
-        }
-        if (!isSafeFilename(name)) {
-            server.send(400, "application/json", "{\"error\":\"Invalid filename\"}");
-            return;
-        }
-        bool ok = sdCard.downloadToFile(url, String(AUDIO_DIR) + "/" + name);
-        server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
     });
 
     server.on("/api/images", HTTP_GET, []() {
@@ -2391,57 +3162,300 @@ void setupWebServer() {
         server.send(200, "application/json", out);
     });
 
-    server.on("/api/images/download", HTTP_POST, []() {
-        if (!isAuthenticated()) { server.send(401, "application/json", JSON_FAIL_UNAUTHORIZED); return; }
-        String body = server.arg("plain");
-        DynamicJsonDocument doc(512);
-        if (deserializeJson(doc, body) != DeserializationError::Ok) {
-            server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-            return;
-        }
-        String url = doc["url"] | "";
-        String name = doc["name"] | "";
-        if (url.length() == 0 || name.length() == 0) {
-            server.send(400, "application/json", "{\"error\":\"Missing url or name\"}");
-            return;
-        }
-        if (!isSafeFilename(name)) {
-            server.send(400, "application/json", "{\"error\":\"Invalid filename\"}");
-            return;
-        }
-        bool ok = sdCard.downloadToFile(url, String(IMAGES_MEDIA_DIR) + "/" + name);
-        server.send(ok ? 200 : 500, "application/json", ok ? JSON_SUCCESS : "{\"error\":\"Download failed\"}");
-    });
-
     server.begin();
 }
 
-// Tell the Pi an upload is on the SD card so it isn't offered again (kind: "audio" or "images")
+// Tell the Pi an upload is on the SD card so it isn't offered again (kind: "audio" or "images").
+// Only while loop() handles a polled batch: it uses the poll's connection (see pollBackend).
 static void markMediaDownloaded(const char* kind, const String& id) {
-    if (backend && id.length() > 0)
-        backend->put("/" + String(kind) + "/" + id + "/downloaded.json", "true");
+    if (pollBackend && id.length() > 0 &&
+        !pollBackend->put("/" + String(kind) + "/" + id + "/downloaded.json", "true"))
+        Logger::warn("Media", "Marking " + id + " downloaded failed: " + pollBackend->getLastError());
+}
+
+// Download a Pi upload over the poll's connection. Same rule as markMediaDownloaded().
+static bool fetchFromPi(const String& piPath, Stream& out) {
+    if (!pollBackend) return false;
+    if (pollBackend->download(piPath, out)) return true;
+    Logger::warn("Media", "Download " + piPath + " failed: " + pollBackend->getLastError());
+    return false;
+}
+
+// ── Alarms ───────────────────────────────────────────────────────
+// Ringing: alarm tune on repeat (at least ALARM_MIN_VOLUME), Main blinks the LED, and a full-screen
+// card with a big Stop button. Stops on Stop, POST /api/alarms/stop, or after ALARM_RING_MS.
+#if !defined(TZT_HEADLESS)
+static lv_obj_t* alarmOverlay = nullptr;
+static void alarmStopCb(lv_event_t* e);
+#endif
+
+static void stopAlarm() {
+    if (!alarmRinging) return;
+    alarmRinging = false;
+    audioSvc.stop();
+    audioSvc.setVolume(alarmSavedVolume);
+#if !defined(TZT_HEADLESS)
+    if (alarmOverlay) lv_obj_del_async(alarmOverlay);
+    alarmOverlay = nullptr;
+    lastDashboardTouchTime = millis();
+#endif
+    Logger::info("Alarm", "Stopped");
+}
+
+#if !defined(TZT_HEADLESS)
+static void alarmStopCb(lv_event_t* e) {
+    (void)e;
+    stopAlarm();
+}
+#endif
+
+static void startAlarm(const String& label) {
+    if (alarmRinging) return;
+    alarmRinging = true;
+    alarmLabel = label;
+    alarmStartedAt = millis();
+    alarmLastLedAt = 0;
+    alarmSavedVolume = audioSvc.getVolume();
+    if (alarmSavedVolume < ALARM_MIN_VOLUME) audioSvc.setVolume(ALARM_MIN_VOLUME);
+    audioSvc.playTune(TUNE_ALARM);
+    wakeScreen();
+    Logger::info("Alarm", "Ringing" + (label.length() ? ": " + label : String("")));
+#if !defined(TZT_HEADLESS)
+    if (!launcherScreen) return;  // still on the splash: sound + LED only
+    closeRestartConfirm();
+    alarmOverlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(alarmOverlay);
+    lv_obj_set_size(alarmOverlay, TZT_SCREEN_WIDTH, TZT_SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(alarmOverlay, uiColor(UI_BACKGROUND), 0);
+    lv_obj_set_style_bg_opa(alarmOverlay, LV_OPA_COVER, 0);
+    lv_obj_add_flag(alarmOverlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t* cap = makeLabel(alarmOverlay, "ALARM", &lv_font_montserrat_12, UI_ACCENT);
+    lv_obj_set_style_text_letter_space(cap, 2, 0);
+    lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 34);
+    char hm[12] = "Alarm";
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+    if (t.tm_year > 100) strftime(hm, sizeof(hm), "%I:%M %p", &t);
+    lv_obj_t* clock = makeLabel(alarmOverlay, hm[0] == '0' ? hm + 1 : hm, &lv_font_montserrat_32, UI_TEXT);
+    lv_obj_align(clock, LV_ALIGN_TOP_MID, 0, 66);
+    lv_obj_t* lbl = makeLabel(alarmOverlay, label.length() ? label.c_str() : "Alarm", &lv_font_montserrat_16, UI_TEXT_MUTED);
+    lv_obj_set_width(lbl, TZT_SCREEN_WIDTH - 2 * UI_MARGIN);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 112);
+    lv_obj_t* stop = makeButton(alarmOverlay, "Stop", TZT_SCREEN_WIDTH - 2 * UI_MARGIN, 64, true, alarmStopCb);
+    lv_obj_set_style_text_font(lv_obj_get_child(stop, 0), &lv_font_montserrat_18, 0);
+    lv_obj_align(stop, LV_ALIGN_BOTTOM_MID, 0, -UI_MARGIN);
+#endif
+}
+
+// Called every loop: due check every few seconds, and keep a ringing alarm going
+static void alarmLoop() {
+    static unsigned long lastCheck = 0;
+    time_t now = time(nullptr);
+    if (!alarmRinging && millis() - lastCheck >= 3000 && now > 1600000000) {  // clock synced (NTP)
+        lastCheck = millis();
+        String label;
+        bool changed = false;
+        if (alarms.checkDue(now, label, changed)) startAlarm(label);
+        if (changed) saveAlarms();
+    }
+    if (!alarmRinging) return;
+    if (millis() - alarmStartedAt > ALARM_RING_MS) { stopAlarm(); return; }
+    if (!audioSvc.isPlaying()) audioSvc.playTune(TUNE_ALARM);
+    if (!alarmLastLedAt || millis() - alarmLastLedAt >= ALARM_LED_EVERY_MS) {
+        alarmLastLedAt = millis();
+        enqueueSettingCommand(CMD_LED_NOTIFY, 4, 0);
+    }
+}
+
+// "07:30" / "7:30" -> hour, minute
+static bool parseAlarmTime(const String& hm, uint8_t& h, uint8_t& m) {
+    int colon = hm.indexOf(':');
+    if (colon < 1 || colon > 2 || hm.length() != (unsigned)(colon + 3)) return false;
+    int hh = hm.substring(0, colon).toInt(), mm = hm.substring(colon + 1).toInt();
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+    h = (uint8_t)hh;
+    m = (uint8_t)mm;
+    return true;
+}
+
+// Shared by POST /api/alarms and the backend "set_alarm" command; returns the id or ""
+static String addAlarmFrom(const String& hm, bool daily, const String& label) {
+    uint8_t h, m;
+    if (!parseAlarmTime(hm, h, m)) return "";
+    String id = alarms.add(h, m, daily, label);
+    if (id.length()) {
+        saveAlarms();
+        playChime(TUNE_ALARM_SET);
+        Logger::info("Alarm", "Set " + hm + (daily ? " daily" : "") + (label.length() ? " - " + label : String("")));
+    }
+    return id;
+}
+
+// New-item alerts. Handling a batch of backend commands only records the newest arrival; the batch
+// then presents it once: Main blinks the LED, the tile gets a NEW badge, and unless someone is using
+// the screen right now, the item itself opens (message text, the picture, or Sounds with it on top).
+static int pendingNewSection = -1;
+static String pendingNewName;   // sound file name / picture path under IMAGES_DIR
+
+static bool pendingNewPlay = false;  // a voice message: play it when it's presented
+
+static void markNewItem(int section, const String& name, bool play = false) {
+    pendingNewSection = section;
+    pendingNewName = name;
+    pendingNewPlay = play;
+}
+
+static void presentNewItem() {
+    if (pendingNewSection < 0) return;
+    int section = pendingNewSection;
+    String name = pendingNewName;
+    bool play = pendingNewPlay && section == SCREEN_SOUNDS && name.length() > 0 && !alarmRinging;
+    wakeScreen();  // something new arrived: light up so it's noticed
+    pendingNewSection = -1;
+    pendingNewName = "";
+    pendingNewPlay = false;
+    enqueueSettingCommand(CMD_LED_NOTIFY, NEW_ITEM_LED_FLASHES, 0);
+    // A voice message plays straight away (after the batch's downloads, so they can't stall it);
+    // everything else gets its chime
+    if (!play || !audioSvc.playFile(String(AUDIO_DIR) + "/" + name))
+        playChime(section == SCREEN_MESSAGES ? TUNE_MESSAGE : section == SCREEN_SOUNDS ? TUNE_SOUND : TUNE_PICTURE);
+    Logger::info("UI", "New " + String(section == SCREEN_MESSAGES ? "message" : section == SCREEN_SOUNDS ? "sound" : "picture")
+                 + (name.length() ? ": " + name : String("")));
+#if !defined(TZT_HEADLESS)
+    if (section == SCREEN_SOUNDS) newSoundName = name;
+    // Never switches screens: the NEW badges (Menu button + tile) say something arrived.
+    // A section that's open right now just picks it up in place.
+    setSectionNew(section, true);
+    if (!launcherScreen) return;
+    if (section == SCREEN_SOUNDS && lv_scr_act() == soundsScreen) refreshSounds(false);  // stays on their pick
+    else if (section == SCREEN_MESSAGES && lv_scr_act() == messagesScreen && msgShown == 0) refreshMessages();
+#endif
+}
+
+// Commands from the Pi arrive by long poll on a background task: the Pi holds the request until a
+// command is queued, so a control sent from the web page lands in about a second, and the held
+// request never freezes the screen. The task polls again only after loop() has handled the previous
+// batch, and that poll carries the handled ids (?ack=) so the Pi deletes them first: a command can't
+// be fetched twice, and loop() never blocks on a DELETE (each new TLS connection costs ~5 s).
+#define COMMAND_POLL_WAIT_S   20     // the Pi holds an empty poll this long (nginx allows 60 s)
+#define COMMAND_POLL_RETRY_MS 10000  // after a failed poll (Pi or WiFi down)
+static DynamicJsonDocument polledCommands(2048);
+static String polledBody;    // the poll's raw JSON: polledCommands points into it (zero-copy parse)
+static bool polledOk = false;
+static String polledAck;     // loop() -> task: ids handled from this batch, acked on the next poll
+static String polledSkipId;  // a command the task couldn't read: loop() logs it, the next poll skips it
+static String polledSkipWhy;
+static SemaphoreHandle_t pollDone = nullptr;  // task -> loop(): polledCommands / polledOk are ready
+static SemaphoreHandle_t pollNext = nullptr;  // loop() -> task: batch handled, poll again
+
+static void commandPollTask(void*) {
+    for (;;) {
+        if (WiFi.status() != WL_CONNECTED) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        // The Pi hands out one command per poll, with its id in X-Command-Id
+        String commandId;
+        pollStartedAt = millis();
+        polledOk = pollBackend->pollCommandsRaw(polledBody, commandId);
+        lastPollEndedAt = millis();
+        pollStartedAt = 0;
+        polledCommands.clear();
+        polledSkipId = "";
+        if (polledOk && polledBody.length() > 0 && polledBody != "null") {
+            // Writable input = zero-copy parse: strings stay in polledBody, so even the longest
+            // message (12.7 KB) fits this 2 KB document, with no second copy of it in RAM
+            DeserializationError err = deserializeJson(polledCommands, polledBody.begin(), polledBody.length());
+            if (err) {
+                polledCommands.clear();
+                polledSkipWhy = String("unreadable (") + err.c_str() + ", " + String(polledBody.length()) + " bytes)";
+                if (commandId.length()) polledSkipId = commandId;  // skip it, so it can't jam the queue
+                else polledOk = false;  // no id to skip by (older Pi): retry like a failed poll
+            }
+        } else if (polledOk && commandId.length()) {
+            polledSkipId = commandId;  // a command came, but its body didn't fit in RAM
+            polledSkipWhy = "too large to receive";
+        }
+        xSemaphoreGive(pollDone);
+        xSemaphoreTake(pollNext, portMAX_DELAY);
+        // The client keeps them until a poll succeeds (the server ignores ids it no longer has)
+        if (polledAck.length()) {
+            pollBackend->setPollAck(polledAck);
+            polledAck = "";
+        }
+        if (polledSkipId.length()) pollBackend->setPollSkip(polledSkipId);
+        if (!polledOk) vTaskDelay(pdMS_TO_TICKS(COMMAND_POLL_RETRY_MS));
+    }
+}
+
+static void startCommandPolling() {
+    pollBackend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT, BACKEND_API_KEY);
+    pollBackend->setRetryPolicy(1, 0);  // the task's retry delay handles failures
+    pollBackend->setDeviceIdentity("tzt-display", "TZT Display");  // Pi marks us seen on every poll
+    pollBackend->setPollWait(COMMAND_POLL_WAIT_S);
+    pollDone = xSemaphoreCreateBinary();
+    pollNext = xSemaphoreCreateBinary();
+    // Core 0 with the WiFi stack; LVGL and loop() stay on core 1. 10 KB covers the TLS handshake.
+    xTaskCreatePinnedToCore(commandPollTask, "cmdPoll", 10240, nullptr, 1, nullptr, 0);
+}
+
+// Whether the print queue can take every print in the polled batch. Until it can, loop() leaves the
+// batch unhandled (and so unacked, and the next poll waits), instead of dropping a message.
+static bool polledPrintsFit() {
+    size_t bytes = 0;
+    uint8_t count = 0;
+    for (JsonPair kv : polledCommands.as<JsonObject>()) {
+        JsonObject c = kv.value();
+        if (c["type"] == "print" && !(c["processed"] | false)) {
+            bytes += strlen(c["data"] | "");
+            count++;
+        }
+    }
+    return count == 0 || printQueueHasRoom(bytes, count);
 }
 
 // Download any audio/image uploads the Pi still lists as not downloaded. Uploads normally arrive as
 // download commands on the regular poll; this catches older ones and downloads that failed.
+// Runs while loop() handles a polled batch, over the poll's connection (see pollBackend).
 #define MEDIA_BACKLOG_SYNC_MS (30UL * 60UL * 1000UL)
-static void syncMediaBacklog() {
+#define MEDIA_SYNC_RETRY_MS   (2UL * 60UL * 1000UL)  // after a sync whose list request failed
+// false = a list request failed (so retry soon rather than in 30 min)
+static bool syncMediaBacklog() {
     struct { const char* kind; const char* dir; } media[] = { {"audio", AUDIO_DIR}, {"images", IMAGES_MEDIA_DIR} };
+    bool ok = true;
     for (auto& m : media) {
         String resp;
-        if (!backend->get("/" + String(m.kind) + ".json", resp) || resp.length() <= 4 || resp == "null") continue;
+        if (!pollBackend->get("/" + String(m.kind) + ".json?pending=1", resp)) {
+            Logger::warn("Media", String("Sync: listing ") + m.kind + " failed: " + pollBackend->getLastError());
+            ok = false;
+            continue;
+        }
+        if (resp.length() <= 4 || resp == "null") continue;
+        // In place (zero-copy): the document holds only pointers into resp, so 4 KB covers ~40 entries
         DynamicJsonDocument doc(4096);
-        if (deserializeJson(doc, resp) != DeserializationError::Ok) continue;
+        DeserializationError err = deserializeJson(doc, resp.begin(), resp.length());
+        if (err) {
+            Logger::warn("Media", String("Sync: ") + m.kind + " list unreadable (" + err.c_str() + ", " + String(resp.length()) + " bytes)");
+            ok = false;
+            continue;
+        }
         for (JsonPair kv : doc.as<JsonObject>()) {
             JsonObject entry = kv.value();
             String url = entry["url"] | "";
             String name = entry["name"] | "";
             if (url.length() == 0 || name.length() == 0 || (entry["downloaded"] | false) || !isSafeFilename(name)) continue;
-            if (sdCard.downloadToFile(url, String(m.dir) + "/" + name))
+            if (sdCard.downloadToFile(url, String(m.dir) + "/" + name, fetchFromPi)) {
                 markMediaDownloaded(m.kind, kv.key().c_str());
+                bool audio = strcmp(m.kind, "audio") == 0;
+                markNewItem(audio ? SCREEN_SOUNDS : SCREEN_PICTURES, audio ? name : String("media/") + name);
+            }
             esp_task_wdt_reset();
         }
     }
+    return ok;
 }
 
 void setup() {
@@ -2450,10 +3464,40 @@ void setup() {
     
     esp_task_wdt_init(60, true);   // 60s so setup (WiFi portal + backend + display) doesn't trigger
     esp_task_wdt_add(NULL);        // Current task (loop) is watched
-    
+
+    // SD card first (VSPI, independent of the display's HSPI): the startup image and the saved
+    // reminders/groceries/todos below all read from it
+    loadSensorPrefs();  // wanted IR/moisture sensor state, re-sent to Main whenever it differs
+    loadDisplayPrefs(); // dim timeout
+    if (sdCard.begin()) {
+        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
+        String a;
+        if (sdCard.readFile(ALARMS_FILE, a) && a.length()) alarms.fromJSON(a);
+    } else {
+        Logger::warn("SD", "Skipped: message history & media will use backend only");
+    }
+    audioSvc.begin();  // DAC output; chimes and alarms work without the SD card too
+
+#if !defined(TZT_HEADLESS)
+    // Display + startup image before WiFi, so the screen isn't black while WiFi connects
+    tft.init();
+    tft.setRotation(1);  // 2.4" 240x320 panel: rotation 1 = 320x240 landscape (matches TZT_SCREEN_*)
+    tft.fillScreen(TFT_BLACK);
+    // Backlight PWM for full brightness (digital HIGH can be dim on some boards)
+    ledcSetup(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_LEDC_FREQ, TZT_TFT_BL_LEDC_RES);
+    ledcAttachPin(TZT_TFT_BL_PIN, TZT_TFT_BL_LEDC_CHANNEL);
+    ledcWrite(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_BRIGHTNESS);
+    bool drewPhoto = drawSplashToTft();
+    splashVisible = true;
+    splashReadyAt = millis() + (drewPhoto ? SPLASH_PHOTO_MS : SPLASH_CARD_MS);
+#endif
+
     // Initialize WiFi
     WiFiManager wifiManager;
     wifiManager.setDebugOutput(false);  // Suppress *wm: verbose logs
+#if !defined(TZT_HEADLESS)
+    wifiManager.setAPCallback([](WiFiManager*) { drawWifiSetupHelp(); });  // no saved WiFi: say how to set it up
+#endif
     wifiManager.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), 
                                      IPAddress(192, 168, 4, 1), 
                                      IPAddress(255, 255, 255, 0));
@@ -2462,10 +3506,14 @@ void setup() {
     wifiManager.resetSettings();
     wifiManager.startConfigPortal(TZT_AP_SSID, TZT_AP_PASSWORD);
 #else
-    esp_task_wdt_reset();  // Feed WDT before blocking autoConnect (portal can take 30s+)
+    // The setup portal blocks this task for as long as someone is entering WiFi details, so unwatch it
+    // (the 60 s WDT would reboot mid-setup); the portal timeout bounds the wait instead
+    esp_task_wdt_delete(NULL);
+    wifiManager.setConfigPortalTimeout(600);
     if (!wifiManager.autoConnect(TZT_AP_SSID, TZT_AP_PASSWORD)) {
         Logger::warn("WiFi", "config portal timed out or failed.");
     }
+    esp_task_wdt_add(NULL);
 #endif
     
     if (WiFi.status() == WL_CONNECTED) {
@@ -2496,6 +3544,7 @@ void setup() {
     backend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT, BACKEND_API_KEY);
     backend->setRetryPolicy(2, 250);  // worst case ~2 x BACKEND_TIMEOUT per call when the Pi is down
     backend->setDeviceIdentity("tzt-display", "TZT Display");  // Pi marks us seen on every poll
+    startCommandPolling();
     reminderService = new ReminderService(backend);
     // Load reminders from SD first (primary persistence)
     if (sdCard.isReady()) {
@@ -2506,29 +3555,8 @@ void setup() {
     loadGroceries();
     loadTodos();
 
-    // Initialize SD card (VSPI — independent of display HSPI)
-    if (sdCard.begin()) {
-        sdCard.loadRecentMessages(MAX_CACHED_MESSAGES);
-        audioSvc.begin();
-    } else {
-        Logger::warn("SD", "Skipped: message history & media will use backend only");
-    }
-
     esp_task_wdt_reset();  // Feed WDT before display init
 #if !defined(TZT_HEADLESS)
-    tft.init();
-    tft.setRotation(1);  // 2.4" 240x320 panel: rotation 1 = 320x240 landscape (matches TZT_SCREEN_*)
-    tft.fillScreen(TFT_BLACK);
-    // Backlight PWM for full brightness (digital HIGH can be dim on some boards)
-    ledcSetup(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_LEDC_FREQ, TZT_TFT_BL_LEDC_RES);
-    ledcAttachPin(TZT_TFT_BL_PIN, TZT_TFT_BL_LEDC_CHANNEL);
-    ledcWrite(TZT_TFT_BL_LEDC_CHANNEL, TZT_TFT_BL_BRIGHTNESS);
-    tft.fillScreen(TFT_BLACK);
-    bool drewSplash = sdCard.isReady() && SD.exists(SPLASH_PATH);
-    drawSplashToTft();  // Show splash.jpg from SD root if present
-    splashVisible = true;
-    // If no splash image, show main UI on first loop; else show splash for SPLASH_MIN_MS
-    splashReadyAt = millis() + (drewSplash ? SPLASH_MIN_MS : 0);
     lv_init();
     lv_disp_draw_buf_init(&draw_buf, disp_buf1, disp_buf2, TZT_DISP_BUF_PIXELS);
     lv_disp_drv_init(&disp_drv);
@@ -2588,6 +3616,21 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    {
+        static unsigned long lastLoopAt = 0;
+        unsigned long nowMs = millis();
+        if (lastLoopAt && nowMs - lastLoopAt > maxLoopStallMs) maxLoopStallMs = nowMs - lastLoopAt;
+        lastLoopAt = nowMs;
+        // The poll task's timeouts should end every request; if one still hangs (a stalled TLS read
+        // they miss), commands would silently stop while the screen looks fine. Restart instead.
+        unsigned long started = pollStartedAt;
+        // Signed: the task can stamp `started` just after nowMs was read (unsigned, that would wrap)
+        if (started && (long)(nowMs - started) > (long)POLL_HANG_RESTART_MS) {
+            Logger::error("Backend", "Command poll stuck for " + String((nowMs - started) / 1000) + " s, restarting");
+            delay(200);  // let the log line go out
+            ESP.restart();
+        }
+    }
     // Main sends a heartbeat every 10 s; after 3 missed ones, stop showing its last values as live
     unsigned long lastRx = lastSensorDataReceiveTime;  // read before millis(): the WiFi task may update it meanwhile
     if (lastSensorDataValid && millis() - lastRx > SENSOR_DATA_STALE_MS) {
@@ -2604,8 +3647,9 @@ void loop() {
         if (millis() >= splashReadyAt) {
             createControlPanel();
             updateControlPanelStatus();
-            lv_scr_load(launcherScreen);
+            lv_scr_load(homeScreen);
             splashVisible = false;
+            playChime(TUNE_STARTUP);
         }
         delay(2);
         return;
@@ -2614,10 +3658,7 @@ void loop() {
     if (pendingTestImagePath.length() > 0) {
         String path = pendingTestImagePath;
         pendingTestImagePath = "";
-        currentImagePath = path;  // viewer redraw below keeps it on screen (LVGL repaints the black bg on load)
-        imageViewerNeedsDraw = true;
-        hideStatusBar();
-        lv_scr_load(imageViewerScreen);
+        openImageViewer(path);  // viewer redraw below keeps it on screen (LVGL repaints the black bg on load)
     }
     if (launcherScreen) {
         if (sensorDataNeedsPanelUpdate) {
@@ -2772,46 +3813,49 @@ void loop() {
         sdCard.writeFile(DATA_DIR "/reminders.json", reminderService->toJSON());
     }
 
-    // Poll backend /commands with adaptive interval (HTTP server)
-    static unsigned long lastCmd = 0;
-    static unsigned long backendPollInterval = 30000;
-    static unsigned long lastCommandFound = 0;
+    // Handle a batch from the command poll task (it waits for pollNext before polling again)
     static unsigned long lastMediaSync = 0;
     static bool mediaSynced = false;
-    if (millis() - lastCommandFound < 120000) {
-        backendPollInterval = 10000;
-    } else {
-        backendPollInterval = 30000;
+    static bool batchWaiting = false;  // a polled batch is in but waits for room in the print queue
+    printQueueLoop();
+    if (!batchWaiting && pollDone && xSemaphoreTake(pollDone, 0) == pdTRUE) {
+        batchWaiting = true;
+        if (!polledOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi): " + pollBackend->getLastError());
+        if (polledSkipId.length()) Logger::warn("Backend", "Skipping command " + polledSkipId + ": " + polledSkipWhy);
     }
-    
-    if (backend && WiFi.status() == WL_CONNECTED && (millis() - lastCmd >= backendPollInterval)) {
-        lastCmd = millis() - (unsigned long)random(0, 2000);  // Jitter backwards: a future lastCmd underflows the elapsed check and polls every loop
-        DynamicJsonDocument cmds(2048);
-        bool pollOk = backend->pollCommands(cmds);
-        if (!pollOk) Logger::warn("Backend", "Poll failed (check Pi URL/WiFi): " + backend->getLastError());
-        // Backlog sync right after the first good poll, then every 30 min (piggybacks on a poll that worked)
-        if (pollOk && sdCard.isReady() && (!mediaSynced || millis() - lastMediaSync >= MEDIA_BACKLOG_SYNC_MS)) {
+    if (batchWaiting && (!polledOk || polledPrintsFit())) {
+        batchWaiting = false;
+        bool pollOk = polledOk;
+        DynamicJsonDocument& cmds = polledCommands;
+        // Backlog sync right after the first good poll, then every 30 min (piggybacks on a poll that worked).
+        // Not while audio plays: the downloads block this loop, which also feeds the audio buffer.
+        if (pollOk && sdCard.isReady() && !audioSvc.isPlaying() && (!mediaSynced || millis() - lastMediaSync >= MEDIA_BACKLOG_SYNC_MS)) {
             mediaSynced = true;
             lastMediaSync = millis();
-            syncMediaBacklog();
+            if (!syncMediaBacklog()) lastMediaSync -= MEDIA_BACKLOG_SYNC_MS - MEDIA_SYNC_RETRY_MS;
         }
         if (pollOk && cmds.size() > 0) {
             Logger::info("Backend", "Commands: " + String(cmds.size()));
-            lastCommandFound = millis();
+            String ack;
             for (JsonPair kv : cmds.as<JsonObject>()) {
                 JsonObject c = kv.value();
+                if (ack.length()) ack += ",";
+                ack += kv.key().c_str();  // acked even if skipped: a command left queued would end every long poll at once
                 if (c["processed"] | false) continue;
                 String typ = c["type"].as<String>(), data = c["data"].as<String>();
                 // Commands: text → print + save to SD + display; audio → send/save + play; image → send/save + show
                 if (typ == "print") {
                     Logger::info("Backend", "Print: \"" + data.substring(0, data.length() > 40 ? 40 : data.length()) + (data.length() > 40 ? "..." : "") + "\"");
                     String source = c["source"].as<String>();
-                    bool messageOnly = !source.equalsIgnoreCase("shortcut");
+                    // Full receipt (MESSAGE title, date, weather, levels) for everything from the Pi -
+                    // Shortcuts don't always send "source". Opt out with "source":"plain".
+                    bool messageOnly = source.equalsIgnoreCase("plain");
                     sendPrintChunked(data, messageOnly);
                     sdCard.saveMessage(data, source);
+                    markNewItem(SCREEN_MESSAGES, "");
 #if !defined(TZT_HEADLESS)
                     lastPrintMessage = data;
-                    if (currentScreenIndex == SCREEN_MESSAGES) refreshHistoryList();
+                    if (currentScreenIndex == SCREEN_MESSAGES) refreshMessages();
 #endif
                 }
                 else if (typ == "download_audio") {
@@ -2819,9 +3863,10 @@ void loop() {
                     String name = c["name"] | "";
                     if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         String path = String(AUDIO_DIR) + "/" + name;
-                        if (sdCard.downloadToFile(url, path)) {
+                        if (sdCard.downloadToFile(url, path, fetchFromPi)) {
                             markMediaDownloaded("audio", c["media_id"] | "");
-                            if (!(c["silent"] | false)) audioSvc.playFile(path);  // silent = upload, just store it
+                            // silent = just store it; otherwise it plays once the batch is done
+                            markNewItem(SCREEN_SOUNDS, name, !(c["silent"] | false));
                         }
                     }
                 }
@@ -2834,13 +3879,28 @@ void loop() {
                     String name = c["name"] | "";
                     if (url.length() > 0 && name.length() > 0 && isSafeFilename(name) && sdCard.isReady()) {
                         String path = String(IMAGES_MEDIA_DIR) + "/" + name;
-                        if (sdCard.downloadToFile(url, path)) {
+                        if (sdCard.downloadToFile(url, path, fetchFromPi)) {
                             markMediaDownloaded("images", c["media_id"] | "");
+                            markNewItem(SCREEN_PICTURES, String("media/") + name);
 #if !defined(TZT_HEADLESS)
-                            if (!(c["silent"] | false)) pendingTestImagePath = path;  // silent = upload, just store it
+                            // Not opened automatically: the NEW badge on Menu / Pictures shows it arrived
 #endif
                         }
                     }
+                }
+                else if (typ == "set_alarm") {
+                    // {"type":"set_alarm","time":"07:30","daily":true,"label":"Wake up"}
+                    addAlarmFrom(c["time"] | "", c["daily"] | false, c["label"] | "");
+                }
+                else if (typ == "delete_alarm") {
+                    if (alarms.remove(c["id"] | "")) saveAlarms();
+                }
+                else if (typ == "clear_alarms") {
+                    alarms.clear();
+                    saveAlarms();
+                }
+                else if (typ == "stop_alarm") {
+                    stopAlarm();
                 }
                 else if (typ == "show_image" && data.length() > 0 && isSafeFilename(data)) {
 #if !defined(TZT_HEADLESS)
@@ -2849,13 +3909,14 @@ void loop() {
                     pendingTestImagePath = showPath;
 #endif
                 }
-                String cmdPath = "/commands/" + String(kv.key().c_str()) + ".json";
-                if (!backend->deleteData(cmdPath)) {
-                    Logger::warn("Backend", "DELETE failed for " + String(kv.key().c_str()) + ": " + backend->getLastError());
-                }
-                esp_task_wdt_reset();  // a batch of downloads + DELETEs can take a while
+                esp_task_wdt_reset();  // a batch of downloads can take a while
             }
+            polledAck = ack;
         }
+        polledCommands.clear();
+        polledBody = String();  // don't hold a long message in RAM through the next 20 s poll
+        presentNewItem();  // newest arrival from this poll / backlog sync, if any
+        xSemaphoreGive(pollNext);
     }
 
     // Reminder check every 10s when time is synced (NTP) -> print via ESP-NOW, mark, save
@@ -2872,6 +3933,7 @@ void loop() {
         });
     }
 
+    alarmLoop();
     audioSvc.loop();
 
 #if !defined(TZT_HEADLESS)
@@ -2881,17 +3943,45 @@ void loop() {
     if (imageViewerNeedsDraw && imageViewerScreen && lv_scr_act() == imageViewerScreen && currentImagePath.length() > 0) {
         imageViewerNeedsDraw = false;
         displayFlushing = true;
-        drawSdJpegToTft(currentImagePath.c_str(), TZT_SCREEN_HEIGHT);
+        drawImageViewer();
         displayFlushing = false;
     }
-    // Idle: untouched for 2 min anywhere but the launcher -> back to the launcher
-    if (launcherScreen && lv_scr_act() != launcherScreen &&
-        (unsigned long)(millis() - lastDashboardTouchTime) > DASHBOARD_IDLE_RETURN_MS) {
+    // Idle: untouched for 2 min anywhere but home -> back to home (not while a sound plays on Sounds)
+    if (homeScreen && lv_scr_act() != homeScreen &&
+        (unsigned long)(millis() - lastDashboardTouchTime) > DASHBOARD_IDLE_RETURN_MS &&
+        !(lv_scr_act() == soundsScreen && audioSvc.isPlaying())) {
         lastDashboardTouchTime = millis();
-        returnToLauncher();
+        goToScreenIndex(SCREEN_HOME);
     }
-    // Keep the now-playing bar in sync when playback ends naturally
+    // Dim after a while untouched; never while an alarm rings, a sound plays or a restart is pending
+    if (homeScreen && !screenDimmed) {
+        if (alarmRinging || audioSvc.isPlaying() || restartConfirm || restartAt) {
+            lastScreenActivity = millis();
+        } else if (dimAfterMin && millis() - lastScreenActivity > dimAfterMin * 60000UL) {
+            screenDimmed = true;
+            setBacklight(DIM_BRIGHTNESS);
+        }
+    }
+    if (toastHideAt && (long)(millis() - toastHideAt) >= 0) {
+        toastHideAt = 0;
+        if (toastLabel) lv_obj_add_flag(toastLabel, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Dispense button rests for one dose; wake it when that's over
+    if (dispenseLockUntil && !dispenseLocked()) updateHomeScreen();
+    // Keep the Play/Stop button in sync when playback ends naturally
     if (soundsScreen && lv_scr_act() == soundsScreen) updateNowPlaying();
+    // A touch while the new item is on screen means it's been seen: drop its launcher badge
+    if (newItemShownSection >= 0 && lastUserTouchTime && (long)(lastUserTouchTime - newItemShownAt) > 0) {
+        lv_obj_t* showing = (newItemShownSection == SCREEN_PICTURES) ? imageViewerScreen : screenByIndex(newItemShownSection);
+        if (lv_scr_act() == showing) setSectionNew(newItemShownSection, false);
+        newItemShownSection = -1;
+    }
+    // Settings > Restart: Main got its CMD_RESTART (queued with resends); now this board
+    if (restartAt && (long)(millis() - restartAt) >= 0) {
+        Logger::info("Boot", "Restart from Settings");
+        delay(100);
+        ESP.restart();
+    }
 #endif
     delay(0);  // Yield only — no fixed delay so LVGL gets more CPU for smoother GUI
 }

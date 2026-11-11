@@ -33,6 +33,7 @@
 
 #define LOAD_GLCD  1
 #define LOAD_FONT2 1
+#define LOAD_FONT4 1   // 26 px: startup title card
 #define LOAD_GFXFF 0
 #define SMOOTH_FONT 0
 

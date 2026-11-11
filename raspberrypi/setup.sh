@@ -81,7 +81,7 @@ Type=simple
 User=$APP_USER
 WorkingDirectory=$SCRIPT_DIR
 EnvironmentFile=$ENV_FILE
-ExecStart=$SCRIPT_DIR/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 --access-logfile - --error-logfile - app:app
+ExecStart=$SCRIPT_DIR/venv/bin/gunicorn -w 2 -k gthread --threads 8 -b 0.0.0.0:5000 --access-logfile - --error-logfile - app:app
 Restart=always
 RestartSec=5
 
@@ -124,20 +124,33 @@ fi
 # --- Nginx reverse proxy ---
 echo ">>> Configuring nginx..."
 cat > /etc/nginx/sites-available/prick-n-print << NGINX
+# Who skips the password: the home LAN and the tailnet (by address), and requests that carry
+# X-API-Key (ESP32s, iOS Shortcuts; Flask rejects any request whose key is wrong, see
+# reject_wrong_api_key in app.py). Not 127.0.0.1: Tailscale Funnel delivers every internet request
+# from there, so trusting it would open the web page (which carries the API key) to anyone.
+geo \$prick_lan {
+    default        0;
+    10.0.0.0/8     1;
+    172.16.0.0/12  1;
+    192.168.0.0/16 1;
+    100.64.0.0/10  1;
+}
+map \$http_x_api_key \$prick_has_key {
+    ""      0;
+    default 1;
+}
+map "\$prick_lan\$prick_has_key" \$prick_auth {
+    "00"    "Prick_n_Print";
+    default off;
+}
+
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
 
     location / {
-        satisfy any;
-        allow 10.0.0.0/8;
-        allow 172.16.0.0/12;
-        allow 192.168.0.0/16;
-        allow 100.64.0.0/10;
-        allow 127.0.0.0/8;
-        deny all;
-        auth_basic "Prick_n_Print";
+        auth_basic \$prick_auth;
         auth_basic_user_file $HTPASSWD_FILE;
 
         proxy_pass http://127.0.0.1:5000;
@@ -153,6 +166,7 @@ NGINX
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/prick-n-print /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
+
 
 # --- Firewall (ufw) ---
 echo ">>> Configuring firewall..."
@@ -176,6 +190,9 @@ echo "Access the server:"
 echo "  - Local:     http://$(hostname -I | awk '{print $1}')"
 echo "  - Public:    http://YOUR_PUBLIC_IP  (port forward 80, for ESP32)"
 echo "  - Tailscale: http://\$(tailscale ip -4)"
+echo ""
+echo "Public via Tailscale Funnel (optional): sudo tailscale funnel --bg 80"
+echo "  (Funnel requests need the password or an X-API-Key, like any public request)"
 echo ""
 echo "HTTP Basic Auth: required for public access only"
 echo "  sudo ./set-http-password.sh   # change password"

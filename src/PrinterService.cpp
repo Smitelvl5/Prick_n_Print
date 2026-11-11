@@ -338,9 +338,12 @@ bool PrinterService::printReceipt(const String& message, bool includeWeatherAndS
         else
             hardware->printerPrintln("  -");
         delay(50);
-        hardware->printerWriteString("Moisture:");
-        hardware->printerWriteString(String(hardware->getMoisturePercent(), 1));
-        hardware->printerWriteString("%  Sanitizer:");
+        if (hardware->isMoistureEnabled()) {  // switched off: a broken sensor's value would be garbage
+            hardware->printerWriteString("Moisture:");
+            hardware->printerWriteString(String(hardware->getMoisturePercent(), 1));
+            hardware->printerWriteString("%  ");
+        }
+        hardware->printerWriteString("Sanitizer:");
         hardware->printerWriteString(String(hardware->getSanitizerLevel(), 1));
         hardware->printerPrintln("%");
         delay(50);
