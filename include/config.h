@@ -104,4 +104,10 @@
 #define ESP_NOW_SEND_INTERVAL 10000  // Heartbeat: full sensor packet every 10 s even when nothing changed
 #define ESP_NOW_MIN_SEND_GAP_MS 250  // State changes (LED, pump, IR, levels) go out immediately, but no closer together than this
 
+// Pi backend, for firmware updates only (Main has no other Pi traffic). Same public address as the
+// TZT's BACKEND_URL in config_tzt.h: Tailscale Funnel -> nginx, reachable from any Wi-Fi.
+#ifndef BACKEND_URL
+#define BACKEND_URL "https://dhara.tailf6c4f5.ts.net"
+#endif
+
 #endif // CONFIG_H 

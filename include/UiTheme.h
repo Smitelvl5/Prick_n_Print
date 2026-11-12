@@ -17,10 +17,10 @@ enum UiColor : uint32_t {
     UI_BACKGROUND     = 0x131B15,  // page background
     UI_CARD           = 0x1C2A1F,  // header band, cards, list rows, tiles
     UI_FIELD          = 0x26352A,  // value wells, bar/slider tracks, switch off
-    UI_BORDER         = 0x5B7F4A,  // cactus green: primary accent - filled primary buttons, switch on
+    UI_BORDER         = 0x3A5A2E,  // cactus green: primary accent - filled primary buttons, switch on
     UI_ACCENT         = 0xB4D69B,  // icons, "connected" status
     UI_TEXT           = 0xC8D4C2,  // universal foreground
-    UI_TEXT_MUTED     = 0x7E9478,  // captions, secondary labels, chevrons
+    UI_TEXT_MUTED     = 0xA9BCA2,  // captions, secondary labels, chevrons
     UI_TITLE          = 0xFFFFFF,  // text on filled primary buttons
     UI_WARNING        = 0xE74C3C,  // errors / destructive / disconnected
     UI_DANGER_DEEP    = 0x7B241C,  // destructive button while idle

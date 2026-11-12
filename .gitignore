@@ -17,3 +17,7 @@ PCB/.history/
 *.kicad_prl
 *-backups/
 fp-info-cache
+
+# Generated build id (scripts/fw_version.py)
+src/tzt-display/FwVersion.cpp
+src/FwVersion.cpp

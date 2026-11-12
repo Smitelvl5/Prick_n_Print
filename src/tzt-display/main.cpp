@@ -7,6 +7,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include "WifiPortal.h"
+#include "FwVersion.h"
+#include "FirmwareSink.h"
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -203,6 +206,7 @@ static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* settingsVolumeValueLabel = nullptr;
 static lv_obj_t* settingsScreen = nullptr;
 static void volumeSliderCb(lv_event_t* e);
+static void saveVolume(int pct);
 // LED brightness card on Settings (level is owned by Main; sent via the settings queue)
 static lv_obj_t* ledLevelSlider = nullptr;
 static lv_obj_t* ledLevelValueLabel = nullptr;
@@ -220,6 +224,7 @@ static void gesture_timer_cb(lv_timer_t* t);
 #define TZT_MIN_TOUCH_H    48
 static lv_obj_t* statusBackBtn = nullptr;    // "<" in status bar: section -> Menu, Menu -> home
 static lv_obj_t* statusTitleLabel = nullptr; // "Menu" or the section name
+static lv_obj_t* statusIconLabel = nullptr;  // the section's icon, before its name (none for Menu)
 static void updateHeader();
 // New items from the backend: the item opens itself, its launcher tile shows a "NEW" badge until
 // someone has looked at it, and Main blinks the LED
@@ -355,6 +360,37 @@ static String addAlarmFrom(const String& hm, bool daily, const String& label);
 #define TUNE_PICTURE  "pic:d=16,o=6,b=200:e,g,8e7"
 #define TUNE_ALARM_SET "set:d=16,o=7,b=220:c,p,c"
 #define TUNE_ALARM    "alarm:d=8,o=7,b=200:c,p,c,p,c,p,c,2p"
+// Quiet hours: what arrives from the Pi overnight comes in silently (no chime, wake, LED flash or
+// voice playback) and its printout waits until morning. Alarms and reminders are set on purpose,
+// so they still ring and print. Settings cycles the windows; saved in NVS "display"/"quiet".
+struct QuietWindow { uint8_t startHour, endHour; const char* label; };
+static const QuietWindow quietChoices[] = { {0, 0, "Off"}, {22, 7, "10p - 7a"}, {23, 8, "11p - 8a"}, {0, 9, "12a - 9a"} };
+#define QUIET_CHOICES (sizeof(quietChoices) / sizeof(quietChoices[0]))
+static uint8_t quietIdx = 2;  // 11 PM - 8 AM
+static lv_obj_t* quietValueLabel = nullptr;
+static unsigned long wifiSetupRestartAt = 0;  // Settings > Wi-Fi > Change: restart into setup at this time
+
+// True once after Settings > Wi-Fi > Change (clears the request)
+static bool takeWifiSetupRequest() {
+    Preferences prefs;
+    if (!prefs.begin("wifi", false)) return false;
+    bool asked = prefs.getBool("setup", false);
+    if (asked) prefs.remove("setup");
+    prefs.end();
+    return asked;
+}
+
+static bool isQuietNow() {
+    const QuietWindow& w = quietChoices[quietIdx];
+    if (w.startHour == w.endHour) return false;  // off
+    time_t now = time(nullptr);
+    if (now < 1600000000) return false;          // clock not set yet: don't guess
+    struct tm lt;
+    localtime_r(&now, &lt);
+    int h = lt.tm_hour;
+    return w.startHour < w.endHour ? (h >= w.startHour && h < w.endHour) : (h >= w.startHour || h < w.endHour);
+}
+
 // Chime unless the user's own sound is playing (don't cut it off) or an alarm is ringing
 static void playChime(const char* tune) {
     if (alarmRinging || (audioSvc.isPlaying() && !audioSvc.isPlayingTune())) return;
@@ -617,6 +653,33 @@ bool sendPrintChunked(const String& fullMessage, bool messageOnly = false) {
     return true;
 }
 
+// Printouts from the Pi that arrived during quiet hours (RAM only: after a restart they're still in
+// Messages, just not printed). Released once quiet hours end.
+#define HELD_PRINTS_MAX 6
+static QueuedPrint heldPrints[HELD_PRINTS_MAX];
+static uint8_t heldPrintCount = 0;
+
+static void holdPrint(const String& text, bool messageOnly) {
+    if (heldPrintCount == HELD_PRINTS_MAX) {  // keep the newest
+        for (uint8_t i = 1; i < HELD_PRINTS_MAX; i++) heldPrints[i - 1] = heldPrints[i];
+        heldPrintCount--;
+    }
+    heldPrints[heldPrintCount++] = { text, messageOnly };
+    Logger::info("Print", "Quiet hours: printout held (" + String(heldPrintCount) + " waiting)");
+}
+
+static void releaseHeldPrints() {
+    if (heldPrintCount == 0 || isQuietNow()) return;
+    uint8_t sent = 0;
+    while (sent < heldPrintCount && printQueueHasRoom(heldPrints[sent].text.length())) {
+        sendPrintChunked(heldPrints[sent].text, heldPrints[sent].messageOnly);
+        sent++;
+    }
+    for (uint8_t i = sent; i < heldPrintCount; i++) heldPrints[i - sent] = heldPrints[i];
+    for (uint8_t i = heldPrintCount - sent; i < heldPrintCount; i++) heldPrints[i] = QueuedPrint();
+    heldPrintCount -= sent;
+}
+
 // Enqueue a setting command: sent until Main ACKs it (up to SETTINGS_MAX_ATTEMPTS, SETTINGS_ACK_TIMEOUT_MS apart). Latest overwrites.
 void enqueueSettingCommand(uint8_t commandType, uint8_t param1, uint8_t param2, const char* message) {
     if (!espNowInitialized) return;
@@ -791,6 +854,9 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
 
 // Nav: home (SCREEN_HOME) -> menu (SCREEN_LAUNCHER) -> section by index (0=Messages, 1=Sounds, 2=Pictures, 3=Settings)
 static const char* const sectionTitles[SCREEN_COUNT] = { "Messages", "Sounds", "Pictures", "Settings" };
+// The section's icon on its Menu tile, in its title bar and on its "nothing here yet" note
+static const char* const sectionIcons[SCREEN_COUNT] = {
+    LV_SYMBOL_ENVELOPE, LV_SYMBOL_AUDIO, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS };
 
 static lv_obj_t* screenByIndex(int idx) {
     switch (idx) {
@@ -873,8 +939,18 @@ static void statusBackCb(lv_event_t* e) {
 
 // Status bar (hidden on home): "<" back + "Menu" or the section title
 static void updateHeader() {
-    if (statusTitleLabel)
-        lv_label_set_text(statusTitleLabel, currentScreenIndex >= 0 ? sectionTitles[currentScreenIndex] : "Menu");
+    if (!statusTitleLabel) return;
+    bool section = currentScreenIndex >= 0;
+    lv_label_set_text(statusTitleLabel, section ? sectionTitles[currentScreenIndex] : "Menu");
+    if (statusIconLabel) {
+        if (section) {
+            lv_label_set_text(statusIconLabel, sectionIcons[currentScreenIndex]);
+            lv_obj_clear_flag(statusIconLabel, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(statusIconLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_align(statusTitleLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 4 + (section ? 28 : 0), 0);
+    }
 }
 
 static void showToast(const char* text) {
@@ -991,18 +1067,6 @@ static lv_color_t uiHairline() {
     return lv_color_mix(uiColor(UI_BORDER), uiColor(UI_BACKGROUND), 56);
 }
 
-// Short cactus-green rule: the brand mark under the splash title, reused on tiles and empty states
-static lv_obj_t* makeAccentRule(lv_obj_t* parent, int w) {
-    lv_obj_t* r = lv_obj_create(parent);
-    lv_obj_remove_style_all(r);
-    lv_obj_set_size(r, w, 3);
-    lv_obj_set_style_bg_color(r, uiColor(UI_BORDER), 0);
-    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(r, 2, 0);
-    lv_obj_clear_flag(r, LV_OBJ_FLAG_CLICKABLE);
-    return r;
-}
-
 // Rounded card: header band / tile / row tone with a hairline edge (.card in theme.css)
 static void styleCard(lv_obj_t* obj, int pad) {
     lv_obj_set_style_bg_color(obj, uiColor(UI_CARD), 0);
@@ -1083,16 +1147,16 @@ static lv_obj_t* makeItemCard(lv_obj_t* parent, int pad, lv_event_cb_t cb) {
     return card;
 }
 
-// "Nothing here yet": a short cactus rule over a line of text, filling the content area.
+// "Nothing here yet": the section's icon over a line of text, filling the content area.
 // The text label is the note's child 1 (set by showItemView).
-static lv_obj_t* makeEmptyNote(lv_obj_t* parent) {
+static lv_obj_t* makeEmptyNote(lv_obj_t* parent, int section) {
     lv_obj_t* note = lv_obj_create(parent);
     lv_obj_remove_style_all(note);
     lv_obj_set_size(note, TZT_SCREEN_WIDTH, TZT_CONTENT_H);
     lv_obj_set_pos(note, 0, TZT_CONTENT_TOP);
     lv_obj_clear_flag(note, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* rule = makeAccentRule(note, 28);
-    lv_obj_align(rule, LV_ALIGN_CENTER, 0, -22);
+    lv_obj_t* icon = makeLabel(note, sectionIcons[section], &lv_font_montserrat_24, UI_ACCENT);
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -22);
     lv_obj_t* l = makeLabel(note, "", &lv_font_montserrat_16, UI_TEXT_MUTED);
     lv_obj_set_width(l, TZT_SCREEN_WIDTH - 4 * UI_MARGIN);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
@@ -1165,12 +1229,14 @@ static void gesture_timer_cb(lv_timer_t* t) {
 }
 
 static void volumeSliderCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED) return;
     lv_obj_t* slider = lv_event_get_target(e);
     if (!slider) return;
     int32_t v = lv_slider_get_value(slider);
     if (v < 0) v = 0;
     if (v > 100) v = 100;
+    if (code == LV_EVENT_RELEASED) { saveVolume((int)v); return; }
     audioSvc.setVolume((float)v / 100.0f);
     if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", (int)v);
 }
@@ -1269,7 +1335,7 @@ static void updateHomeScreen() {
     else if (!lastSensorDataValid) info = "Main board offline";
     else if (low) info = "Refill soon";
     else if (!wantIrSensor) info = "Hand sensor off";
-    else info = "One dose per tap";
+    else info = "";
     setLabelIfChanged(homeDispenseInfo, info);
     if (homeLevelArc) {
         lv_arc_set_value(homeLevelArc, level < 0 ? 0 : constrain(level, 0, 100));
@@ -1319,6 +1385,17 @@ static void loadDisplayPrefs() {
     if (!prefs.begin("display", true)) return;  // first boot: keep the default
     uint8_t m = prefs.getUChar("dimMin", dimAfterMin);
     for (uint8_t c : dimChoices) if (c == m) dimAfterMin = m;  // ignore anything unexpected
+    uint8_t q = prefs.getUChar("quiet", quietIdx);
+    if (q < QUIET_CHOICES) quietIdx = q;
+    if (prefs.isKey("volume")) audioSvc.setVolume(min((int)prefs.getUChar("volume"), 100) / 100.0f);
+    prefs.end();
+}
+
+// Volume survives a restart. Saved when the slider is let go (not on every drag step: flash wear).
+static void saveVolume(int pct) {
+    Preferences prefs;
+    if (!prefs.begin("display", false)) return;
+    if (prefs.getUChar("volume", 255) != pct) prefs.putUChar("volume", (uint8_t)pct);
     prefs.end();
 }
 
@@ -1342,6 +1419,33 @@ static void dimCycleCb(lv_event_t* e) {
     dimLabelText(t, sizeof(t));
     if (dimValueLabel) lv_label_set_text(dimValueLabel, t);
     wakeScreen();
+}
+
+// Settings > Wi-Fi > Change: remember the request, restart, and open the setup portal on boot (the
+// portal needs the whole board, like first setup). Main is told to open its own setup page too:
+// both boards must be on the same Wi-Fi (ESP-NOW only works on one channel).
+static void wifiChangeCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    Preferences prefs;
+    if (prefs.begin("wifi", false)) {
+        prefs.putBool("setup", true);
+        prefs.end();
+    }
+    enqueueSettingCommand(CMD_WIFI_SETUP, 0, 0);  // the dispenser opens its setup page too
+    showToast("Restarting into Wi-Fi setup...");
+    wifiSetupRestartAt = millis() + 3000;           // time for Main to get (and ACK) that
+}
+
+// Settings: tap cycles Off -> 10p-7a -> 11p-8a -> 12a-9a
+static void quietCycleCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    quietIdx = (quietIdx + 1) % QUIET_CHOICES;
+    Preferences prefs;
+    if (prefs.begin("display", false)) {
+        prefs.putUChar("quiet", quietIdx);
+        prefs.end();
+    }
+    if (quietValueLabel) lv_label_set_text(quietValueLabel, quietChoices[quietIdx].label);
 }
 
 static void saveSensorPrefs() {
@@ -1460,10 +1564,7 @@ static void createControlPanel() {
         lv_obj_set_style_arc_rounded(homeLevelArc, true, LV_PART_INDICATOR);
         lv_obj_set_style_pad_all(homeLevelArc, 0, 0);
         homeLevelLabel = makeLabel(homeLevelArc, "--", &lv_font_montserrat_24, UI_TITLE);
-        lv_obj_align(homeLevelLabel, LV_ALIGN_CENTER, 0, -6);
-        lv_obj_t* left = makeLabel(homeLevelArc, "LEFT", &lv_font_montserrat_12, UI_ACCENT);
-        lv_obj_set_style_text_letter_space(left, 1, 0);
-        lv_obj_align(left, LV_ALIGN_CENTER, 0, 16);
+        lv_obj_align(homeLevelLabel, LV_ALIGN_CENTER, 0, 0);
 
         // Action text on the right
         const int textX = 18 + ring + 20;
@@ -1513,8 +1614,8 @@ static void createControlPanel() {
             styleCard(btn, 12);
             applyBtnPressStyle(btn);
             lv_obj_add_event_cb(btn, launcherTileCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-            lv_obj_t* rule = makeAccentRule(btn, 22);
-            lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 0, 2);
+            lv_obj_t* icon = makeLabel(btn, sectionIcons[i], &lv_font_montserrat_24, UI_ACCENT);
+            lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 0, -2);
             lv_obj_t* name = makeLabel(btn, sectionTitles[i], &lv_font_montserrat_18, UI_TEXT);
             lv_obj_align(name, LV_ALIGN_BOTTOM_LEFT, 0, -18);
             lv_obj_t* sub = makeLabel(btn, tileSubtitles[i], &lv_font_montserrat_12, UI_TEXT_MUTED);
@@ -1550,7 +1651,7 @@ static void createControlPanel() {
     lv_obj_set_pos(msgTextLabel, 0, 24);
     msgNewerBtn = makeBarButton(messagesScreen, LV_SYMBOL_LEFT "  Newer", UI_MARGIN, halfW, false, messageStepCb, -1);
     msgOlderBtn = makeBarButton(messagesScreen, "Older  " LV_SYMBOL_RIGHT, UI_MARGIN + halfW + UI_GAP, halfW, false, messageStepCb, 1);
-    msgEmptyNote = makeEmptyNote(messagesScreen);
+    msgEmptyNote = makeEmptyNote(messagesScreen, SCREEN_MESSAGES);
 
     // ---- Sounds: a player on the newest sound; tap the card or Play, arrows pick another ----
     soundsScreen = lv_obj_create(NULL);
@@ -1576,13 +1677,13 @@ static void createControlPanel() {
         soundPlayLabel = lv_obj_get_child(soundPlayBtn, 0);
         soundNextBtn = makeBarButton(soundsScreen, LV_SYMBOL_RIGHT, UI_MARGIN + arrowW + UI_GAP + playW + UI_GAP,
                                      arrowW, false, soundStepCb, 1);
-        soundEmptyNote = makeEmptyNote(soundsScreen);
+        soundEmptyNote = makeEmptyNote(soundsScreen, SCREEN_SOUNDS);
     }
 
     // ---- Pictures: the menu opens the viewer directly; this screen only says there are none ----
     picturesScreen = lv_obj_create(NULL);
     setScreenStyle(picturesScreen);
-    picturesEmptyNote = makeEmptyNote(picturesScreen);
+    picturesEmptyNote = makeEmptyNote(picturesScreen, SCREEN_PICTURES);
 
     // Image viewer: full screen. Swipe or tap an edge for newer/older, tap the middle to close.
     imageViewerScreen = lv_obj_create(NULL);
@@ -1611,6 +1712,9 @@ static void createControlPanel() {
         statusBackBtn = makeBarIconButton(statusBar, LV_SYMBOL_LEFT, statusBackCb);
         lv_obj_align(statusBackBtn, LV_ALIGN_LEFT_MID, 0, 0);
 
+        statusIconLabel = makeLabel(statusBar, "", &lv_font_montserrat_18, UI_ACCENT);
+        lv_obj_align(statusIconLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 4, 0);
+        lv_obj_add_flag(statusIconLabel, LV_OBJ_FLAG_HIDDEN);
         statusTitleLabel = makeLabel(statusBar, "", &lv_font_montserrat_18, UI_TEXT);
         lv_obj_align(statusTitleLabel, LV_ALIGN_LEFT_MID, UI_BACK_W - 4, 0);
 
@@ -1644,9 +1748,13 @@ static void createControlPanel() {
 
     // Connection: network on the right, IP under it
     {
-        lv_obj_t* card = makeGroup("CONNECTION", rowH);
+        lv_obj_t* card = makeGroup("CONNECTION", 2 * rowH + 1);
         makeRowText(card, 0, rowH, "Wi-Fi", nullptr);
         const int valueW = innerW - 60;
+        makeRowDivider(card, rowH, innerW);
+        makeRowText(card, rowH + 1, rowH, "New Wi-Fi", "Restarts into setup");
+        lv_obj_t* wifiBtn = makeButton(card, "Change", 84, rowH - 12, false, wifiChangeCb);
+        lv_obj_align(wifiBtn, LV_ALIGN_TOP_RIGHT, 0, rowH + 1 + 6);
         statusWifiLabel = makeLabel(card, "--", &lv_font_montserrat_14, UI_TEXT);
         lv_label_set_long_mode(statusWifiLabel, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_align(statusWifiLabel, LV_TEXT_ALIGN_RIGHT, 0);
@@ -1670,6 +1778,7 @@ static void createControlPanel() {
         volumeSlider = makeSlider(card, sliderW, 0, 100, v0);
         lv_obj_set_pos(volumeSlider, 8, 42);
         lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_VALUE_CHANGED, nullptr);
+        lv_obj_add_event_cb(volumeSlider, volumeSliderCb, LV_EVENT_RELEASED, nullptr);
 
         makeRowDivider(card, sliderRowH, innerW);
 
@@ -1706,13 +1815,18 @@ static void createControlPanel() {
 
     // Screen: dim after a while untouched
     {
-        lv_obj_t* card = makeGroup("SCREEN", rowH);
+        lv_obj_t* card = makeGroup("SCREEN", 2 * rowH + 1);
         makeRowText(card, 0, rowH, "Dim after", "First tap only wakes it");
         char t[12];
         dimLabelText(t, sizeof(t));
         lv_obj_t* btn = makeButton(card, t, 84, rowH - 12, false, dimCycleCb);
-        lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, 0, 6);
         dimValueLabel = lv_obj_get_child(btn, 0);
+        makeRowDivider(card, rowH, innerW);
+        makeRowText(card, rowH + 1, rowH, "Quiet hours", "Alarms still ring");
+        lv_obj_t* qbtn = makeButton(card, quietChoices[quietIdx].label, 84, rowH - 12, false, quietCycleCb);
+        lv_obj_align(qbtn, LV_ALIGN_TOP_RIGHT, 0, rowH + 1 + 6);
+        quietValueLabel = lv_obj_get_child(qbtn, 0);
     }
 
     // Device: restart both boards (asks first)
@@ -1846,6 +1960,43 @@ static void messageCardCb(lv_event_t* e) {
 
 static String soundPath(int idx) { return String(AUDIO_DIR) + "/" + audioFileNames[idx]; }
 
+// Days since 1970-01-01 for a UTC calendar date (timegm isn't in newlib)
+static long daysFromCivil(int y, int m, int d) {
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+// File name as people should read it. The Pi names Shortcut uploads <prefix>_YYYYMMDD_HHMMSS[_n]
+// in UTC: "voice_20261111_082948.mp3" -> "Voice message\nNov 11, 2:29 AM" (local time). Anything
+// else loses its extension and underscores: "new_sound.wav" -> "New sound".
+static String friendlyName(const String& file) {
+    int dot = file.lastIndexOf('.');
+    String stem = dot > 0 ? file.substring(0, dot) : file;
+    int y, mo, d, h, mi, s, n = 0;
+    char prefix[16];
+    if (sscanf(stem.c_str(), "%15[a-z]_%4d%2d%2d_%2d%2d%2d%n", prefix, &y, &mo, &d, &h, &mi, &s, &n) == 7 &&
+        mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        time_t t = (time_t)(daysFromCivil(y, mo, d) * 86400L + h * 3600L + mi * 60L + s);
+        struct tm lt;
+        localtime_r(&t, &lt);
+        static const char* months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        int h12 = lt.tm_hour % 12 ? lt.tm_hour % 12 : 12;
+        char w[24];
+        snprintf(w, sizeof(w), "%s %d, %d:%02d %s", months[lt.tm_mon], lt.tm_mday, h12, lt.tm_min, lt.tm_hour < 12 ? "AM" : "PM");
+        String kind = strcmp(prefix, "voice") == 0 ? "Voice message" : strcmp(prefix, "photo") == 0 ? "Photo" : String(prefix);
+        kind.setCharAt(0, toupper(kind[0]));
+        return kind + "\n" + w;
+    }
+    stem.replace('_', ' ');
+    stem.replace('-', ' ');
+    stem.trim();
+    if (stem.length()) stem.setCharAt(0, toupper(stem[0]));
+    return stem;
+}
+
 static void showSoundAt(int pos) {
     lv_obj_t* parts[] = { soundCard, soundPrevBtn, soundPlayBtn, soundNextBtn };
     if (audioFileCount == 0) {
@@ -1855,8 +2006,7 @@ static void showSoundAt(int pos) {
     showItemView(parts, 4, soundEmptyNote, nullptr);
     soundShown = constrain(pos, 0, audioFileCount - 1);
     String name = audioFileNames[soundShown];
-    int dot = name.lastIndexOf('.');
-    lv_label_set_text(soundNameLabel, (dot > 0 ? name.substring(0, dot) : name).c_str());
+    lv_label_set_text(soundNameLabel, friendlyName(name).c_str());
     if (audioFileCount > 1) lv_label_set_text_fmt(soundPosLabel, "%d of %d", soundShown + 1, audioFileCount);
     else lv_label_set_text(soundPosLabel, "");
     if (newSoundName.length() && name == newSoundName) lv_obj_clear_flag(soundNewBadge, LV_OBJ_FLAG_HIDDEN);
@@ -1962,18 +2112,21 @@ static bool drawSplashToTft() {
 }
 
 static void drawWifiSetupHelp() {
-    drawTitleCard("Set up WiFi");
+    drawTitleCard("Set up Wi-Fi");
     tft.setTextDatum(TL_DATUM);
+    const int x = 20;
     tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
-    const int x = 28;
-    tft.drawString("1. On your phone, join WiFi:", x, 116, 2);
+    tft.drawString("1. On your phone, join", x, 108, 2);
     tft.setTextColor(tftColor(UI_ACCENT), tftColor(UI_BACKGROUND));
-    tft.drawString("   " TZT_AP_SSID "   pw: " TZT_AP_PASSWORD, x, 136, 2);
+    tft.drawString(TZT_AP_SSID "  pw " TZT_AP_PASSWORD, x + 150, 108, 2);
     tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
-    tft.drawString("2. Pick your home WiFi on the page", x, 162, 2);
-    tft.drawString("   that opens (or go to 192.168.4.1)", x, 182, 2);
+    tft.drawString("   and pick your Wi-Fi on the page", x, 126, 2);
+    tft.drawString("2. Then do the same for the dispenser:", x, 152, 2);
+    tft.setTextColor(tftColor(UI_ACCENT), tftColor(UI_BACKGROUND));
+    tft.drawString("   " AP_SSID "  pw " AP_PASSWORD, x, 170, 2);
     tft.setTextColor(tftColor(UI_TEXT_MUTED), tftColor(UI_BACKGROUND));
-    tft.drawString("Carries on by itself once connected.", x, 212, 2);
+    tft.drawString("Page doesn't open? Go to 192.168.4.1", x, 196, 2);
+    tft.drawString("Not done in 10 min? Keeps the old Wi-Fi.", x, 214, 2);
 }
 static void drawSdJpegToTft(const char* path, int maxY) {
     if (maxY <= 0) maxY = TZT_SCREEN_HEIGHT;
@@ -2261,7 +2414,8 @@ void handleGetStatus() {
     doc["minFreeHeap"] = ESP.getMinFreeHeap();  // lowest since boot: TLS (two at once with the command poll) is the big user
     unsigned long pollEnd = lastPollEndedAt;
     doc["lastPollAgoS"] = pollEnd ? (long)((millis() - pollEnd) / 1000) : -1;  // a long poll ends every ~20 s
-    doc["maxLoopStallMs"] = maxLoopStallMs;  // screen/touch/audio freeze, worst since boot
+    doc["maxLoopStallMs"] = maxLoopStallMs;
+    doc["firmware"] = FW_VERSION;  // screen/touch/audio freeze, worst since boot
     doc["sensorsValid"] = lastSensorDataValid;
     if (lastSensorDataValid) {
         doc["moisture"] = lastSensorData.moisturePercent;  // < 0 = moisture sensor switched off
@@ -3133,6 +3287,7 @@ void setupWebServer() {
         if (doc.containsKey("volume")) {
             int v = constrain(doc["volume"].as<int>(), 0, 100);
             audioSvc.setVolume((float)v / 100.0f);
+            saveVolume(v);
 #if !defined(TZT_HEADLESS)
             if (volumeSlider) lv_slider_set_value(volumeSlider, v, LV_ANIM_OFF);
             if (settingsVolumeValueLabel) lv_label_set_text_fmt(settingsVolumeValueLabel, "%d%%", v);
@@ -3179,6 +3334,66 @@ static bool fetchFromPi(const String& piPath, Stream& out) {
     if (pollBackend->download(piPath, out)) return true;
     Logger::warn("Media", "Download " + piPath + " failed: " + pollBackend->getLastError());
     return false;
+}
+
+// ── Firmware updates from the Pi ─────────────────────────────────
+// scripts/publish_firmware.py puts a build on the Pi, which queues "update_firmware". The image
+// streams over the poll's own connection (the TZT can't hold a second TLS session) straight into
+// the spare app partition; the MD5 is checked before it's made bootable. Anything going wrong
+// leaves the running firmware in place, and the Pi offers the update again in 30 min.
+// The command isn't acked before the restart, so it comes back once: same version, skipped.
+
+static void drawUpdateProgress(int pct) {
+#if !defined(TZT_HEADLESS)
+    const int w = 220, x = (TZT_SCREEN_WIDTH - w) / 2, y = 150;
+    tft.fillRoundRect(x, y, w, 10, 5, tftColor(UI_FIELD));
+    tft.fillRoundRect(x, y, max(10, w * pct / 100), 10, 5, tftColor(UI_ACCENT));
+#endif
+}
+
+static void installFirmware(const String& version, const String& path, size_t size, const String& md5) {
+    if (version == FW_VERSION) return;  // already running it
+    if (alarmRinging || size == 0 || md5.length() != 32 || !path.startsWith("/api/firmware/")) {
+        Logger::warn("Update", "Firmware " + version + " skipped (alarm ringing or bad command)");
+        return;
+    }
+    Logger::info("Update", "Installing firmware " + version + " (" + String(size) + " bytes), running " + FW_VERSION);
+    audioSvc.stop();
+#if !defined(TZT_HEADLESS)
+    wakeScreen();
+    drawTitleCard("Updating");
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(tftColor(UI_TEXT), tftColor(UI_BACKGROUND));
+    tft.drawString("Please don't unplug - about a minute", TZT_SCREEN_WIDTH / 2, 124, 2);
+    drawUpdateProgress(0);
+#endif
+    bool ok = Update.begin(size);
+    if (!ok) Logger::error("Update", "Begin failed: " + String(Update.errorString()));
+    if (ok) {
+        Update.setMD5(md5.c_str());
+        FirmwareSink sink(size, drawUpdateProgress);
+        ok = pollBackend && pollBackend->download(path, sink) && sink.written == size;
+        if (!ok) Logger::error("Update", "Download failed (" + String(sink.written) + "/" + String(size) + "): " +
+                               (pollBackend ? pollBackend->getLastError() : String("no backend")));
+        if (ok && !Update.end()) {
+            ok = false;
+            Logger::error("Update", "Not installed: " + String(Update.errorString()));  // e.g. MD5 mismatch
+        }
+        if (!ok) Update.abort();
+    }
+    if (ok) {
+        Logger::info("Update", "Firmware " + version + " installed, restarting");
+#if !defined(TZT_HEADLESS)
+        tft.fillRect(0, 115, TZT_SCREEN_WIDTH, 20, tftColor(UI_BACKGROUND));
+        tft.drawString("Done - restarting", TZT_SCREEN_WIDTH / 2, 124, 2);
+#endif
+        delay(800);
+        ESP.restart();
+    }
+#if !defined(TZT_HEADLESS)
+    tft.fillScreen(tftColor(UI_BACKGROUND));
+    lv_obj_invalidate(lv_scr_act());  // put the UI back over the update card
+#endif
 }
 
 // ── Alarms ───────────────────────────────────────────────────────
@@ -3312,16 +3527,19 @@ static void presentNewItem() {
     if (pendingNewSection < 0) return;
     int section = pendingNewSection;
     String name = pendingNewName;
-    bool play = pendingNewPlay && section == SCREEN_SOUNDS && name.length() > 0 && !alarmRinging;
-    wakeScreen();  // something new arrived: light up so it's noticed
+    bool quiet = isQuietNow();
+    bool play = pendingNewPlay && section == SCREEN_SOUNDS && name.length() > 0 && !alarmRinging && !quiet;
     pendingNewSection = -1;
     pendingNewName = "";
     pendingNewPlay = false;
-    enqueueSettingCommand(CMD_LED_NOTIFY, NEW_ITEM_LED_FLASHES, 0);
-    // A voice message plays straight away (after the batch's downloads, so they can't stall it);
-    // everything else gets its chime
-    if (!play || !audioSvc.playFile(String(AUDIO_DIR) + "/" + name))
-        playChime(section == SCREEN_MESSAGES ? TUNE_MESSAGE : section == SCREEN_SOUNDS ? TUNE_SOUND : TUNE_PICTURE);
+    if (!quiet) {  // quiet hours: only the NEW badges below
+        wakeScreen();  // something new arrived: light up so it's noticed
+        enqueueSettingCommand(CMD_LED_NOTIFY, NEW_ITEM_LED_FLASHES, 0);
+        // A voice message plays straight away (after the batch's downloads, so they can't stall it);
+        // everything else gets its chime
+        if (!play || !audioSvc.playFile(String(AUDIO_DIR) + "/" + name))
+            playChime(section == SCREEN_MESSAGES ? TUNE_MESSAGE : section == SCREEN_SOUNDS ? TUNE_SOUND : TUNE_PICTURE);
+    }
     Logger::info("UI", "New " + String(section == SCREEN_MESSAGES ? "message" : section == SCREEN_SOUNDS ? "sound" : "picture")
                  + (name.length() ? ": " + name : String("")));
 #if !defined(TZT_HEADLESS)
@@ -3395,6 +3613,7 @@ static void startCommandPolling() {
     pollBackend = new HttpBackendService(BACKEND_URL, BACKEND_TIMEOUT, BACKEND_API_KEY);
     pollBackend->setRetryPolicy(1, 0);  // the task's retry delay handles failures
     pollBackend->setDeviceIdentity("tzt-display", "TZT Display");  // Pi marks us seen on every poll
+    pollBackend->setFirmwareVersion(FW_VERSION);  // Pi offers newer published firmware until this matches
     pollBackend->setPollWait(COMMAND_POLL_WAIT_S);
     pollDone = xSemaphoreCreateBinary();
     pollNext = xSemaphoreCreateBinary();
@@ -3495,6 +3714,8 @@ void setup() {
     // Initialize WiFi
     WiFiManager wifiManager;
     wifiManager.setDebugOutput(false);  // Suppress *wm: verbose logs
+    styleWifiPortal(wifiManager, "Prick'n'Print screen");
+    wifiManager.setHostname("TZT-Display");
 #if !defined(TZT_HEADLESS)
     wifiManager.setAPCallback([](WiFiManager*) { drawWifiSetupHelp(); });  // no saved WiFi: say how to set it up
 #endif
@@ -3509,10 +3730,16 @@ void setup() {
     // The setup portal blocks this task for as long as someone is entering WiFi details, so unwatch it
     // (the 60 s WDT would reboot mid-setup); the portal timeout bounds the wait instead
     esp_task_wdt_delete(NULL);
-    wifiManager.setConfigPortalTimeout(600);
-    if (!wifiManager.autoConnect(TZT_AP_SSID, TZT_AP_PASSWORD)) {
-        Logger::warn("WiFi", "config portal timed out or failed.");
+    bool wifiOk;
+    if (takeWifiSetupRequest()) {  // Settings > Wi-Fi > Change restarted into setup
+        Logger::info("WiFi", "Setup requested from Settings: opening the portal");
+        wifiOk = openWifiPortal(wifiManager, TZT_AP_SSID, TZT_AP_PASSWORD, 600);
+    } else {
+        // Saved Wi-Fi that isn't up yet (router still booting after a power cut) is retried in the
+        // background; the portal only opens on first setup
+        wifiOk = connectWifi(wifiManager, TZT_AP_SSID, TZT_AP_PASSWORD, 600);
     }
+    if (!wifiOk) Logger::warn("WiFi", "Not connected yet; retrying in the background");
     esp_task_wdt_add(NULL);
 #endif
     
@@ -3611,7 +3838,7 @@ void setup() {
     }
 
     setupWebServer();
-    Logger::info("Boot", "TZT Display ready | http://" + deviceIP + ":8080");
+    Logger::info("Boot", "TZT Display ready | http://" + deviceIP + ":8080 | firmware " + FW_VERSION);
 }
 
 void loop() {
@@ -3649,7 +3876,7 @@ void loop() {
             updateControlPanelStatus();
             lv_scr_load(homeScreen);
             splashVisible = false;
-            playChime(TUNE_STARTUP);
+            if (!isQuietNow()) playChime(TUNE_STARTUP);
         }
         delay(2);
         return;
@@ -3850,7 +4077,8 @@ void loop() {
                     // Full receipt (MESSAGE title, date, weather, levels) for everything from the Pi -
                     // Shortcuts don't always send "source". Opt out with "source":"plain".
                     bool messageOnly = source.equalsIgnoreCase("plain");
-                    sendPrintChunked(data, messageOnly);
+                    if (isQuietNow()) holdPrint(data, messageOnly);  // prints when quiet hours end
+                    else sendPrintChunked(data, messageOnly);
                     sdCard.saveMessage(data, source);
                     markNewItem(SCREEN_MESSAGES, "");
 #if !defined(TZT_HEADLESS)
@@ -3870,7 +4098,14 @@ void loop() {
                         }
                     }
                 }
-                else if (typ == "play_audio" && data.length() > 0 && isSafeFilename(data)) {
+                else if (typ == "update_firmware") {
+                    String device = c["device"] | "tzt-display";
+                    if (device == "tzt-display")
+                        installFirmware(c["version"] | "", c["path"] | "", c["size"] | 0, c["md5"] | "");
+                    else if (device == "main-board")  // Main fetches it from the Pi itself; this says "now"
+                        enqueueSettingCommand(CMD_CHECK_UPDATE, 0, 0);
+                }
+                else if (typ == "play_audio" && data.length() > 0 && isSafeFilename(data) && !isQuietNow()) {
                     String path = String(AUDIO_DIR) + "/" + data;
                     audioSvc.playFile(path);
                 }
@@ -3933,6 +4168,10 @@ void loop() {
         });
     }
 
+    {
+        static unsigned long lastHeldCheck = 0;
+        if (heldPrintCount && millis() - lastHeldCheck >= 30000) { lastHeldCheck = millis(); releaseHeldPrints(); }
+    }
     alarmLoop();
     audioSvc.loop();
 
@@ -3975,6 +4214,11 @@ void loop() {
         lv_obj_t* showing = (newItemShownSection == SCREEN_PICTURES) ? imageViewerScreen : screenByIndex(newItemShownSection);
         if (lv_scr_act() == showing) setSectionNew(newItemShownSection, false);
         newItemShownSection = -1;
+    }
+    if (wifiSetupRestartAt && (long)(millis() - wifiSetupRestartAt) >= 0) {
+        Logger::info("Boot", "Restart into Wi-Fi setup");
+        delay(100);
+        ESP.restart();
     }
     // Settings > Restart: Main got its CMD_RESTART (queued with resends); now this board
     if (restartAt && (long)(millis() - restartAt) >= 0) {

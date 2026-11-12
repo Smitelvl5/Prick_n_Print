@@ -19,8 +19,7 @@ static AudioGeneratorRTTTL*    tuneGen = nullptr;
 bool AudioService::begin() {
     if (initialized) return true;
     audioOut = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
-    volume = 0.25f;
-    audioOut->SetGain(volume);
+    audioOut->SetGain(volume);  // 25% by default, or the saved volume set before begin()
     initialized = true;
     return true;
 }

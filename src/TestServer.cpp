@@ -3,6 +3,8 @@
 #include "secrets.h"
 #include "WebTheme.h"
 #include "version.h"
+#include "FwVersion.h"
+extern String lastUpdateStatus;  // main.cpp: result of the last firmware check
 #include <WiFi.h>
 #include <esp_system.h>
 
@@ -254,7 +256,8 @@ static long agoSeconds(unsigned long ms) { return ms ? (long)((millis() - ms) / 
 
 void TestServer::handleSystem() {
     String fields = "\"firmware\":\"" FIRMWARE_VERSION "\"" +
-                    String(",\"build\":\"" __DATE__ " " __TIME__ "\"") +
+                    String(",\"build\":\"") + FW_VERSION + "\"" +  // build id the Pi's updates compare against
+                    ",\"update\":\"" + lastUpdateStatus + "\"" +
                     ",\"uptimeS\":" + String(millis() / 1000) +
                     ",\"resetReason\":\"" + resetReasonName(esp_reset_reason()) + "\"" +
                     ",\"freeHeap\":" + String(ESP.getFreeHeap()) +

@@ -22,6 +22,7 @@ private:
     unsigned long lastRequest;
     String deviceId;
     String deviceName;
+    String firmwareVersion;  // sent as X-Firmware: the Pi offers newer published firmware
     int pollWaitS = 0;  // > 0: pollCommands() long-polls (server holds the request until a command arrives)
     String pollAck;     // handled command ids, sent with the next poll (the server deletes them)
     String pollSkip;    // received but unreadable command ids (the server deletes them, marks them failed)
@@ -43,6 +44,7 @@ public:
 
     void setRetryPolicy(int count, int delayMs) override;
     void setDeviceIdentity(const String& id, const String& name) override;
+    void setFirmwareVersion(const String& v) { firmwareVersion = v; }
     // Long poll: blocks up to waitS seconds, so only call pollCommands() off the UI loop when set
     void setPollWait(int waitS) { pollWaitS = waitS; }
     // Comma-separated ids handled since the last poll; replaces DELETE /commands/<id> per command

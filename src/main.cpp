@@ -8,6 +8,14 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include "WifiPortal.h"
+#include "FwVersion.h"
+#include "FirmwareSink.h"
+#include <esp_ota_ops.h>
+#include <soc/soc.h>
+#include <esp_image_format.h>  // rtc_retain_mem_t
+#include <esp_ipc.h>
+#include "BackendTls.h"
 #include <WebServer.h>
 #include <esp_task_wdt.h>
 #include <esp_sleep.h>
@@ -44,6 +52,25 @@ static const unsigned long TEST_PUMP_DURATION_MS = 800;
 static const unsigned long TEST_LED_DURATION_MS = 1000;
 static unsigned long espNowTestDurationMs = 0;  // actual duration for the in-flight test (set per-call)
 static volatile unsigned long pendingRestartAt = 0;  // CMD_RESTART: millis() to reboot at (0 = none)
+static volatile bool updateCheckRequested = false;   // CMD_CHECK_UPDATE: ask the Pi for new firmware now
+String lastUpdateStatus = "not checked yet";      // shown on /system (TestServer)
+
+// Wi-Fi setup page (WiFiManager), run non-blocking from loop() so the dispenser keeps working.
+// This board has no screen, so it opens by itself after WIFI_FALLBACK_PORTAL_MS without Wi-Fi
+// (new router, changed password) and on request from the TZT (Settings > New Wi-Fi). The light
+// blinks slowly while it's open.
+static WiFiManager wifiManager;
+static bool wifiPortalOpen = false;
+static unsigned long wifiPortalOpenedAt = 0;
+static unsigned long wifiDownSince = 0;      // 0 = connected
+static unsigned long lastFallbackPortalAt = 0;
+#define WIFI_PORTAL_S              600              // setup page stays up this long
+#define WIFI_FALLBACK_PORTAL_MS    (10UL * 60 * 1000)  // offline this long -> open it by itself
+#define WIFI_FALLBACK_REPEAT_MS    (30UL * 60 * 1000)  // and again this often while still offline
+
+// Firmware updates from the Pi (scripts/publish_firmware.py --env esp32-wroom-32-ota --device main-board)
+#define UPDATE_FIRST_CHECK_MS   (3UL * 60 * 1000)        // after boot
+#define UPDATE_CHECK_EVERY_MS   (6UL * 60 * 60 * 1000)   // then this often (and when the TZT says so)
 
 // Cancels this file's in-flight pump/LED test pulse without touching the
 // actuator - called before TestServer starts its own pulse, so only one
@@ -135,6 +162,8 @@ static String wifiStatusName(int status) {
 
 // Function declarations
 void setupWiFi();
+static void wifiLoop();
+static void updateLoop();
 void setupTime();
 void handleEspNowCommand(CommandPacket* cmd);
 static bool isPreformattedPrint(const String& full);
@@ -248,6 +277,8 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    wifiLoop();
+    updateLoop();
 
     testServer->handleClient();
     testServer->update();
@@ -329,6 +360,15 @@ void loop() {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         delay(50);
+#if CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP
+        // On a deep-sleep wake the bootloader boots whatever ran before (its rtc_retain_mem_t record,
+        // kept at the top of RTC fast memory) instead of reading the OTA setting, so a just-installed
+        // update wouldn't start. Wiping the record (its CRC then fails) makes it boot like a reset.
+        // RTC fast memory is only reachable from the PRO CPU (core 0); loop() runs on core 1.
+        esp_ipc_call_blocking(0, [](void*) {
+            memset((void*)(SOC_RTC_DRAM_HIGH - sizeof(rtc_retain_mem_t)), 0, sizeof(rtc_retain_mem_t));
+        }, nullptr);
+#endif
         esp_sleep_enable_timer_wakeup(100 * 1000ULL);
         esp_deep_sleep_start();
     }
@@ -465,6 +505,121 @@ void loop() {
     delay(1);  // Short delay for sensor->actuator responsiveness (IR->pump). HTTP latency not a priority.
 }
 
+// Setup page without blocking loop() (WiFiManager non-blocking mode; loop() calls process())
+static void openWifiPortalInBackground() {
+    wifiManager.setConfigPortalBlocking(false);
+    wifiManager.setConfigPortalTimeout(WIFI_PORTAL_S);
+    wifiManager.startConfigPortal(AP_SSID, AP_PASSWORD);
+    wifiPortalOpen = true;
+    wifiPortalOpenedAt = millis();
+}
+
+static void wifiLoop() {
+    bool up = WiFi.status() == WL_CONNECTED;
+    if (wifiPortalOpen) {
+        wifiManager.process();
+        static unsigned long lastBlink = 0;
+        if (hardware && millis() - lastBlink >= 4000) { lastBlink = millis(); hardware->startNotifyFlash(1); }
+        if (up && WiFi.getMode() != WIFI_AP) {
+            // Joined a network from the page: restart so ESP-NOW and everything else start on it
+            Logger::info("WiFi", "Connected to " + WiFi.SSID() + " from the setup page, restarting");
+            wifiPortalOpen = false;
+            wifiManager.stopConfigPortal();
+            pendingRestartAt = millis() + 1000;
+        } else if (!wifiManager.getConfigPortalActive() || millis() - wifiPortalOpenedAt > (WIFI_PORTAL_S + 30) * 1000UL) {
+            Logger::info("WiFi", "Setup page closed; trying the saved Wi-Fi again");
+            wifiPortalOpen = false;
+            wifiManager.stopConfigPortal();
+            if (wifiManager.getWiFiIsSaved()) keepRetryingWifi();
+        }
+        return;
+    }
+    if (up) { wifiDownSince = 0; return; }
+    if (!wifiDownSince) wifiDownSince = millis() ? millis() : 1;
+    if (millis() - wifiDownSince >= WIFI_FALLBACK_PORTAL_MS &&
+        (!lastFallbackPortalAt || millis() - lastFallbackPortalAt >= WIFI_FALLBACK_REPEAT_MS)) {
+        lastFallbackPortalAt = millis();
+        Logger::warn("WiFi", "No Wi-Fi for 10 min: opening the setup page (" AP_SSID ")");
+        openWifiPortalInBackground();
+    }
+}
+
+// Ask the Pi whether newer firmware is published for this board; if so, install it and restart.
+// Leaves the running firmware alone on any failure (next check retries).
+static void checkFirmwareUpdate() {
+    // An update already installed but not running yet (the restart didn't boot it): writing another
+    // one would erase that very partition. Restart into it instead.
+    if (esp_ota_get_boot_partition() != esp_ota_get_running_partition()) {
+        lastUpdateStatus = "installed update not running: restarting";
+        Logger::warn("Update", lastUpdateStatus);
+        pendingRestartAt = millis() + 500;
+        return;
+    }
+    HTTPClient http;
+    if (!beginBackendHttp(http, String(BACKEND_URL) + "/api/firmware/main-board")) { lastUpdateStatus = "no connection to the Pi"; return; }
+    http.setTimeout(15000);
+    http.addHeader("X-API-Key", BACKEND_API_KEY);
+    http.addHeader("X-Device-Id", "main-board");
+    http.addHeader("X-Device-Name", "Main board");
+    int code = http.GET();
+    if (code != 200) {
+        lastUpdateStatus = code == 404 ? "nothing published" : "check failed: HTTP " + String(code);
+        if (code != 404) Logger::warn("Update", lastUpdateStatus);
+        http.end();
+        return;
+    }
+    StaticJsonDocument<384> meta;
+    DeserializationError err = deserializeJson(meta, http.getString());
+    http.end();
+    String version = meta["version"] | "";
+    String md5 = meta["md5"] | "";
+    size_t size = meta["size"] | 0;
+    if (err || version.length() == 0 || size == 0 || md5.length() != 32) { lastUpdateStatus = "bad answer from the Pi"; return; }
+    if (version == FW_VERSION) { lastUpdateStatus = "up to date"; return; }
+    Logger::info("Update", "Installing firmware " + version + " (" + String(size) + " bytes), running " + FW_VERSION);
+
+    if (!Update.begin(size)) {
+        lastUpdateStatus = "begin failed: " + String(Update.errorString());  // e.g. flash erase
+        Logger::error("Update", lastUpdateStatus);
+        return;
+    }
+    Update.setMD5(md5.c_str());
+    HTTPClient img;
+    bool ok = beginBackendHttp(img, String(BACKEND_URL) + "/api/firmware/main-board/image");
+    if (ok) {
+        img.setTimeout(15000);
+        img.addHeader("X-API-Key", BACKEND_API_KEY);
+        ok = img.GET() == 200;
+    }
+    FirmwareSink sink(size);
+    if (ok) ok = img.writeToStream(&sink) > 0 && sink.written == size;
+    img.end();
+    if (!ok) {
+        lastUpdateStatus = "download failed (" + String(sink.written) + "/" + String(size) + ")";
+        Logger::error("Update", lastUpdateStatus);
+    }
+    if (ok && !Update.end()) {
+        ok = false;
+        lastUpdateStatus = "not installed: " + String(Update.errorString());
+        Logger::error("Update", lastUpdateStatus);
+    }
+    if (!ok) { Update.abort(); return; }
+    lastUpdateStatus = "installed " + version + ", restarting";
+    Logger::info("Update", lastUpdateStatus);
+    pendingRestartAt = millis() + 500;  // deep-sleep restart in loop() (ESP.restart() freezes this board)
+}
+
+static void updateLoop() {
+    static unsigned long nextCheckAt = UPDATE_FIRST_CHECK_MS;
+    bool due = updateCheckRequested || (long)(millis() - nextCheckAt) >= 0;
+    // Not mid-dispense, mid-print, or offline; the download blocks loop() for a minute or so
+    if (!due || WiFi.status() != WL_CONNECTED || wifiPortalOpen || pendingRestartAt) return;
+    if ((hardware && hardware->isDispensing()) || printChunkTotal || pendingChunkPrintReady) return;
+    updateCheckRequested = false;
+    nextCheckAt = millis() + UPDATE_CHECK_EVERY_MS;
+    checkFirmwareUpdate();
+}
+
 void setupWiFi() {
     Logger::info("WiFi", "Setting up WiFi...");
     
@@ -474,8 +629,10 @@ void setupWiFi() {
     int initialStatus = WiFi.status();
     Logger::info("WiFi", "Initial WiFi status: " + String(initialStatus));
     
-    WiFiManager wm;
+    WiFiManager& wm = wifiManager;
     wm.setDebugOutput(false);  // Suppress *wm: verbose logs
+    styleWifiPortal(wm, "Prick'n'Print dispenser");
+    wm.setHostname("Print-n-Prick");
     WiFi.mode(WIFI_STA);
     Logger::info("WiFi", "WiFi mode set to STA (Station)");
     
@@ -489,9 +646,27 @@ void setupWiFi() {
     wm.startConfigPortal(AP_SSID, AP_PASSWORD);
     bool res = (WiFi.status() == WL_CONNECTED);
 #else
-    // Try saved credentials first; if none or connection fails, config portal opens once, then credentials are saved for next boot.
-    Logger::info("WiFi", "Starting autoConnect (timeout: 180s)...");
-    bool res = wm.autoConnect(AP_SSID, AP_PASSWORD);
+    // Saved Wi-Fi that isn't up yet (router still booting after a power cut) is retried in the
+    // background; the setup portal (3 min) only opens when no Wi-Fi is saved
+    bool asked = false;
+    {
+        Preferences prefs;
+        if (prefs.begin("wifi", false)) {
+            asked = prefs.getBool("setup", false);
+            if (asked) prefs.remove("setup");
+            prefs.end();
+        }
+    }
+    bool res = false;
+    if (asked) {
+        // TZT Settings > New Wi-Fi: setup page for WIFI_PORTAL_S, handled in loop() so the rest
+        // of setup (ESP-NOW, sensors) still runs
+        Logger::info("WiFi", "Setup requested by the TZT: opening the setup page");
+        openWifiPortalInBackground();
+    } else {
+        Logger::info("WiFi", "Connecting...");
+        res = connectWifi(wm, AP_SSID, AP_PASSWORD, 180);
+    }
 #endif
     
     // Check WiFi status after connection attempt
@@ -621,7 +796,7 @@ static bool isSettingCommandType(uint8_t type) {
     return (type == CMD_SET_LED_BRIGHTNESS || type == CMD_SET_LED_STATE || type == CMD_SET_LED_SCHEDULE
          || type == CMD_SET_PUMP_DURATION || type == CMD_SET_PUMP_COOLDOWN || type == CMD_SET_AUTO_DISPENSE
          || type == CMD_SET_LED_SCHEDULE_TIME || type == CMD_LED_NOTIFY || type == CMD_RESTART
-         || type == CMD_SET_MOISTURE_SENSOR);
+         || type == CMD_SET_MOISTURE_SENSOR || type == CMD_CHECK_UPDATE || type == CMD_WIFI_SETUP);
 }
 
 void handleEspNowCommand(CommandPacket* cmd) {
@@ -801,6 +976,19 @@ void handleEspNowCommand(CommandPacket* cmd) {
         case CMD_LED_NOTIFY:
             hardware->startNotifyFlash(cmd->param1 ? cmd->param1 : 3);
             break;
+        case CMD_CHECK_UPDATE:
+            updateCheckRequested = true;  // loop() fetches it (not here: this is the ESP-NOW callback)
+            Logger::info("Update", "TZT says new firmware is on the Pi");
+            break;
+        case CMD_WIFI_SETUP: {
+            // Restart into the setup page (after the ACK goes out), like the TZT does
+            Preferences prefs;
+            if (prefs.begin("wifi", false)) { prefs.putBool("setup", true); prefs.end(); }
+            pendingRestartAt = millis() + 500;
+            if (pendingRestartAt == 0) pendingRestartAt = 1;
+            Logger::info("WiFi", "TZT asked for Wi-Fi setup: restarting into it");
+            break;
+        }
         case CMD_RESTART:
             // Reboot from loop() a moment later, so the ACK sent after this callback still goes out
             pendingRestartAt = millis() + 500;

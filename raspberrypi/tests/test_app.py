@@ -28,6 +28,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "IMAGES_DIR", tmp_path / "images")
     monkeypatch.setattr(app_module, "AUDIO_DIR", tmp_path / "audio")
     monkeypatch.setattr(app_module, "DEVICES_FILE", tmp_path / "devices.json")
+    monkeypatch.setattr(app_module, "FIRMWARE_DIR", tmp_path / "firmware")
+    app_module._firmware_offered_at.clear()
     (tmp_path / "images").mkdir()
     (tmp_path / "audio").mkdir()
     app_module.app.config["TESTING"] = True
@@ -445,3 +447,71 @@ def test_media_list_pending_only(client):
     client.put(f"/api/images/{ids[0]}", json={"downloaded": True}, headers=AUTH)
     assert set(client.get("/api/images", headers=AUTH).get_json()) == set(ids)
     assert list(client.get("/api/images?pending=1", headers=AUTH).get_json()) == [ids[1]]
+
+
+# ---------- Firmware updates ----------
+
+FW = b"\xe9" + b"\x00" * 4095  # ESP32 app images start with 0xE9
+
+
+def _fw_commands(client):
+    data = app_module.get_data()
+    return [v for v in data["commands"].values() if v.get("type") == "update_firmware"]
+
+
+def test_publish_firmware_requires_api_key(client):
+    assert client.post("/api/firmware/tzt-display?version=v1", data=FW).status_code == 401
+
+
+def test_publish_firmware_rejects_non_firmware(client):
+    r = client.post("/api/firmware/tzt-display?version=v1", data=b"hello", headers=AUTH)
+    assert r.status_code == 400
+    r = client.post("/api/firmware/other?version=v1", data=FW, headers=AUTH)
+    assert r.status_code == 404
+    r = client.post("/api/firmware/tzt-display", data=FW, headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_publish_firmware_queues_one_update_and_serves_image(client):
+    import hashlib
+    assert client.post("/api/firmware/tzt-display?version=v1", data=FW, headers=AUTH).status_code == 201
+    assert client.post("/api/firmware/tzt-display?version=v2", data=FW, headers=AUTH).status_code == 201
+    cmds = _fw_commands(client)
+    assert len(cmds) == 1  # the newer publish replaced the pending one
+    cmd = cmds[0]
+    assert cmd["version"] == "v2" and cmd["size"] == len(FW)
+    assert cmd["md5"] == hashlib.md5(FW).hexdigest()
+    r = client.get(cmd["path"], headers=AUTH)
+    assert r.status_code == 200 and r.data == FW
+    assert client.get(cmd["path"]).status_code == 401
+    assert client.get("/api/firmware/tzt-display", headers=AUTH).get_json()["version"] == "v2"
+
+
+def test_main_board_firmware_size_limit(client):
+    big = b"\xe9" + b"\x00" * 0x140000  # one byte over Main's 1.25 MB app partition
+    assert client.post("/api/firmware/main-board?version=v1", data=big, headers=AUTH).status_code == 400
+    assert client.post("/api/firmware/main-board?version=v1", data=FW, headers=AUTH).status_code == 201
+    cmd = _fw_commands(client)[0]
+    assert cmd["device"] == "main-board"
+    seen = dict(AUTH, **{"X-Device-Id": "main-board"})
+    assert client.get("/api/firmware/main-board", headers=seen).get_json()["version"] == "v1"
+    assert "main-board" in app_module.load_devices()
+
+
+def test_device_on_old_firmware_is_offered_update_again(client):
+    client.post("/api/firmware/tzt-display?version=v2", data=FW, headers=AUTH)
+    poll = dict(AUTH, **{"X-Device-Id": "tzt-display", "X-Firmware": "v1"})
+    cid = next(k for k, v in app_module.get_data()["commands"].items() if v["type"] == "update_firmware")
+    client.get(f"/api/commands?ack={cid}", headers=poll)  # handled, but the install failed: still v1
+    assert _fw_commands(client) == []                      # not straight away (no retry storm)
+    app_module._firmware_offered_at.clear()                # ...FIRMWARE_RETRY_S later
+    client.get("/api/commands", headers=poll)
+    assert len(_fw_commands(client)) == 1
+    client.get("/api/commands", headers=poll)
+    assert len(_fw_commands(client)) == 1                  # never queued twice
+    app_module.get_data()
+    with app_module.update_data() as data:
+        data["commands"] = {}
+    app_module._firmware_offered_at.clear()
+    client.get("/api/commands", headers=dict(AUTH, **{"X-Device-Id": "tzt-display", "X-Firmware": "v2"}))
+    assert _fw_commands(client) == []                      # nothing for a device that's current

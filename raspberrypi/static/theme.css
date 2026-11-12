@@ -4,8 +4,8 @@
    raspberrypi/tests/test_theme.py checks it. */
 :root {
   /* Cactus palette (UiTheme.h); --fi-border is the cactus green */
-  --fi-background: #131B15; --fi-card: #1C2A1F; --fi-field: #26352A; --fi-border: #5B7F4A;
-  --fi-accent: #B4D69B; --fi-text: #C8D4C2; --fi-text-muted: #7E9478; --fi-title: #FFFFFF;
+  --fi-background: #131B15; --fi-card: #1C2A1F; --fi-field: #26352A; --fi-border: #3A5A2E;
+  --fi-accent: #B4D69B; --fi-text: #C8D4C2; --fi-text-muted: #A9BCA2; --fi-title: #FFFFFF;
   --fi-warning: #E74C3C; --fi-danger-deep: #7B241C; --fi-success: #2FB36B; --fi-amber: #D4AC0D;
   --fi-selection: #4A6B3F; --fi-button: #2E4A30;
 

@@ -43,6 +43,7 @@ bool HttpBackendService::beginRequest(HTTPClient& http, const String& url, WiFiC
         http.addHeader("X-Device-Id", deviceId);
         http.addHeader("X-Device-Name", deviceName);
     }
+    if (firmwareVersion.length() > 0) http.addHeader("X-Firmware", firmwareVersion);
     return true;
 }
 

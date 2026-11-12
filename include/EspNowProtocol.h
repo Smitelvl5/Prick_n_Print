@@ -42,6 +42,8 @@
 #define CMD_LED_NOTIFY              0x11  // param1 = number of slow LED flashes (new message/sound/picture on the TZT)
 #define CMD_RESTART                 0x12  // reboot Main (TZT Settings "Restart" restarts both boards)
 #define CMD_SET_MOISTURE_SENSOR     0x13  // param1 = 1 on, 0 off (off: not read, reported as -1, left off receipts)
+#define CMD_CHECK_UPDATE            0x14  // new Main firmware was published on the Pi: fetch it now
+#define CMD_WIFI_SETUP              0x15  // TZT Settings > New Wi-Fi: Main restarts into its Wi-Fi setup page too
 
 // Sensor data packet (Main ESP32 → TZT Display)
 // Total size: ~32 bytes
@@ -167,6 +169,8 @@ inline const char* espNowCommandName(uint8_t cmd) {
         case CMD_LED_NOTIFY: return "LED_NOTIFY";
         case CMD_RESTART: return "RESTART";
         case CMD_SET_MOISTURE_SENSOR: return "SET_MOISTURE_SENSOR";
+        case CMD_CHECK_UPDATE: return "CHECK_UPDATE";
+        case CMD_WIFI_SETUP: return "WIFI_SETUP";
         default: return "CMD_?";
     }
 }

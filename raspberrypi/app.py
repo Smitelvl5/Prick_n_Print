@@ -10,6 +10,7 @@ Run (prod): gunicorn -w 2 -k gthread --threads 8 -b 0.0.0.0:5000 app:app   (see 
 
 import contextlib
 import functools
+import hashlib
 import hmac
 import json
 import os
@@ -40,6 +41,7 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 IMAGES_DIR = UPLOADS_DIR / "images"
 AUDIO_DIR = UPLOADS_DIR / "audio"
+FIRMWARE_DIR = UPLOADS_DIR / "firmware"
 DATA_FILE = BASE_DIR / "data.json"
 LOCK_FILE = BASE_DIR / "data.json.lock"
 COMMANDS_MAX_WAIT_S = 25     # GET /api/commands?wait= cap
@@ -48,6 +50,12 @@ COMMANDS_WAIT_CHECK_S = 0.2  # how often a waiting poll looks for new commands
 # 199 bytes (PRINT_CHUNK_MAX in src/main.cpp) and drops anything longer without printing it.
 PRINT_MAX_BYTES = 64 * 199
 COMMAND_MAX_BYTES = 16 * 1024  # whole command as sent to the TZT (it holds one in RAM at a time)
+# Firmware the Pi hands out (scripts/publish_firmware.py uploads it). Key = the device's X-Device-Id.
+# Value = the device's app partition size: TZT min_spiffs.csv (1.875 MB), Main default.csv (1.25 MB).
+# Main never polls /api/commands: it checks GET /api/firmware/main-board itself, and the TZT
+# relays the queued update command to it over ESP-NOW so it checks straight away.
+FIRMWARE_DEVICES = {"tzt-display": 0x1E0000, "main-board": 0x140000}
+FIRMWARE_RETRY_S = 30 * 60     # a device still on old firmware gets the update offered again after this
 
 # Shared secret required (as header X-API-Key) on every state-changing request.
 # Set in the environment (see setup.sh / systemd unit); the server refuses to
@@ -387,6 +395,7 @@ def get_commands():
     device_id = request.headers.get("X-Device-Id", "").strip()
     if device_id:
         touch_device(device_id, request.headers.get("X-Device-Name", "").strip() or device_id)
+        _offer_firmware_again(device_id, request.headers.get("X-Firmware", "").strip())
     acked, skipped = _id_list("ack"), _id_list("skip")
     if acked or skipped:
         now = _now()
@@ -775,6 +784,94 @@ def serve_image(name):
 @app.route("/uploads/audio/<path:name>")
 def serve_audio(name):
     return send_from_directory(AUDIO_DIR, name, as_attachment=True)
+
+
+# ---------- Firmware updates (the TZT installs what's published here) ----------
+# The boards live away from the Mac, so updates go through the Pi: publish_firmware.py uploads a
+# build, the Pi queues an "update_firmware" command, and the TZT downloads it over its usual
+# connection and installs it. A device that reports (X-Firmware on its polls) that it's still on
+# an older build is offered the update again every FIRMWARE_RETRY_S, so a failed install retries.
+_firmware_offered_at = {}  # device -> monotonic time of the last automatic re-offer (per worker)
+
+
+def _firmware_meta(device):
+    try:
+        return json.loads((FIRMWARE_DIR / f"{device}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _queue_firmware_update(data, device, meta):
+    """Replace any pending update for this device with one for meta's build."""
+    data["commands"] = {k: v for k, v in data["commands"].items()
+                        if not (v.get("type") == "update_firmware" and v.get("device") == device)}
+    data["commands"]["fw-" + uuid.uuid4().hex[:8]] = {
+        "type": "update_firmware", "device": device, "version": meta["version"],
+        "size": meta["size"], "md5": meta["md5"], "path": f"/api/firmware/{device}/image", "at": _now(),
+    }
+
+
+def _offer_firmware_again(device, running):
+    if not running or device not in FIRMWARE_DEVICES:
+        return
+    meta = _firmware_meta(device)
+    if not meta or meta["version"] == running:
+        return
+    last = _firmware_offered_at.get(device)
+    if last is not None and time.monotonic() - last < FIRMWARE_RETRY_S:
+        return
+    _firmware_offered_at[device] = time.monotonic()
+    with update_data() as data:
+        if not any(v.get("type") == "update_firmware" and v.get("device") == device
+                   for v in data["commands"].values()):
+            _queue_firmware_update(data, device, meta)
+            app.logger.info("Offering firmware %s to %s again (it runs %s)", meta["version"], device, running)
+
+
+@app.route("/api/firmware/<device>", methods=["POST"])
+@require_api_key
+def publish_firmware(device):
+    """Raw .bin body, ?version=<build id>. Stores it and tells the device to update."""
+    version = request.args.get("version", "").strip()
+    if device not in FIRMWARE_DEVICES:
+        return jsonify({"error": f"unknown device {device!r}"}), 404
+    if not version or len(version) > 64:
+        return jsonify({"error": "version required"}), 400
+    blob = request.get_data()
+    if not blob or blob[0] != 0xE9:  # every ESP32 app image starts with this magic byte
+        return jsonify({"error": "not an ESP32 firmware image"}), 400
+    if len(blob) > FIRMWARE_DEVICES[device]:
+        return jsonify({"error": f"image is {len(blob)} bytes, the partition holds {FIRMWARE_DEVICES[device]}"}), 400
+    FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
+    meta = {"version": version, "size": len(blob), "md5": hashlib.md5(blob).hexdigest(), "at": _now()}
+    tmp = FIRMWARE_DIR / f"{device}.bin.tmp"
+    tmp.write_bytes(blob)
+    os.replace(tmp, FIRMWARE_DIR / f"{device}.bin")
+    (FIRMWARE_DIR / f"{device}.json").write_text(json.dumps(meta))
+    with update_data() as data:
+        _queue_firmware_update(data, device, meta)
+    _firmware_offered_at.pop(device, None)
+    app.logger.info("Firmware %s published for %s (%d bytes)", version, device, len(blob))
+    return jsonify(meta), 201
+
+
+@app.route("/api/firmware/<device>", methods=["GET"])
+@require_api_key
+def firmware_info(device):
+    """What's published. Main checks this itself (with X-Device-Id, which marks it seen)."""
+    seen = request.headers.get("X-Device-Id", "").strip()
+    if seen:
+        touch_device(seen, request.headers.get("X-Device-Name", "").strip() or seen)
+    meta = _firmware_meta(device) if device in FIRMWARE_DEVICES else None
+    return (jsonify(meta), 200) if meta else (jsonify({"error": "nothing published"}), 404)
+
+
+@app.route("/api/firmware/<device>/image", methods=["GET"])
+@require_api_key
+def firmware_image(device):
+    if device not in FIRMWARE_DEVICES or not (FIRMWARE_DIR / f"{device}.bin").exists():
+        return jsonify({"error": "nothing published"}), 404
+    return send_from_directory(FIRMWARE_DIR, f"{device}.bin", mimetype="application/octet-stream")
 
 
 # ---------- Health ----------
