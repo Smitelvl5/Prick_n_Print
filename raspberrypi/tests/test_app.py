@@ -11,8 +11,8 @@ import sys
 import threading
 import time
 
-TEST_API_KEY = "test-key-do-not-use-in-prod"
-os.environ.setdefault("PRICK_N_PRINT_API_KEY", TEST_API_KEY)
+# The server's key: CI sets its own in the environment, so use whatever is set
+TEST_API_KEY = os.environ.setdefault("PRICK_N_PRINT_API_KEY", "test-key-do-not-use-in-prod")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
